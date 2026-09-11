@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>SYGNIF Desk</title>
+<link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/theme-dark.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c0e12'/%3E%3Ctext x='16' y='23' font-size='21' text-anchor='middle' fill='%2322D3EE' font-family='monospace' font-weight='700'%3E%CE%A3%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ TOP BAR ============ -->
+  <header id="topbar">
+    <button id="drawer-toggle" class="iconbtn drawer-toggle" aria-label="Show sidebar"
+            aria-expanded="false" aria-controls="chat-sidebar">&#9776;</button>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">&Sigma;</span><span class="brand-sub">SYGNIF</span><span class="brand-name">Desk</span>
+    </div>
+    <nav id="viewnav" role="tablist" aria-label="Views">
+      <button class="navbtn active" id="tab-chat" role="tab" data-view="chat"
+              aria-selected="true" aria-controls="view-chat">Chat</button>
+      <button class="navbtn" id="tab-workflows" role="tab" data-view="workflows"
+              aria-selected="false" aria-controls="view-workflows" tabindex="-1">Workflows</button>
+    </nav>
+    <div class="topbar-right">
+      <div id="provider-picker" class="picker">
+        <label class="picker-label" for="provider-select">Provider</label>
+        <select id="provider-select"></select>
+      </div>
+      <div id="model-picker" class="picker">
+        <label class="picker-label" for="model-select">Model</label>
+        <select id="model-select"></select>
+      </div>
+      <button id="health-refresh" class="iconbtn" aria-label="Refresh provider health"
+              title="Refresh provider health">&#8635;</button>
+    </div>
+  </header>
+
+  <!-- ============ CHAT VIEW ============ -->
+  <main id="view-chat" class="view active" role="tabpanel" aria-labelledby="tab-chat">
+    <aside id="chat-sidebar">
+      <div class="sidebar-head">
+        <span>Conversations</span>
+        <button id="new-conv" class="iconbtn" aria-label="New conversation (Ctrl+K)"
+                title="New conversation (Ctrl+K)">+</button>
+      </div>
+      <div class="sidebar-search">
+        <input id="conv-search" type="search" class="search-input"
+               placeholder="Filter conversations" aria-label="Filter conversations" />
+      </div>
+      <ul id="conv-list" class="conv-list"></ul>
+      <div class="sidebar-foot">
+        <div class="hint"><kbd>Ctrl</kbd>+<kbd>K</kbd> new conversation</div>
+        <div class="hint"><kbd>Enter</kbd> send &middot; <kbd>Shift</kbd>+<kbd>Enter</kbd> newline</div>
+        <div class="hint"><kbd>Esc</kbd> stop generating</div>
+      </div>
+    </aside>
+
+    <section id="chat-main" class="chat-main">
+      <div id="chat-header" class="chat-header">
+        <input id="conv-title" class="conv-title-input" placeholder="Untitled conversation"
+               aria-label="Conversation title" />
+        <button id="toggle-system" class="ghostbtn" aria-expanded="false"
+                aria-controls="system-row" title="System prompt">System</button>
+        <button id="del-conv" class="ghostbtn danger" title="Delete conversation">Delete</button>
+      </div>
+      <div id="system-row" class="system-row hidden">
+        <label class="sr-only" for="system-input">System prompt for this conversation</label>
+        <textarea id="system-input" class="system-input" rows="2"
+          placeholder="System prompt for this conversation (saved on blur)"></textarea>
+      </div>
+
+      <div id="resume-bar" class="resume-bar hidden" role="status">
+        <span class="resume-dot" aria-hidden="true">&#9679;</span>
+        <span id="resume-text">Session closed with work in progress.</span>
+        <button id="resume-btn" class="ghostbtn">Resume</button>
+        <button id="resume-dismiss" class="iconbtn" aria-label="Dismiss resume notice">&times;</button>
+      </div>
+
+      <div id="thread" class="thread" tabindex="0" aria-label="Conversation">
+        <div id="empty-thread" class="empty-thread">
+          <div class="empty-glyph" aria-hidden="true">&Sigma;</div>
+          <p>Start a conversation. Drop or paste files &mdash; text, PDF, DOCX, audio and
+             images are read server-side (images via OCR) and appended to your message.</p>
+        </div>
+      </div>
+
+      <button id="jump-latest" class="jump-latest hidden" aria-live="off">
+        <span class="jump-arrow" aria-hidden="true">&#8595;</span>
+        <span id="jump-label">Jump to latest</span>
+      </button>
+
+      <div id="dropzone-overlay" class="dropzone-overlay hidden"><div>Drop to attach</div></div>
+
+      <div class="composer-wrap">
+        <div id="attach-chips" class="attach-chips"></div>
+        <div class="composer">
+          <button id="attach-btn" class="iconbtn" aria-label="Attach file" title="Attach file">&#128206;</button>
+          <label class="sr-only" for="chat-input">Message</label>
+          <textarea id="chat-input" class="chat-input" rows="1"
+            placeholder="Message SYGNIF Desk&hellip;  (Enter to send, Shift+Enter for newline)"></textarea>
+          <button id="send-btn" class="sendbtn" title="Send">Send</button>
+          <span id="stream-timer" class="stream-timer hidden" aria-hidden="true"></span>
+          <button id="stop-btn" class="sendbtn stop hidden" title="Stop streaming (Esc)">Stop</button>
+        </div>
+        <input id="file-input" type="file" multiple class="hidden" aria-hidden="true" tabindex="-1" />
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ WORKFLOWS VIEW ============ -->
+  <main id="view-workflows" class="view" role="tabpanel" aria-labelledby="tab-workflows">
+    <aside id="wf-sidebar">
+      <div class="sidebar-head">
+        <span>Workflows</span>
+        <button id="new-wf" class="iconbtn" aria-label="New workflow" title="New workflow">+</button>
+      </div>
+      <ul id="wf-list" class="conv-list"></ul>
+      <div class="sidebar-foot">
+        <div class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> run workflow</div>
+        <div class="hint"><kbd>Esc</kbd> stop run</div>
+      </div>
+    </aside>
+
+    <section id="wf-main" class="wf-main">
+      <div id="wf-editor" class="wf-editor">
+        <div class="wf-editor-head">
+          <label class="sr-only" for="wf-name">Workflow name</label>
+          <input id="wf-name" class="conv-title-input" placeholder="Workflow name" />
+          <div class="wf-editor-actions">
+            <button id="wf-add-step" class="ghostbtn">+ Step</button>
+            <button id="wf-save" class="sendbtn">Save</button>
+            <button id="wf-delete" class="ghostbtn danger">Delete</button>
+          </div>
+        </div>
+        <div id="wf-steps" class="wf-steps"></div>
+      </div>
+
+      <div class="wf-run">
+        <div class="wf-run-head">
+          <span>Run</span>
+        </div>
+        <label class="sr-only" for="wf-input">Workflow input</label>
+        <textarea id="wf-input" class="wf-input" rows="4"
+          placeholder="Input for the workflow (paste text, transcript, etc.)"></textarea>
+        <div class="wf-run-actions">
+          <button id="wf-run-btn" class="sendbtn">Run workflow</button>
+          <button id="wf-stop-btn" class="sendbtn stop hidden">Stop run</button>
+        </div>
+        <div id="wf-log" class="wf-log"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="scrim" class="scrim hidden"></div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+  <div id="live-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

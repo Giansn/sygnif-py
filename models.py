@@ -1,0 +1,138 @@
+"""Model + preset registry for SYGNIF py (the generic seat).
+
+Unlike a single-proxy seat, every model here is self-describing: it carries its
+own OpenAI-compatible `base_url`, an optional `api_key_env` (the NAME of an env
+var holding the key — never the key itself), and its context/max_tokens. That is
+what makes the seat model-agnostic: bring any OpenAI-compatible endpoint.
+
+Config lives in config.json next to this module and may be overridden per-user by
+~/.sygnif/sygnif-py.json (same shape). The two are merged: `models` and `presets`
+are dict-updated (user file wins per key), `default_preset` is replaced if set.
+
+Config shape:
+  {
+    "models": {
+      "<key>": { "id": "<model id sent as `model`>",
+                 "base_url": "https://.../v1",
+                 "api_key_env": "OPENAI_API_KEY" | null,
+                 "context": 128000, "max_tokens": 4096 },
+      ...
+    },
+    "default_preset": "<preset name>",
+    "presets": {
+      "<name>": { "model": "<models key>", "tools": [...], "focus": "..." },
+      ...
+    }
+  }
+"""
+from __future__ import annotations
+
+import json
+import os
+
+SEAT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.environ.get("SYGNIF_PY_CONFIG", os.path.join(SEAT_DIR, "config.json"))
+USER_CONFIG = os.path.expanduser(
+    os.environ.get("SYGNIF_PY_USER_CONFIG", "~/.sygnif/sygnif-py.json")
+)
+
+DEFAULT_TOOLS = ["shell", "read_file", "write_file", "note"]
+
+# Keys starting with "_" in the config are documentation/examples, not real
+# entries — skipped when building the live registry.
+def _is_meta(key: str) -> bool:
+    return key.startswith("_")
+
+
+# Used only if config.json is missing/broken AND no preset resolves — the seat
+# must still start rather than crash. Points at the shipped free OpenRouter slug.
+_FALLBACK_MODEL = {
+    "id": os.environ.get("SYGNIF_PY_MODEL", "nvidia/nemotron-3.5-lightning:free"),
+    "base_url": os.environ.get("SYGNIF_PY_BASE_URL", "https://openrouter.ai/api/v1"),
+    "api_key_env": os.environ.get("SYGNIF_PY_API_KEY_ENV", "OPENROUTER_API_KEY") or None,
+    "context": 1000000,
+    "max_tokens": 4096,
+}
+_FALLBACK_PRESET = {
+    "model": "openrouter-free",
+    "tools": DEFAULT_TOOLS,
+    "focus": "General-purpose assistant. Understand the task, then use the tools to act, grounding claims in real output.",
+}
+
+
+def _read_json(path: str):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"[sygnif-py] config {path} failed to load: {e}")
+        return None
+
+
+def load_config() -> dict:
+    """Return the merged config (config.json overlaid by the per-user file)."""
+    cfg = _read_json(CONFIG_PATH) or {}
+    cfg.setdefault("models", {})
+    cfg.setdefault("presets", {})
+    cfg.setdefault("default_preset", "assistant")
+
+    user = _read_json(USER_CONFIG)
+    if isinstance(user, dict):
+        if isinstance(user.get("models"), dict):
+            cfg["models"].update(user["models"])
+        if isinstance(user.get("presets"), dict):
+            cfg["presets"].update(user["presets"])
+        if user.get("default_preset"):
+            cfg["default_preset"] = user["default_preset"]
+    return cfg
+
+
+def list_models(cfg: dict) -> list[str]:
+    return sorted(k for k in cfg.get("models", {}) if not _is_meta(k))
+
+
+def resolve_model(cfg: dict, name: str) -> dict:
+    """Return a model spec dict {id, base_url, api_key, context, max_tokens}.
+
+    `name` is a key in the models table. An unknown name falls back to the
+    default preset's model, then to the shipped fallback. The named api_key_env
+    is read from the environment here (the file only stores the var name).
+    """
+    models = cfg.get("models", {})
+    spec = None
+    if name and name in models and not _is_meta(name):
+        spec = dict(models[name])
+    if spec is None:
+        spec = dict(_FALLBACK_MODEL)
+    key_env = spec.get("api_key_env")
+    spec["api_key"] = os.environ.get(key_env) if key_env else None
+    spec.setdefault("id", _FALLBACK_MODEL["id"])
+    spec.setdefault("base_url", _FALLBACK_MODEL["base_url"])
+    spec.setdefault("context", 32768)
+    spec.setdefault("max_tokens", 4096)
+    return spec
+
+
+def get_preset(cfg: dict, name: str | None) -> tuple[str, dict]:
+    """Resolve a preset by name, falling back to default_preset.
+
+    Returns (resolved_name, preset_dict). The preset_dict keeps its "model" as a
+    models-table key; callers pass that key to resolve_model.
+    """
+    presets = cfg.get("presets", {})
+    chosen = name or cfg.get("default_preset")
+    if chosen not in presets:
+        chosen = cfg.get("default_preset")
+    if chosen not in presets:
+        return "assistant", dict(_FALLBACK_PRESET)
+    preset = dict(presets[chosen])
+    preset.setdefault("tools", DEFAULT_TOOLS)
+    preset.setdefault("focus", "")
+    preset.setdefault("model", cfg.get("default_preset"))
+    return chosen, preset
+
+
+def list_presets(cfg: dict) -> list[str]:
+    return sorted(cfg.get("presets", {}))

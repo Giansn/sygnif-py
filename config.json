@@ -1,0 +1,83 @@
+{
+  "_comment": "SYGNIF py — model + preset registry. This is the GENERIC SYGNIF seat: it talks to any OpenAI-compatible chat endpoint. Three models ship listed: 'openrouter-free' (the out-of-box default — a free public slug, just needs a free OpenRouter key), 'claude' (your own Claude Pro/Max subscription via the official claude CLI — run `sygnif login` once), and 'inkling' (a local bridge). Add your own models below, or per-user in ~/.sygnif/sygnif-py.json (same shape; 'models' and 'presets' are merged, 'default_preset' replaced). Nothing here contains a secret — API keys are read from an environment variable named by 'api_key_env', never stored in this file.",
+
+  "models": {
+    "openrouter-free": {
+      "id": "nvidia/nemotron-3.5-lightning:free",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "context": 1000000,
+      "max_tokens": 4096,
+      "note": "Free public model on OpenRouter — the out-of-box default so the seat works before you configure anything. Make a free account at openrouter.ai, create a key, and `export OPENROUTER_API_KEY=sk-or-...`. Free slugs rotate: if this one 404s or stalls, pick a current one from https://openrouter.ai/models?max_price=0 and change 'id' here (keep the ':free' suffix)."
+    },
+
+    "claude": {
+      "id": "sonnet",
+      "provider": "claude-cli",
+      "base_url": null,
+      "api_key_env": null,
+      "context": 200000,
+      "max_tokens": 8192,
+      "note": "Your own Claude via the official `claude` CLI, billed to your Claude Pro/Max subscription (not the pay-per-use API). One-time setup: install the claude CLI (https://claude.com/claude-code), then run `sygnif login` (wraps `claude setup-token`). 'id' is passed to the CLI as --model: use 'sonnet', 'opus', 'haiku', or a full model id."
+    },
+
+    "inkling": {
+      "id": "thinkingmachines-inkling-256k",
+      "base_url": "http://127.0.0.1:9223/v1",
+      "api_key_env": null,
+      "context": 262144,
+      "max_tokens": 4096,
+      "note": "ThinkingMachines Inkling 256k, served by a local OpenAI-compatible bridge on :9223. Free, but you must run the bridge yourself. Select with `/model inkling` or set it as a preset's model."
+    },
+
+    "_examples": {
+      "_comment": "Templates only — NOT live (keys under '_examples' are ignored by the seat). To use one, lift it up into 'models' above under a name of your choosing, then point a preset's 'model' at that name. Put the key in the named env var, never here.",
+      "openai": {
+        "id": "gpt-4o-mini",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "context": 128000,
+        "max_tokens": 4096
+      },
+      "openrouter": {
+        "id": "meta-llama/llama-3.3-70b-instruct",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "context": 131072,
+        "max_tokens": 4096
+      },
+      "ollama": {
+        "id": "llama3.1",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "api_key_env": null,
+        "context": 32768,
+        "max_tokens": 4096
+      }
+    }
+  },
+
+  "default_preset": "assistant",
+
+  "presets": {
+    "assistant": {
+      "model": "openrouter-free",
+      "tools": ["shell", "read_file", "write_file", "note"],
+      "focus": "You are a general-purpose assistant with hands on this machine. Understand the task first; if the request is ambiguous, ask a short clarifying question before acting. Use the tools to inspect and change real files and to run real commands, and ground every factual claim in actual tool output."
+    },
+    "chat": {
+      "model": "openrouter-free",
+      "tools": ["note"],
+      "focus": "Plain conversation and reasoning. No shell or file access in this preset — think and answer. Use 'note' only if the operator asks you to record something."
+    },
+    "dev": {
+      "model": "openrouter-free",
+      "tools": ["shell", "read_file", "write_file", "dev_apply_and_test", "note"],
+      "focus": "You are in development mode. Work in small, proven steps: read the relevant code before you change it; make the smallest edit that moves the task forward; then PROVE it with dev_apply_and_test (write the file and run the test/build command in one call). A change is not done until its test actually passes here — never report success from a write alone. If a command fails, read the real error and fix it; the error is the next spec. Record notable decisions with note."
+    },
+    "ops": {
+      "model": "openrouter-free",
+      "tools": ["centre", "shell", "note"],
+      "focus": "You are in ops mode: understand and report the real state of this machine. Prefer the Centre (the 'centre' tool) for structured state — sys.state for a host snapshot, sys.procs for processes, knowledge.search for the operator's notes. Use shell only to confirm or drill deeper. Ground every claim in what a tool actually returned; never guess a port, unit, or number."
+    }
+  }
+}

@@ -1,0 +1,29 @@
+"""Drop-in tool extension for SYGNIF py.
+
+Copy this to `custom_tools.py` (next to seat.py) or to
+`~/.sygnif/sygnif-py-tools.py`. Define `register(reg)` and add your tools to the
+registry dict. Each tool is {desc, args, func}; func takes an args dict and
+returns a string. See tools.py for the built-ins.
+"""
+
+
+def _tool_http_get(args: dict) -> str:
+    import urllib.request
+
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return "http_get: empty url"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            body = r.read().decode(errors="replace")
+        return body[:8000]
+    except Exception as e:  # noqa: BLE001
+        return f"[http_get error: {e}]"
+
+
+def register(reg: dict) -> None:
+    reg["http_get"] = {
+        "desc": "Fetch a URL over HTTP(S) and return the first 8000 chars of the body.",
+        "args": {"url": "the URL to GET"},
+        "func": _tool_http_get,
+    }

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+desk-venv/
+
+# Local runtime state / secrets (never publish)
+.sygnif/
+*.env
+custom_tools.py
+
+# Optional FastAPI "full" Desk flavour — kept out of the public package:
+# it carries host-specific config and heavy deps. The shipped Desk is the
+# stdlib desk.py + static/ (zero dependencies).
+desk/
+sygnif-desk-full.sh
+sygnif-desk-full.ps1
+
+# OS cruft
+.DS_Store

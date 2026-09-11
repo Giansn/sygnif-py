@@ -1,0 +1,131 @@
+/* ====== SYGNIF Desk — dark theme ======
+   Token values:
+     paper #1B1E24   ink #E9EBE7   line #323843   card #232833
+     muted #8F95A1   seal #2BD4E8  verify #2FB89E
+     --radius 8px    pills 999px   shadow 0 1px 2px/0 4px 12px
+
+   Shape language: navigation and tags are 999px pills detached from the
+   viewport edge; panels are 8px cards on a flat paper ground. Deliberately
+   flat — no gradients, no grain, no glow. Σ mark and cyan accent (#22D3EE).
+   ------------------------------------------------------------------------ */
+:root{
+  --bg:#1B1E24;            /* paper  */
+  --bg-1:#232833;          /* card   */
+  --bg-2:#232833;
+  --bg-3:#2C313B;          /* line-2 */
+  --panel:#1B1E24;
+  --border:#323843;        /* line   */
+  --border-soft:#2C313B;
+  --text:#E9EBE7;          /* ink    */
+  --text-dim:#C6CAD1;      /* ink-2  */
+  --text-faint:#8F95A1;    /* muted  */
+  --accent:#2BD4E8;        /* seal   */
+  --accent-2:#2FB89E;      /* verify */
+  --accent-glow:rgba(43,212,232,.45);
+  --user-bubble:#232833;
+  --ent-radius:8px;
+  --ent-gutter:clamp(1.25rem,.8rem + 2.5vw,3rem);
+  --ent-shadow:0 1px 2px rgba(0,0,0,.35),0 4px 12px rgba(0,0,0,.30);
+}
+
+/* --- ground: one restrained glow over paper ------------------
+   one radial of `seal` at 7% opacity
+   (.hero:before — 60% 60% at 32% 26%, fading out by 80%) over flat paper. Not
+   a four-layer field. That formula is reproduced here at 5%, pinned to the
+   viewport so it reads on any screen instead of only behind a hero, with a
+   second much fainter counter-glow to stop the corner looking lopsided. */
+body{
+  background:
+    radial-gradient(60% 60% at 32% 26%,
+      color-mix(in srgb, var(--accent) 5%, transparent), transparent 80%),
+    radial-gradient(55% 55% at 88% 84%,
+      color-mix(in srgb, var(--accent-2) 3%, transparent), transparent 78%),
+    var(--bg);
+  background-attachment:fixed;
+}
+#app,#view-chat,#view-workflows,#chat-main,.thread{background:transparent}
+
+/* --- film grain: the previous theme's own layer, unchanged --------------- */
+body::after{
+  content:"";position:fixed;inset:-60%;z-index:9999;pointer-events:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='260'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.55'/%3E%3C/svg%3E");
+  opacity:.18;mix-blend-mode:screen;
+  animation:grainShift 1.4s steps(4) infinite;
+}
+@keyframes grainShift{
+  0%{transform:translate(0,0)}25%{transform:translate(-1.5%,1%)}
+  50%{transform:translate(1%,-1.5%)}75%{transform:translate(-1%,1.5%)}100%{transform:translate(0,0)}
+}
+@media (prefers-reduced-motion:reduce){body::after{animation:none}}
+
+/* --- the signature: header as a floating pill, content scrolls beneath --- */
+#topbar{
+  margin:.8rem;
+  border:1px solid var(--border);
+  border-radius:999px;
+  background:color-mix(in srgb,var(--bg-1) 82%,transparent);
+  backdrop-filter:blur(12px);
+  box-shadow:var(--ent-shadow);
+  padding-left:var(--s4);padding-right:var(--s4);
+}
+
+/* --- sidebar as a detached card on the same gutter --- */
+#chat-sidebar,#wf-sidebar{
+  margin:0 0 .8rem .8rem;
+  border:1px solid var(--border);
+  border-right:1px solid var(--border);
+  border-radius:var(--ent-radius);
+  background:var(--bg-1);
+  box-shadow:var(--ent-shadow);
+}
+.chat-main,.wf-main{margin:0 .8rem .8rem 0}
+
+/* --- pills for navigation and controls, cards for panels --- */
+.navbtn,.iconbtn,select,.search-input,.ghostbtn,.sendbtn,.chip{border-radius:999px}
+.navbtn.active{color:var(--accent);background:rgba(43,212,232,.10);border-color:rgba(43,212,232,.35)}
+.navbtn:hover{background:rgba(43,212,232,.08)}
+.conv-item{border-radius:var(--ent-radius)}
+.conv-item.active{background:var(--bg-3);border-color:var(--border)}
+.md pre,.codefold,.thinking,.wf-step,.wf-log-step,.msg.user .content{border-radius:var(--ent-radius)}
+.toast{border-radius:999px;background:var(--bg-1);border:1px solid var(--border)}
+/* --- composer: single frame — outer .composer owns border+glow, inner stays bare --- */
+.composer .chat-input,
+textarea.chat-input{
+  border:none!important;
+  box-shadow:none!important;
+  outline:none!important;
+}
+.composer .chat-input:focus,
+textarea.chat-input:focus{
+  border:none!important;
+  box-shadow:none!important;
+  outline:none!important;
+}
+
+/* --- user bubble: round the element that actually paints it ---------------
+   The visible box is .msg.user itself (this file gives it the gradient + cyan
+   border above) and it simply never had a radius — which is why it stayed
+   square no matter what was done to .content. style.css ALSO puts a
+   background+border on the inner .msg.user .content, so two boxes were being
+   drawn; the inner one is flattened here so exactly one rounded bubble shows. */
+.msg.user{
+  background:color-mix(in srgb, var(--bg-1) 90%, transparent);
+  border:1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+  border-radius:20px;
+  box-shadow:var(--ent-shadow);
+}
+/* inner stays bare so exactly ONE bubble is drawn — the port flattened this and
+   forgot to repaint the outer, which left the prompt with no outline at all */
+.msg.user .content{background:transparent;border-color:transparent;border-radius:20px}
+
+/* --- composer: no grey slab -------------------------------------------------
+   style.css paints TWO greys here: a full-width band on .composer-wrap
+   (background var(--bg-1) + border-top) and a fill on the .composer pill
+   (var(--bg-2)). Both are dropped so the composer floats on the page ground.
+   A light backdrop blur keeps the typed text legible over the grain without
+   putting a solid panel back. */
+.composer-wrap{background:transparent;border-top:none}
+.composer{
+  background:transparent;
+  backdrop-filter:blur(8px);
+}
