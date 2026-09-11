@@ -122,7 +122,7 @@ def prompt_str() -> str:
     top rule then a bold cyan chevron; a plain `you> ` otherwise."""
     if not PIX:
         return "you> "
-    return rule() + "\n" + (cyan(bold("❯")) if COLOR else "❯") + " "
+    return cyan("╭" + "─" * max(8, width() - 2)) + "\n" + (cyan(bold("❯")) if COLOR else "❯") + " "
 
 
 def reply_header() -> None:
@@ -210,3 +210,81 @@ def hello(name: str, model_key: str, model_id: str, endpoint: str) -> None:
     else:
         print(f"SYGNIF py — {model_key} ({model_id}) @ {endpoint}")
         print("Type a prompt, or /help for commands.")
+
+
+# --- full seat chrome (ported from the SYGNIF pi seat: wordmark + Σ box) -----
+
+import re as _re
+
+SIGIL = "Σ"
+
+# SYGNIF block wordmark (figlet "ANSI Shadow") — the same mark the pi seat shows
+# at boot. Reversible: SYGNIF_PY_BANNER=0 hides it; auto-skipped off-TTY/narrow.
+WORDMARK = [
+    "███████╗██╗   ██╗ ██████╗ ███╗   ██╗██╗███████╗",
+    "██╔════╝╚██╗ ██╔╝██╔════╝ ████╗  ██║██║██╔════╝",
+    "███████╗ ╚████╔╝ ██║  ███╗██╔██╗ ██║██║█████╗",
+    "╚════██║  ╚██╔╝  ██║   ██║██║╚██╗██║██║██╔══╝",
+    "███████║   ██║   ╚██████╔╝██║ ╚████║██║██║",
+    "╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝",
+]
+
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
+
+
+def vlen(s: str) -> int:
+    """Visible width: length with ANSI SGR codes stripped, for box padding."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def banner() -> str:
+    """SYGNIF wordmark in brand cyan, or '' when it should not show. Reversible:
+    SYGNIF_PY_BANNER=0/off hides it; skipped off-TTY, when PIX is off, or when the
+    terminal is narrower than the mark (so it never wrap-mangles)."""
+    if not PIX:
+        return ""
+    if os.environ.get("SYGNIF_PY_BANNER", "").strip().lower() in ("0", "off", "false", "no"):
+        return ""
+    w = max(len(l) for l in WORDMARK)
+    if width() < w:
+        return ""
+    return "\n".join(cyan(l) for l in WORDMARK)
+
+
+def seat_box(model_id: str, n_tools: int, extras: str, switch_line: str, help_line: str) -> None:
+    """The framed 'Σ SYGNIF seat' welcome box: model · tools · extras, then the
+    model-switch legend and the session-command legend. Plain fallback off-PIX."""
+    title = f"{SIGIL} SYGNIF seat"
+    body = [
+        f"{bold(model_id)} {dim('·')} {n_tools} tools {dim('·')} {dim(extras)}",
+        dim(switch_line),
+        dim(help_line),
+    ]
+    if not PIX:
+        print(f"{title} — {model_id} · {n_tools} tools · {extras}")
+        print("  " + switch_line)
+        print("  " + help_line)
+        return
+    w = min(max([vlen(title) + 1] + [vlen(b) for b in body]), max(20, width() - 4))
+    print(cyan("╭─ ") + cyan(bold(title)) + cyan(" " + "─" * max(0, w - vlen(title) - 1) + "╮"))
+    for b in body:
+        print(cyan("│ ") + b + " " * max(0, w - vlen(b)) + cyan(" │"))
+    print(cyan("╰" + "─" * (w + 2) + "╯"))
+
+
+def status_line(model: str, used, window, tps, turns: int, state: str = "idle") -> None:
+    """The idle status readout above the prompt: state dot, ctx occupancy, last
+    tps, model, turn count — the fields the pi seat pins under its prompt box."""
+    if not PIX:
+        return
+    dot = cyan("●") if state != "idle" else gray("○")
+    parts = []
+    if used is not None and window:
+        parts.append(f"ctx {fmt_k(used)}/{fmt_k(window)} {round(used / window * 100)}%")
+    else:
+        parts.append("ctx —")
+    parts.append(f"~{tps} tps" if tps is not None else "— tps")
+    parts.append(model)
+    if turns > 0:
+        parts.append(f"{turns} turn{'' if turns == 1 else 's'}")
+    print(f"  {dot} {dim(state + '  ·  ' + '  ·  '.join(parts))}")

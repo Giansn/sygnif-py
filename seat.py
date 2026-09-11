@@ -12,7 +12,7 @@ local llama.cpp server, or the shipped Inkling bridge — whatever speaks
 /v1/chat/completions.
 
 Usage:
-    python3 seat.py                          # REPL, default preset (openrouter-free)
+    python3 seat.py                          # REPL, default preset (pentest, Fable 5.1)
     python3 seat.py login                    # log in to your Claude subscription
     python3 seat.py --preset chat            # REPL, chat preset
     python3 seat.py --model claude "hello"   # one-shot on your Claude subscription
@@ -53,6 +53,15 @@ COMPACT_PREFIX = "[Compacted earlier conversation — older turns summarized to 
 CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test"}  # gated when --confirm / SYGNIF_PY_CONFIRM=1
 CLAUDE_BIN = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "300"))
+
+# First-run onboarding: a marker gates a one-time setup (Claude login + a pentest
+# workspace). SYGNIF_PY_FIRSTRUN=0 skips it; delete the marker to run it again.
+FIRSTRUN_MARKER = os.path.expanduser(
+    os.environ.get("SYGNIF_PY_FIRSTRUN_MARKER", "~/.sygnif/.sygnif-py-initialized")
+)
+PENTEST_DIR = os.path.expanduser(os.environ.get("SYGNIF_PY_PENTEST_DIR", "~/sygnif-pentest"))
+# Common tools a first pentest reaches for — reported present/missing, never assumed.
+PENTEST_TOOLS = ["nmap", "curl", "dig", "whois", "nc", "nikto", "gobuster", "sqlmap", "hydra", "openssl"]
 
 _FENCE = re.compile(r"```(?:tool|json)?\s*(\{.*?\})\s*```", re.S)
 
@@ -588,6 +597,92 @@ def do_login() -> int:
     return rc
 
 
+def _firstrun_pending() -> bool:
+    """True when the one-time onboarding has not run yet and we're interactive.
+    Skipped for one-shot prompts, non-TTY runs, and when SYGNIF_PY_FIRSTRUN=0."""
+    if os.environ.get("SYGNIF_PY_FIRSTRUN", "1") == "0":
+        return False
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    return not os.path.exists(FIRSTRUN_MARKER)
+
+
+def _mark_firstrun_done() -> None:
+    try:
+        os.makedirs(os.path.dirname(FIRSTRUN_MARKER), exist_ok=True)
+        with open(FIRSTRUN_MARKER, "w", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def do_first_run(spec: dict) -> None:
+    """One-time onboarding, run the first time `sygnif` is launched interactively:
+    log in to the Claude subscription that backs the default model (Fable 5.1),
+    then stand up a pentest workspace and report which tools are on the box. Gated
+    by FIRSTRUN_MARKER so it never nags after the first successful run."""
+    print(pix.rule())
+    print(pix.cyan(pix.bold("  Welcome to SYGNIF py")) + pix.dim("  ·  first-run setup"))
+    print(pix.dim("  This runs once. It logs you in and preps your first pentest."))
+    print(pix.rule())
+
+    # 1. Claude subscription login (only if the default model is subscription-backed).
+    if spec.get("provider") == "claude-cli":
+        if shutil.which(CLAUDE_BIN):
+            pix.notice(f"  Default model is Claude Fable 5.1 via your Claude Pro/Max subscription ({spec.get('id')}).")
+            try:
+                ans = input(pix.cyan("  Log in now? ") + pix.dim("[Enter = yes, s = skip] ")).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = "s"
+                print()
+            if ans in ("", "y", "yes"):
+                print(pix.dim(f"  running: {CLAUDE_BIN} setup-token\n"))
+                try:
+                    rc = subprocess.call([CLAUDE_BIN, "setup-token"])
+                    pix.notice("  logged in." if rc == 0 else f"  [login exited {rc} — you can retry later with `sygnif login`]",
+                               "green" if rc == 0 else "yellow")
+                except Exception as e:  # noqa: BLE001
+                    pix.notice(f"  [login failed: {e} — retry later with `sygnif login`]", "yellow")
+            else:
+                pix.notice("  skipped. Run `sygnif login` before using Fable 5.1, or `/model openrouter-free`.", "yellow")
+        else:
+            pix.notice("  The official Claude CLI is not installed, so Fable 5.1 can't run yet.", "yellow")
+            pix.notice("  Install it: https://claude.com/claude-code   then run: sygnif login")
+            pix.notice("  Meanwhile you can use a free model with: /model openrouter-free  (needs OPENROUTER_API_KEY)")
+
+    # 2. Pentest workspace + a scope reminder.
+    try:
+        os.makedirs(PENTEST_DIR, exist_ok=True)
+        scope = os.path.join(PENTEST_DIR, "SCOPE.md")
+        if not os.path.exists(scope):
+            with open(scope, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "# Pentest scope\n\n"
+                    "SYGNIF only tests systems you are AUTHORIZED to test. Before you start,\n"
+                    "record here who authorized this, the exact in-scope targets, and the\n"
+                    "rules of engagement.\n\n"
+                    "- Authorization / owner:\n"
+                    "- In-scope targets (hosts / IPs / URLs):\n"
+                    "- Out of scope:\n"
+                    "- Rules of engagement / time window:\n"
+                )
+        pix.notice(f"  Pentest workspace ready: {PENTEST_DIR}  (edit SCOPE.md before you start)", "green")
+    except Exception as e:  # noqa: BLE001
+        pix.notice(f"  [could not create pentest workspace: {e}]", "yellow")
+
+    # 3. Report which pentest tools are actually installed — grounded, not assumed.
+    have = [t for t in PENTEST_TOOLS if shutil.which(t)]
+    missing = [t for t in PENTEST_TOOLS if not shutil.which(t)]
+    pix.notice("  tools present: " + (", ".join(have) if have else "none of the usual set"))
+    if missing:
+        pix.notice("  not installed: " + ", ".join(missing))
+
+    print(pix.rule())
+    pix.notice("  You're set. Describe your first authorized target and SYGNIF will begin recon.")
+    print(pix.rule())
+    _mark_firstrun_done()
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "login":
         return do_login()
@@ -603,6 +698,11 @@ def main() -> int:
     name, preset, reg, system = build_session(cfg, a.preset)
     model_key = a.model or preset.get("model")
     spec = models.resolve_model(cfg, model_key)
+
+    # First interactive launch after install: log in + prep the pentest workspace.
+    if not a.prompt and _firstrun_pending():
+        do_first_run(spec)
+
     messages = [{"role": "system", "content": system}]
 
     def endpoint_of(sp: dict) -> str:
@@ -621,15 +721,32 @@ def main() -> int:
 
     state = SessionState()
     state.set_model(model_key, spec)
-    banner()
 
     if a.prompt:
+        banner()
         messages.append({"role": "user", "content": " ".join(a.prompt)})
         run_turn(spec, messages, reg, confirm, state)
         return 0
 
+    # REPL: full PIX chrome — wordmark, then the Σ SYGNIF seat welcome box.
+    _wm = pix.banner()
+    if _wm:
+        print(_wm)
+    _switch = " · ".join("/" + k for k in models.list_models(cfg)) + "  → switch model"
+    pix.seat_box(
+        spec["id"], len(reg),
+        "presets: " + ", ".join(models.list_presets(cfg)),
+        _switch,
+        "/reset → new session   /exit (/quit) → leave   Ctrl-C → abort",
+    )
+    if spec.get("provider") == "claude-cli":
+        _key = "claude login" if shutil.which(CLAUDE_BIN) else "run: sygnif login"
+    else:
+        _key = "set" if spec.get("api_key") else ("none" if not spec.get("api_key_env") else f"missing ${spec['api_key_env']}")
+    pix.banner_line(f"  preset '{name}'  ·  {endpoint_of(spec)}  ·  key={_key}" + ("  ·  confirm on" if confirm else ""))
+
     while True:
-        pix.info_line(state.model_key, state.used, state.window, state.tps, state.turns)
+        pix.status_line(state.model_key, state.used, state.window, state.tps, state.turns)
         try:
             line = input(pix.prompt_str()).strip()
         except (EOFError, KeyboardInterrupt):
@@ -643,7 +760,7 @@ def main() -> int:
             if cmd in ("quit", "q", "exit"):
                 return 0
             if cmd == "help":
-                pix.notice("  /preset <name>  /model <name>  /models  /tools  /reset  /quit")
+                pix.notice("  /preset <name>  /model <name>  /<model>  /models  /tools  /reset  /quit")
                 continue
             if cmd == "models":
                 pix.notice("  " + ", ".join(models.list_models(cfg)))
@@ -675,6 +792,13 @@ def main() -> int:
                 messages = [{"role": "system", "content": system}]
                 state.used = None
                 pix.notice("  conversation reset")
+                continue
+            if cmd in models.list_models(cfg):
+                model_key = cmd
+                spec = models.resolve_model(cfg, model_key)
+                state.set_model(model_key, spec)
+                state.used = None
+                pix.notice(f"  model → {model_key} ({spec['id']}) @ {endpoint_of(spec)}", "cyan")
                 continue
             pix.notice(f"  [unknown command /{cmd}] /help for the list", "red")
             continue

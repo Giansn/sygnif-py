@@ -69,7 +69,12 @@ if ($userPath -notlike "*$binDir*") {
 }
 
 Say "installed. commands: sygnif (seat), sygnif-desk (browser dashboard), sygnif-nexus (portal board, needs WSL), sygnif-centre (knot point), sygnif-commander (hands)"
-Say "default model is a FREE OpenRouter slug — make a free key at openrouter.ai, then:"
-Say '        $env:OPENROUTER_API_KEY = "sk-or-..."'
-Say "to use your own Claude Pro/Max subscription instead:  sygnif login   (needs the claude CLI)"
-Say "add other models in $homeDir\config.json or ~\.sygnif\sygnif-py.json"
+Say ""
+Say "FIRST RUN: type  sygnif  once. The default model is Claude Fable 5.1, so the first"
+Say "launch walks you through logging in to your Claude Pro/Max subscription (via the"
+Say "official claude CLI) and sets up a pentest workspace at ~\sygnif-pentest."
+Say "        sygnif"
+Say ""
+Say "prefer a free model with no login?  in the seat run:  /model openrouter-free"
+Say '        (free key at openrouter.ai, then: $env:OPENROUTER_API_KEY = "sk-or-...")'
+Say "add or change models in $homeDir\config.json or ~\.sygnif\sygnif-py.json"

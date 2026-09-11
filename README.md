@@ -5,9 +5,11 @@ It's an agent loop over **any OpenAI-compatible chat endpoint**: the model calls
 tools by emitting a fenced `` ```tool `` block, the seat runs the tool on your
 machine and feeds the result back, and it loops until the model answers.
 
-No private models are baked in. Out of the box it points at a **free public
-OpenRouter model** so it works after one `export`; you can also log in to your own
-**Claude Pro/Max subscription** with `sygnif login`, or add any other endpoint.
+No private models are baked in. Out of the box the default model is **Claude
+Fable 5.1** on your own **Claude Pro/Max subscription** (via the official `claude`
+CLI): the first time you run `sygnif`, it walks you through login and sets up a
+pentest workspace. Prefer no login? Switch to a **free public OpenRouter model**
+with `/model openrouter-free`, or add any other OpenAI-compatible endpoint.
 
 ## Install
 
@@ -26,25 +28,34 @@ irm https://raw.githubusercontent.com/Giansn/sygnif-py/main/dist/install.ps1 | i
 (Or host the four files in `dist/` yourself — any static host works — and set
 `SYGNIF_PY_BASE_URL` before piping the installer.)
 
-## First run — pick how it talks to a model
+## First run — just type `sygnif`
 
-The default model is a **free** OpenRouter slug, so the fastest start is:
-
-```sh
-# 1. make a free key at https://openrouter.ai/keys  (no card needed)
-export OPENROUTER_API_KEY=sk-or-...
-sygnif "hello"
-```
-
-Prefer your own **Claude subscription** (billed to Pro/Max, not pay-per-use API)?
-Install the [claude CLI](https://claude.com/claude-code), then:
+The default model is **Claude Fable 5.1** on your Claude Pro/Max subscription, so
+the first launch is guided. Install the [claude CLI](https://claude.com/claude-code)
+first (that's what carries the subscription login), then:
 
 ```sh
-sygnif login                 # wraps `claude setup-token` (one time)
-sygnif --model claude "hello"
+sygnif                       # first run: logs you in + preps a pentest workspace
 ```
 
-Free OpenRouter slugs rotate; if the default 404s, pick a current one from
+That one-time onboarding:
+
+1. runs `claude setup-token` so Fable 5.1 bills to your Pro/Max plan (not the
+   pay-per-use API) — you can skip and run `sygnif login` later;
+2. creates `~/sygnif-pentest/` with a `SCOPE.md` authorization reminder;
+3. reports which common pentest tools (`nmap`, `curl`, `dig`, …) are on your box;
+4. drops you into the **pentest** preset, ready for your first authorized target.
+
+It runs only once (gated by `~/.sygnif/.sygnif-py-initialized`; set
+`SYGNIF_PY_FIRSTRUN=0` to skip it entirely, or delete the marker to run it again).
+
+**Prefer a free model with no login?** In the seat, switch anytime:
+
+```sh
+/model openrouter-free       # then: export OPENROUTER_API_KEY=sk-or-...  (free key)
+```
+
+Free OpenRouter slugs rotate; if it 404s, pick a current one from
 <https://openrouter.ai/models?max_price=0> and set its `id` in your config.
 
 Both need **Python 3.8+** on PATH and nothing else — the seat uses only the
@@ -201,12 +212,13 @@ Working on a remote box? Don't expose the port — tunnel to it:
 
 ## Models — bring your own
 
-Three models ship listed:
+Four models ship listed:
 
 | model | what it is | to use |
 |---|---|---|
-| `openrouter-free` *(default)* | a free public OpenRouter slug — the out-of-box default | `export OPENROUTER_API_KEY=...` |
-| `claude` | your own Claude Pro/Max subscription via the official `claude` CLI | `sygnif login` (needs the claude CLI) |
+| `fable` *(default)* | **Claude Fable 5.1** on your Claude Pro/Max subscription via the official `claude` CLI | first run of `sygnif`, or `sygnif login` (needs the claude CLI) |
+| `claude` | any other model on your subscription (`sonnet`/`opus`/`haiku`/full id) | `sygnif login` (needs the claude CLI) |
+| `openrouter-free` | a free public OpenRouter slug — no login, just a free key | `/model openrouter-free` + `export OPENROUTER_API_KEY=...` |
 | `inkling` | ThinkingMachines Inkling 256k on a local bridge (`:9223`) | run the bridge yourself |
 
 Beyond those the seat is model-agnostic — anything that speaks
@@ -255,7 +267,7 @@ seat.py            agent loop + REPL + OpenAI-compatible transport
 tools.py           built-in tools + plugin loader
 models.py          model/preset registry (config.json + ~/.sygnif/sygnif-py.json)
 identity.py        system prompt + tool protocol + live tool catalog
-config.json        the shipped registry (openrouter-free default + claude + inkling + presets + BYO examples)
+config.json        the shipped registry (fable/Fable 5.1 default + claude + openrouter-free + inkling + presets + BYO examples)
 centre.py          the Centre — neuron registry + HTTP endpoint (the knot point)
 commander.py       the commander — sandboxed fs/exec JSON-RPC server (the hands)
 sygnif.sh/.ps1             seat launchers (Linux/macOS · Windows)
