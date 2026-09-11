@@ -32,8 +32,10 @@ _CODES = {
     "yellow": "\x1b[33m",
     "blue": "\x1b[34m",
     "magenta": "\x1b[35m",
-    "cyan": "\x1b[36m",
+    "cyan": "\x1b[38;2;34;211;238m",
     "gray": "\x1b[90m",
+    "slate": "\x1b[38;2;71;85;105m",
+    "green": "\x1b[38;2;16;185;129m",
 }
 
 
@@ -212,14 +214,29 @@ def hello(name: str, model_key: str, model_id: str, endpoint: str) -> None:
         print("Type a prompt, or /help for commands.")
 
 
-# --- full seat chrome (ported from the SYGNIF pi seat: wordmark + Σ box) -----
-
+# --- full seat chrome (faithful port of the SYGNIF pi seat's render.ts) ------
+# Truecolor palette copied verbatim from the pi seat so the terminal matches the
+# SYGNIF brand exactly: cyan border/accent, slate meta, green ok.
 import re as _re
 
 SIGIL = "Σ"
+_TC = {
+    "cyan": "38;2;34;211;238",   # #22D3EE accent — border, headings, ❯
+    "green": "38;2;16;185;129",  # #10B981 ctx ok
+    "slate": "38;2;71;85;105",   # #475569 dim — rules, separators, meta
+}
 
-# SYGNIF block wordmark (figlet "ANSI Shadow") — the same mark the pi seat shows
-# at boot. Reversible: SYGNIF_PY_BANNER=0 hides it; auto-skipped off-TTY/narrow.
+
+def tc(key: str, s: str, bold: bool = False) -> str:
+    """Paint s in a truecolor palette entry (no-op when colour is off)."""
+    if not COLOR or not s:
+        return s
+    codes = _TC.get(key, "")
+    if bold:
+        codes = (codes + ";1") if codes else "1"
+    return f"\x1b[{codes}m{s}\x1b[0m"
+
+
 WORDMARK = [
     "███████╗██╗   ██╗ ██████╗ ███╗   ██╗██╗███████╗",
     "██╔════╝╚██╗ ██╔╝██╔════╝ ████╗  ██║██║██╔════╝",
@@ -237,54 +254,134 @@ def vlen(s: str) -> int:
     return len(_ANSI_RE.sub("", s))
 
 
+def frame_width() -> int:
+    """Full terminal width — the prompt frame and seat box both span it (pi parity)."""
+    return width()
+
+
 def banner() -> str:
     """SYGNIF wordmark in brand cyan, or '' when it should not show. Reversible:
-    SYGNIF_PY_BANNER=0/off hides it; skipped off-TTY, when PIX is off, or when the
-    terminal is narrower than the mark (so it never wrap-mangles)."""
+    SYGNIF_PY_BANNER=0/off hides it; skipped off-TTY/PIX or when too narrow."""
     if not PIX:
         return ""
     if os.environ.get("SYGNIF_PY_BANNER", "").strip().lower() in ("0", "off", "false", "no"):
         return ""
     w = max(len(l) for l in WORDMARK)
-    if width() < w:
+    if frame_width() < w:
         return ""
-    return "\n".join(cyan(l) for l in WORDMARK)
+    return "\n".join(tc("cyan", l) for l in WORDMARK)
 
 
-def seat_box(model_id: str, n_tools: int, extras: str, switch_line: str, help_line: str) -> None:
-    """The framed 'Σ SYGNIF seat' welcome box: model · tools · extras, then the
-    model-switch legend and the session-command legend. Plain fallback off-PIX."""
-    title = f"{SIGIL} SYGNIF seat"
-    body = [
-        f"{bold(model_id)} {dim('·')} {n_tools} tools {dim('·')} {dim(extras)}",
-        dim(switch_line),
-        dim(help_line),
-    ]
+def box(title: str, body_lines, tone: str = "cyan") -> str:
+    """Rounded full-width box with a bold title inset in the top rule — the exact
+    geometry of the pi seat's render.ts box(): cols = terminal width, inner = cols-4."""
+    W = frame_width()
+    inner = W - 4
+    tag = f" {title} " if title else ""
+    fill = max(0, W - 2 - 1 - vlen(tag))
+    out = [tc(tone, "╭─") + tc(tone, tag, bold=True) + tc(tone, "─" * fill + "╮")]
+    for row in body_lines:
+        gap = " " * max(0, inner - vlen(row))
+        out.append(tc(tone, "│") + " " + row + gap + " " + tc(tone, "│"))
+    out.append(tc(tone, "╰" + "─" * (W - 2) + "╯"))
+    return "\n".join(out)
+
+
+def seat_box(model_id: str, n_tools: int, extras: str, switch_line: str, help_line: str, probe: str = "") -> None:
+    """The 'Σ SYGNIF seat' welcome box, same box language as the pi seat."""
     if not PIX:
-        print(f"{title} — {model_id} · {n_tools} tools · {extras}")
+        print(f"{SIGIL} SYGNIF seat — {model_id} · {n_tools} tools · {extras}")
         print("  " + switch_line)
         print("  " + help_line)
+        if probe:
+            print("  " + probe)
         return
-    w = min(max([vlen(title) + 1] + [vlen(b) for b in body]), max(20, width() - 4))
-    print(cyan("╭─ ") + cyan(bold(title)) + cyan(" " + "─" * max(0, w - vlen(title) - 1) + "╮"))
-    for b in body:
-        print(cyan("│ ") + b + " " * max(0, w - vlen(b)) + cyan(" │"))
-    print(cyan("╰" + "─" * (w + 2) + "╯"))
+    body = [
+        f"{tc('cyan', model_id, bold=True)} {tc('slate', '·')} {n_tools} tools {tc('slate', '·')} {tc('slate', extras)}",
+        tc("slate", switch_line),
+        tc("slate", help_line),
+    ]
+    if probe:
+        body.append(tc("slate", probe))
+    print(box(f"{SIGIL} SYGNIF seat", body, "cyan"))
 
 
-def status_line(model: str, used, window, tps, turns: int, state: str = "idle") -> None:
-    """The idle status readout above the prompt: state dot, ctx occupancy, last
-    tps, model, turn count — the fields the pi seat pins under its prompt box."""
+def status_bar(model: str, used, window, tps, frame: bool = True) -> str:
+    """The strip under the prompt: ○ idle · ctx · tps · model — a faithful port of
+    render.ts statusBar(). `frame` makes it the box's bottom rule (╰─ … ─╯)."""
+    W = frame_width()
+    dot = tc("slate", "○ idle")
+    pct = round((used / window) * 100) if (used is not None and window) else None
+    win = fmt_k(window) if window else "0"
+    ctxval = "—" if used is None else (f"{fmt_k(used)}/{win}" + (f" {pct}%" if pct is not None else ""))
+    ctx = tc("slate", "ctx ") + tc("green" if pct is not None else "slate", ctxval)
+    tps_s = tc("slate", "— tps") if tps is None else tc("cyan", f"~{tps} tps")
+    model_s = tc("slate", model)
+    sep = tc("slate", " · ")
+    lead = (tc("cyan", "╰") + tc("slate", "─ ")) if frame else tc("slate", "╶─ ")
+    segs = [dot, ctx, tps_s, model_s]
+    body = sep.join(segs)
+    while (vlen(lead) + vlen(body) + 2) > W and len(segs) > 1:
+        segs.pop()
+        body = sep.join(segs)
+    fill = max(0, W - vlen(lead) - vlen(body) - 2)
+    tail = (tc("slate", "─" * fill) + tc("cyan", "╯")) if frame else tc("slate", "─" * fill + "╴")
+    return lead + body + " " + tail
+
+
+def status_line(model: str, used, window, tps, turns: int = 0, state: str = "idle") -> None:
+    """Standalone status readout (fallback when the boxed prompt is not used)."""
     if not PIX:
         return
-    dot = cyan("●") if state != "idle" else gray("○")
-    parts = []
-    if used is not None and window:
-        parts.append(f"ctx {fmt_k(used)}/{fmt_k(window)} {round(used / window * 100)}%")
-    else:
-        parts.append("ctx —")
-    parts.append(f"~{tps} tps" if tps is not None else "— tps")
-    parts.append(model)
-    if turns > 0:
-        parts.append(f"{turns} turn{'' if turns == 1 else 's'}")
-    print(f"  {dot} {dim(state + '  ·  ' + '  ·  '.join(parts))}")
+    print(status_bar(model, used, window, tps, frame=False))
+
+
+def prompt_glyph() -> str:
+    """The ❯ line's left gutter + cyan chevron: '│ ❯ ' (visible width 4)."""
+    return tc("cyan", "│") + " " + tc("cyan", "❯", bold=True) + " "
+
+
+def frame_top() -> str:
+    W = frame_width()
+    return tc("cyan", "╭" + "─" * max(0, W - 2) + "╮")
+
+
+def frame_bottom() -> str:
+    W = frame_width()
+    return tc("cyan", "╰" + "─" * max(0, W - 2) + "╯")
+
+
+def prompt_str() -> str:
+    """Fallback prompt (non-TTY / box disabled): cyan top rule then '│ ❯ '."""
+    if not PIX:
+        return "you> "
+    return frame_top() + "\n" + prompt_glyph()
+
+
+def read_prompt_box(model, used, window, tps, turns: int = 0) -> str:
+    """Draw the pi-style prompt box — top rule, the '│ ❯ ' line with a right edge,
+    and the status bar as the bottom rule — then read one line inside it.
+
+    Cooked-mode read (sys.stdin.readline) rather than the readline module: readline
+    repaints the line from column 0 and would wipe the pre-drawn bottom rule.
+    Trade-off: no arrow-key history in the boxed reader; SYGNIF_PY_PIX_BOX=0 falls
+    back to a plain readline prompt (with history) and the status line above it."""
+    boxed = PIX and TTY and os.environ.get("SYGNIF_PY_PIX_BOX", "1") != "0"
+    if not boxed:
+        if PIX:
+            status_line(model, used, window, tps, turns)
+        return input(prompt_str() if PIX else "you> ")
+    W = frame_width()
+    edge = tc("cyan", "│")
+    line = prompt_glyph() + " " * max(0, W - 4 - 1) + edge
+    bar = status_bar(model, used, window, tps, frame=True)
+    sys.stdout.write("\n" + frame_top() + "\n" + line + "\n" + bar + "\r")
+    sys.stdout.write("\x1b[1A\x1b[5G")  # up to the ❯ row, column after '│ ❯ '
+    sys.stdout.flush()
+    s = sys.stdin.readline()  # cooked mode: terminal echoes inside the box
+    if s == "":
+        raise EOFError
+    text = s.rstrip("\n")
+    sys.stdout.write("\r\x1b[2K" + frame_bottom() + "\n")  # close the frame
+    sys.stdout.flush()
+    return text

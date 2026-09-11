@@ -60,8 +60,75 @@ FIRSTRUN_MARKER = os.path.expanduser(
     os.environ.get("SYGNIF_PY_FIRSTRUN_MARKER", "~/.sygnif/.sygnif-py-initialized")
 )
 PENTEST_DIR = os.path.expanduser(os.environ.get("SYGNIF_PY_PENTEST_DIR", "~/sygnif-pentest"))
-# Common tools a first pentest reaches for — reported present/missing, never assumed.
+# Common tools a first pentest reaches for — reported present/missing, and (on
+# first run, with consent) installed via the host package manager. Kali/Debian
+# ships all of these; on other distros we install what the manager knows.
 PENTEST_TOOLS = ["nmap", "curl", "dig", "whois", "nc", "nikto", "gobuster", "sqlmap", "hydra", "openssl"]
+# binary name -> package name, per manager, when they differ. Unlisted binaries
+# install under their own name (true for nmap, nikto, sqlmap, hydra, whois, ...).
+_PKG_NAMES = {
+    "apt": {"dig": "dnsutils", "nc": "netcat-traditional"},
+    "dnf": {"dig": "bind-utils", "nc": "nmap-ncat"},
+    "pacman": {"dig": "bind", "nc": "gnu-netcat"},
+    "brew": {"dig": "bind", "nc": "netcat"},
+}
+
+
+def _pkg_manager():
+    """Detect the host package manager. Returns (name, install_argv, update_argv|None)
+    where argv already carries `sudo` when we're not root and sudo exists. None if
+    no known manager is present (e.g. bare macOS without Homebrew)."""
+    is_root = getattr(os, "geteuid", lambda: 1)() == 0
+    sudo = [] if is_root else (["sudo"] if shutil.which("sudo") else [])
+    if shutil.which("apt-get"):
+        return ("apt", sudo + ["apt-get", "install", "-y"], sudo + ["apt-get", "update"])
+    if shutil.which("brew"):  # macOS — brew refuses to run under sudo, so never prefix it
+        return ("brew", ["brew", "install"], None)
+    if shutil.which("dnf"):
+        return ("dnf", sudo + ["dnf", "install", "-y"], None)
+    if shutil.which("pacman"):
+        return ("pacman", sudo + ["pacman", "-S", "--noconfirm"], None)
+    return None
+
+
+def _install_pentest_tools(missing: list[str]) -> None:
+    """Offer to install the missing pentest tools with the host package manager.
+    TTY-gated by the caller; skippable; grounded — we re-check with `which` after
+    and only report what actually landed. Disable entirely with SYGNIF_PY_INSTALL_TOOLS=0."""
+    if os.environ.get("SYGNIF_PY_INSTALL_TOOLS") == "0":
+        pix.notice("  tool install skipped (SYGNIF_PY_INSTALL_TOOLS=0).", "yellow")
+        return
+    mgr = _pkg_manager()
+    if not mgr:
+        pix.notice("  no known package manager found — install these yourself: " + ", ".join(missing), "yellow")
+        return
+    name, install_argv, update_argv = mgr
+    pkgs = [_PKG_NAMES.get(name, {}).get(t, t) for t in missing]
+    pix.notice(f"  {len(missing)} pentest tool(s) missing. Install with {name}?  packages: {', '.join(pkgs)}")
+    try:
+        ans = input(pix.cyan("  Install now? ") + pix.dim("[Enter = yes, s = skip] ")).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "s"
+        print()
+    if ans not in ("", "y", "yes"):
+        pix.notice("  skipped. Install later with your package manager, or re-run: sygnif", "yellow")
+        return
+    try:
+        if update_argv:
+            print(pix.dim("  running: " + " ".join(update_argv) + "\n"))
+            subprocess.call(update_argv)
+        cmd = install_argv + pkgs
+        print(pix.dim("  running: " + " ".join(cmd) + "\n"))
+        rc = subprocess.call(cmd)
+    except Exception as e:  # noqa: BLE001
+        pix.notice(f"  [install failed: {e} — install the tools manually]", "yellow")
+        return
+    now_have = [t for t in missing if shutil.which(t)]
+    still_missing = [t for t in missing if not shutil.which(t)]
+    if now_have:
+        pix.notice("  installed: " + ", ".join(now_have), "green")
+    if still_missing:
+        pix.notice(f"  still missing (rc={rc}): " + ", ".join(still_missing) + " — install these manually", "yellow")
 
 _FENCE = re.compile(r"```(?:tool|json)?\s*(\{.*?\})\s*```", re.S)
 
@@ -670,12 +737,14 @@ def do_first_run(spec: dict) -> None:
     except Exception as e:  # noqa: BLE001
         pix.notice(f"  [could not create pentest workspace: {e}]", "yellow")
 
-    # 3. Report which pentest tools are actually installed — grounded, not assumed.
+    # 3. Report which pentest tools are installed, then offer to install the rest
+    #    with the host package manager — grounded, re-checked after, never assumed.
     have = [t for t in PENTEST_TOOLS if shutil.which(t)]
     missing = [t for t in PENTEST_TOOLS if not shutil.which(t)]
     pix.notice("  tools present: " + (", ".join(have) if have else "none of the usual set"))
     if missing:
         pix.notice("  not installed: " + ", ".join(missing))
+        _install_pentest_tools(missing)
 
     print(pix.rule())
     pix.notice("  You're set. Describe your first authorized target and SYGNIF will begin recon.")
@@ -728,27 +797,26 @@ def main() -> int:
         run_turn(spec, messages, reg, confirm, state)
         return 0
 
-    # REPL: full PIX chrome — wordmark, then the Σ SYGNIF seat welcome box.
+    # REPL: full PIX chrome — wordmark, then the Σ SYGNIF seat welcome box (pi parity).
     _wm = pix.banner()
     if _wm:
-        print(_wm)
-    _switch = " · ".join("/" + k for k in models.list_models(cfg)) + "  → switch model"
+        print("\n" + _wm + "\n")
+    if spec.get("provider") == "claude-cli":
+        _key = "claude login" if shutil.which(CLAUDE_BIN) else "run: sygnif login"
+    else:
+        _key = "set" if spec.get("api_key") else ("none" if not spec.get("api_key_env") else f"missing ${spec['api_key_env']}")
+    _switch = " · ".join("/" + k for k in models.list_models(cfg)) + " → switch model"
     pix.seat_box(
         spec["id"], len(reg),
         "presets: " + ", ".join(models.list_presets(cfg)),
         _switch,
         "/reset → new session   /exit (/quit) → leave   Ctrl-C → abort",
+        probe=f"{endpoint_of(spec)} · key={_key}" + ("  · confirm on" if confirm else ""),
     )
-    if spec.get("provider") == "claude-cli":
-        _key = "claude login" if shutil.which(CLAUDE_BIN) else "run: sygnif login"
-    else:
-        _key = "set" if spec.get("api_key") else ("none" if not spec.get("api_key_env") else f"missing ${spec['api_key_env']}")
-    pix.banner_line(f"  preset '{name}'  ·  {endpoint_of(spec)}  ·  key={_key}" + ("  ·  confirm on" if confirm else ""))
 
     while True:
-        pix.status_line(state.model_key, state.used, state.window, state.tps, state.turns)
         try:
-            line = input(pix.prompt_str()).strip()
+            line = pix.read_prompt_box(state.model_key, state.used, state.window, state.tps, state.turns).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0

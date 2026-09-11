@@ -43,7 +43,10 @@ That one-time onboarding:
 1. runs `claude setup-token` so Fable 5.1 bills to your Pro/Max plan (not the
    pay-per-use API) — you can skip and run `sygnif login` later;
 2. creates `~/sygnif-pentest/` with a `SCOPE.md` authorization reminder;
-3. reports which common pentest tools (`nmap`, `curl`, `dig`, …) are on your box;
+3. reports which common pentest tools (`nmap`, `curl`, `dig`, …) are on your box,
+   and **offers to install the ones you're missing** (`nikto`, `gobuster`, `sqlmap`,
+   `hydra`, `dnsutils`, …) via your package manager — `apt`/`brew`/`dnf`/`pacman`,
+   skippable, needs `sudo`. Set `SYGNIF_PY_INSTALL_TOOLS=0` to turn this off;
 4. drops you into the **pentest** preset, ready for your first authorized target.
 
 It runs only once (gated by `~/.sygnif/.sygnif-py-initialized`; set
