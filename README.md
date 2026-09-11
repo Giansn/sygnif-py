@@ -78,6 +78,18 @@ SYGNIF py ships the generic core of the SYGNIF architecture — a **seat**, a
 The agent loop. Talks to any OpenAI-compatible model, calls tools, loops until it
 answers. This is what you run day to day.
 
+Over a terminal it renders the **pix UI**: the model's reply streams token by
+token, each turn opens with a `── turn N · HH:MM:SS ──` rule, and a dim status
+line under the `❯` prompt shows where you stand —
+`Σ <model> · ctx <used>/<window> <pct>% · ~<tps> tps · <n> turns`
+(context occupancy and throughput come from the endpoint's own usage report when
+it sends one, else a char estimate). Tool calls show as clean `→ tool(args)` /
+`← result` lines instead of raw JSON. It's on automatically when stdout is a TTY;
+a pipe gets plain text with no escape codes. Turn it off with `SYGNIF_PY_PIX=0`,
+and colour follows `NO_COLOR`.
+
+REPL commands: `/preset` `/model` `/models` `/tools` `/reset` `/help` `/quit`.
+
 ### Centre (`sygnif-centre`) — the knot point
 One local HTTP endpoint (`:9100`) fronting a registry of **neurons** — small
 capabilities behind a single dispatch. Ships generic, read-mostly neurons:
