@@ -141,6 +141,52 @@ Knobs (all optional):
 > can reach it, and it will **not** run shell commands unless you explicitly set
 > `SYGNIF_DESK_EXEC=1`. Don't expose it to a public address.
 
+## Nexus — a portal board for your agent sessions
+
+`sygnif-nexus` puts a live board of your **tmux sessions** in the browser. Every
+tmux session named `<type>` or `<type>-<label>` (e.g. `sygnif-thesis`,
+`claude-recon`) is a *portal*: a running agent you can see, spawn, rename and
+kill from the page, and attach to from any terminal.
+
+**Setup** (Linux/macOS; on Windows run it inside WSL):
+
+1. Install tmux if you don't have it: `sudo apt install tmux` / `brew install tmux`.
+2. Start the board:
+
+   ```sh
+   sygnif-nexus                    # serves http://127.0.0.1:8910
+   ```
+
+3. Open <http://127.0.0.1:8910>. Pick a type, give the portal a label (e.g.
+   `thesis`), hit **spawn** — a detached tmux session starts with that agent
+   already running in it.
+4. To sit down at a portal, click its card to copy the attach command, then run
+   it in any terminal: `tmux attach -t <name>`. Detach again with `Ctrl-b d` —
+   the agent keeps running.
+
+Portal types are discovered from what your machine has: `sygnif` (the seat
+itself), `claude` (if the Claude CLI is on PATH), and `shell` (your login
+shell). Add your own agents via env:
+
+```sh
+SYGNIF_NEXUS_TYPES="aider=aider,ipython=ipython" sygnif-nexus
+```
+
+Knobs (all optional):
+
+| env var | default | what it does |
+|---|---|---|
+| `SYGNIF_NEXUS_PORT` | `8910` | port to serve on |
+| `SYGNIF_NEXUS_BIND` | `127.0.0.1` | bind address — keep it loopback |
+| `SYGNIF_NEXUS_TYPES` | — | extra portal types, `name=command,name2=command2` |
+
+Working on a remote box? Don't expose the port — tunnel to it:
+`ssh -N -L 8910:127.0.0.1:8910 <host>`, then open `http://localhost:8910`.
+
+> **Safety:** the Nexus binds to loopback only, and it refuses to kill a portal
+> that someone is currently attached to (detach first). Same zero-dependency
+> deal: pure Python standard library — the only system requirement is tmux.
+
 ## Models — bring your own
 
 Three models ship listed:

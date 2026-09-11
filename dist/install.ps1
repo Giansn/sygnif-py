@@ -53,6 +53,7 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 foreach ($pair in @(
     @("sygnif", "sygnif.ps1"),
     @("sygnif-desk", "sygnif-desk.ps1"),
+    @("sygnif-nexus", "sygnif-nexus.ps1"),
     @("sygnif-centre", "sygnif-centre.ps1"),
     @("sygnif-commander", "sygnif-commander.ps1")
 )) {
@@ -67,7 +68,7 @@ if ($userPath -notlike "*$binDir*") {
     Say "added $binDir to your user PATH (open a new terminal to pick it up)."
 }
 
-Say "installed. commands: sygnif (seat), sygnif-desk (browser dashboard), sygnif-centre (knot point), sygnif-commander (hands)"
+Say "installed. commands: sygnif (seat), sygnif-desk (browser dashboard), sygnif-nexus (portal board, needs WSL), sygnif-centre (knot point), sygnif-commander (hands)"
 Say "default model is a FREE OpenRouter slug — make a free key at openrouter.ai, then:"
 Say '        $env:OPENROUTER_API_KEY = "sk-or-..."'
 Say "to use your own Claude Pro/Max subscription instead:  sygnif login   (needs the claude CLI)"

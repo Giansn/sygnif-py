@@ -18,12 +18,14 @@ mkdir -p "$DIST"
 # Files that make up the runtime package (NOT the installers or dist tooling).
 PKG=(
   seat.py tools.py models.py identity.py config.json
-  centre.py commander.py desk.py
+  centre.py commander.py desk.py nexus.py
   static/index.html static/app.js static/style.css static/theme-dark.css
+  static/nexus.html
   sygnif.sh sygnif.ps1
   sygnif-centre.sh sygnif-centre.ps1
   sygnif-commander.sh sygnif-commander.ps1
   sygnif-desk.sh sygnif-desk.ps1
+  sygnif-nexus.sh sygnif-nexus.ps1
   README.md custom_tools.py.example
 )
 
