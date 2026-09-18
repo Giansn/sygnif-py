@@ -35,6 +35,7 @@ import urllib.request
 
 import identity
 import models
+import pentest
 import pix
 import tools
 
@@ -737,14 +738,30 @@ def do_first_run(spec: dict) -> None:
     except Exception as e:  # noqa: BLE001
         pix.notice(f"  [could not create pentest workspace: {e}]", "yellow")
 
-    # 3. Report which pentest tools are installed, then offer to install the rest
-    #    with the host package manager — grounded, re-checked after, never assumed.
-    have = [t for t in PENTEST_TOOLS if shutil.which(t)]
-    missing = [t for t in PENTEST_TOOLS if not shutil.which(t)]
-    pix.notice("  tools present: " + (", ".join(have) if have else "none of the usual set"))
-    if missing:
-        pix.notice("  not installed: " + ", ".join(missing))
-        _install_pentest_tools(missing)
+    # 3. Provision the FULL Kali pentest toolset (not just a handful of packages).
+    #    pentest.install_full_toolset picks the best tier: metapackages on a Kali
+    #    host, a persistent `sygnif-kali` container off kalilinux/kali-rolling on
+    #    any Docker host, or a curated apt set as a last resort. Grounded + TTY-gated.
+    if os.environ.get("SYGNIF_PY_INSTALL_TOOLS") == "0":
+        pix.notice("  Kali toolset install skipped (SYGNIF_PY_INSTALL_TOOLS=0).", "yellow")
+    else:
+        pentest.toolset_status(pix.notice)
+        mode = pentest.choose_mode()
+        prompt = {
+            "host": "  Install the full Kali toolset (metapackages) on this Kali host now?",
+            "docker": "  Set up the full Kali toolset in a `sygnif-kali` Docker container now?",
+            "fallback": "  Install a curated pentest tool set with your package manager now?",
+        }.get(mode, "  Install the pentest toolset now?")
+        pix.notice(prompt)
+        try:
+            ans = input(pix.cyan("  Proceed? ") + pix.dim("[Enter = yes, s = skip] ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "s"
+            print()
+        if ans in ("", "y", "yes"):
+            pentest.install_full_toolset(pix.notice)
+        else:
+            pix.notice("  skipped. Run it any time with:  sygnif kali-setup", "yellow")
 
     print(pix.rule())
     pix.notice("  You're set. Describe your first authorized target and SYGNIF will begin recon.")
@@ -755,6 +772,10 @@ def do_first_run(spec: dict) -> None:
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "login":
         return do_login()
+    if len(sys.argv) >= 2 and sys.argv[1] in ("kali-setup", "kali_setup"):
+        pentest.toolset_status(pix.notice)
+        ok = pentest.install_full_toolset(pix.notice)
+        return 0 if ok else 1
     ap = argparse.ArgumentParser(description="SYGNIF py — the generic SYGNIF seat")
     ap.add_argument("--preset", default=None, help="preset name (default: config default_preset)")
     ap.add_argument("--model", default=None, help="override model (a key in the models table)")

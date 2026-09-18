@@ -17,7 +17,7 @@ mkdir -p "$DIST"
 
 # Files that make up the runtime package (NOT the installers or dist tooling).
 PKG=(
-  seat.py pix.py tools.py models.py identity.py config.json
+  seat.py pix.py render.py pentest.py tools.py models.py identity.py config.json
   centre.py commander.py desk.py nexus.py
   static/index.html static/app.js static/style.css static/theme-dark.css
   static/nexus.html

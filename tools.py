@@ -29,6 +29,11 @@ import urllib.request
 SEAT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SHELL_TIMEOUT = int(os.environ.get("SYGNIF_PY_SHELL_TIMEOUT", "120"))
+# Kali scans routinely run past the 120s shell cap — a full nmap, a nuclei run
+# with many templates, or gobuster on a large wordlist all die mid-scan at 120s.
+# The kali tool gets its own, longer budget (default 15 min) so a real scan can
+# finish instead of being killed and reported as a truncated non-result.
+KALI_TIMEOUT = int(os.environ.get("SYGNIF_PY_KALI_TIMEOUT", "900"))
 MAX_OUTPUT = int(os.environ.get("SYGNIF_PY_MAXOUT", "8000"))
 MAX_READ = int(os.environ.get("SYGNIF_PY_MAXREAD", "20000"))
 JOURNAL = os.path.expanduser(
@@ -212,6 +217,246 @@ def tool_commander(args: dict) -> str:
         return _truncate(json.dumps(data, indent=2, default=str))
 
 
+# --- internet + github + kali (stdlib-only, no extra deps) ------------------
+
+WEB_TIMEOUT = int(os.environ.get("SYGNIF_PY_WEB_TIMEOUT", "30"))
+WEB_MAXBYTES = int(os.environ.get("SYGNIF_PY_WEB_MAXBYTES", "200000"))
+_UA = os.environ.get("SYGNIF_PY_WEB_UA", "sygnif-py/1.0 (+https://github.com/Giansn/sygnif-py)")
+
+
+def _http_get(url: str, headers: dict | None = None) -> tuple[str, int, str]:
+    """GET a URL. Returns (body, status, error). Never raises."""
+    h = {"User-Agent": _UA, "Accept": "*/*"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=WEB_TIMEOUT) as resp:
+            raw = resp.read(WEB_MAXBYTES + 1)
+            body = raw[:WEB_MAXBYTES].decode(errors="replace")
+            if len(raw) > WEB_MAXBYTES:
+                body += f"\n[... truncated at {WEB_MAXBYTES} bytes ...]"
+            return body, getattr(resp, "status", 200), ""
+    except urllib.error.HTTPError as e:
+        return e.read().decode(errors="replace")[:2000], e.code, f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return "", 0, f"{type(e).__name__}: {e}"
+
+
+def _strip_html(html: str) -> str:
+    import re
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = (text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " "))
+    return re.sub(r"[ \t]*\n[ \t\n]*", "\n", re.sub(r"[ \t]+", " ", text)).strip()
+
+
+def tool_web(args: dict) -> str:
+    """Reach the internet: fetch a URL, or run a web search (DuckDuckGo, no key)."""
+    url = str(args.get("url", "")).strip()
+    query = str(args.get("query", "")).strip()
+    if not url and not query:
+        return "web: give a 'url' to fetch, or a 'query' to search the web."
+    if query and not url:
+        import re
+        import urllib.parse as _up
+        q = _up.urlencode({"q": query})
+        body = ""
+        # duckduckgo.com/html resets from some hosts; html.* and lite.* are stabler.
+        for base in ("https://html.duckduckgo.com/html/?", "https://lite.duckduckgo.com/lite/?"):
+            body, status, err = _http_get(base + q)
+            if body:
+                break
+        if not body:
+            return f"[web search failed: {err}]"
+        if re.search(r"(?i)bots use DuckDuckGo|complete the following challenge", body):
+            return ("[web search blocked: the search engine served a bot challenge to "
+                    "this host's network. Fetch a specific URL with web(url=...) instead, "
+                    "or run this from a residential connection.]")
+        hits = re.findall(r'result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', body, re.S)
+        if not hits:  # lite layout: links carry the target directly
+            hits = [(h, h) for h in re.findall(r'href="(https?://[^"]+)"', body)
+                    if "duckduckgo.com" not in h][:10]
+        if not hits:
+            return _truncate(_strip_html(body), 3000) or "[web search: no results parsed]"
+        seen, lines = set(), []
+        for href, title in hits:
+            m = re.search(r"uddg=([^&]+)", href)
+            link = _up.unquote(m.group(1)) if m else href
+            if link in seen:
+                continue
+            seen.add(link)
+            lines.append(f"- {_strip_html(title) or link}\n  {link}")
+            if len(lines) >= 10:
+                break
+        return "web search: " + query + "\n" + "\n".join(lines)
+    raw = str(args.get("raw", "")).lower() in ("1", "true", "yes")
+    body, status, err = _http_get(url)
+    if err and not body:
+        return f"[web fetch failed: {err}]"
+    text = body if raw else _strip_html(body)
+    return f"GET {url} -> HTTP {status}\n" + _truncate(text)
+
+
+def tool_github(args: dict) -> str:
+    """Search GitHub for tools/repos (and optionally code). No key needed;
+    GITHUB_TOKEN in the environment raises the rate limit if present."""
+    import urllib.parse
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "github: give a 'query', e.g. 'subdomain enumeration tool'."
+    kind = str(args.get("kind", "repositories")).strip().lower()
+    if kind not in ("repositories", "code"):
+        kind = "repositories"
+    qs = urllib.parse.urlencode({"q": query, "per_page": str(int(args.get("limit", 10) or 10)),
+                                 "sort": "stars" if kind == "repositories" else "indexed"})
+    headers = {"Accept": "application/vnd.github+json"}
+    tok = os.environ.get("GITHUB_TOKEN", "").strip()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    body, status, err = _http_get(f"https://api.github.com/search/{kind}?{qs}", headers)
+    if err and not body:
+        return f"[github search failed: {err}]"
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return f"[github: unparseable response (HTTP {status})]\n" + _truncate(body, 1000)
+    items = data.get("items") or []
+    if not items:
+        msg = data.get("message")
+        return f"github: no results for '{query}'" + (f" ({msg})" if msg else "")
+    lines = [f"github {kind} for '{query}' (top {len(items[:10])} of {data.get('total_count', '?')}):"]
+    for it in items[:10]:
+        if kind == "repositories":
+            lines.append(f"- {it.get('full_name')}  ★{it.get('stargazers_count', 0)}"
+                         f"  {it.get('language') or ''}\n  {it.get('html_url')}"
+                         f"\n  {(it.get('description') or '').strip()[:200]}")
+        else:
+            repo = (it.get("repository") or {}).get("full_name", "?")
+            lines.append(f"- {repo}: {it.get('path')}\n  {it.get('html_url')}")
+    return "\n".join(lines)
+
+
+# The verified Kali arsenal, category -> tools, confirmed present AND functional
+# in the sygnif-kali container on 2026-09-17 (each smoke-tested, not just on
+# PATH). This is the honest inventory the pentest focus text only claimed: that
+# text named tools that were not actually installed (katana, ligolo-ng,
+# volatility3). This map is the fallback; tool_kali_tools queries the live
+# container first, so a freshly provisioned or upgraded container reports its
+# real state rather than this snapshot.
+KALI_VERIFIED: dict[str, list[str]] = {
+    "recon":        ["nmap", "masscan", "amass", "subfinder", "dnsx", "dnsrecon",
+                     "dnsenum", "fierce", "theHarvester", "recon-ng", "whatweb",
+                     "wafw00f", "sslscan", "sslyze", "httpx"],
+    "web":          ["nikto", "gobuster", "feroxbuster", "ffuf", "dirb",
+                     "dirbuster", "wfuzz", "sqlmap", "wpscan", "nuclei",
+                     "commix", "xsser"],
+    "passwords":    ["hydra", "medusa", "patator", "john", "hashcat", "hashid",
+                     "hash-identifier", "crackmapexec", "netexec", "crunch", "cewl"],
+    "smb_ad":       ["enum4linux", "enum4linux-ng", "smbclient", "smbmap",
+                     "responder", "evil-winrm", "bloodhound-python",
+                     "impacket-secretsdump", "impacket-psexec"],
+    "exploit":      ["msfconsole", "msfvenom", "searchsploit"],
+    "sniff_mitm":   ["wireshark", "tshark", "tcpdump", "bettercap", "ettercap"],
+    "wireless":     ["aircrack-ng", "wifite", "reaver", "hcxdumptool"],
+    "pivot":        ["proxychains", "proxychains4", "chisel", "socat"],
+    "forensics_re": ["binwalk", "foremost", "radare2", "ghidra", "gdb",
+                     "steghide", "exiftool"],
+    "essentials":   ["curl", "wget", "openssl", "nc", "ncat"],
+}
+
+
+def _kali_probe_present(container: str, names: list[str]) -> list[str]:
+    """Ask the running container which of `names` are on PATH. One exec, so the
+    round trip stays cheap even for the full arsenal."""
+    joined = " ".join(names)
+    inner = 'for t in ' + joined + '; do command -v "$t" >/dev/null 2>&1 && echo "$t"; done'
+    import shlex
+    out, _ = _run_host(
+        "docker exec " + container + " bash -lc " + shlex.quote(inner), 45)
+    return out.split()
+
+
+def tool_kali_tools(args: dict) -> str:
+    """Report the Kali arsenal actually available, category by category.
+
+    Queries the live sygnif-kali container so the answer is the container's real
+    state, not a hardcoded claim; falls back to the verified map when Docker or
+    the container is absent. `category` narrows the listing; `check` names one
+    tool and confirms it is really on PATH. The point is that the seat never has
+    to guess whether a tool exists before reaching for it via `kali`.
+    """
+    category = str(args.get("category", "")).strip().lower()
+    check = str(args.get("check", "")).strip()
+    container = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+    have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
+    live = False
+    if have_docker:
+        st, _ = _run_host(
+            "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
+        live = st.strip() == "running"
+
+    if check:
+        if live:
+            _, rc = _run_host(
+                "docker exec " + container + " bash -lc " + repr("command -v " + check), 15)
+            src = "docker:" + container
+        else:
+            _, rc = _run_host("command -v " + check, 10)
+            src = "host"
+        verdict = "available" if rc == 0 else "NOT found"
+        return check + ": " + verdict + "  (checked on " + src + ")"
+
+    if category and category not in KALI_VERIFIED:
+        return ("unknown category. known: " + ", ".join(KALI_VERIFIED)
+                + " (omit category to list all)")
+    cats = {category: KALI_VERIFIED[category]} if category else KALI_VERIFIED
+
+    lines: list[str] = []
+    total = 0
+    for cat, tool_list in cats.items():
+        present = _kali_probe_present(container, tool_list) if live else tool_list
+        total += len(present)
+        lines.append("[" + cat + "] " + ", ".join(present))
+    src = ("live: docker:" + container) if live else "fallback: verified map (container not running)"
+    header = "Kali arsenal — " + str(total) + " tool(s) available (" + src + ")"
+    return header + "\n" + "\n".join(lines)
+
+
+def tool_kali(args: dict) -> str:
+    """Run a pentest command with the Kali toolset. Prefers the `sygnif-kali`
+    Docker container (same as the pi seat) when Docker + the container are
+    available; otherwise runs directly on this host (a native Kali box already
+    has the tools). Grounds every result in real output."""
+    command = str(args.get("command", "")).strip()
+    if not command:
+        return "kali: empty command"
+    container = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+    have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
+    if have_docker:
+        state, _ = _run_host(
+            f"docker inspect -f '{{{{.State.Status}}}}' {container} 2>/dev/null", 10
+        )
+        state = state.strip()
+        if state and state != "running":
+            # Container exists but is stopped — bring it up so the toolset is usable.
+            _run_host(f"docker start {container}", 60)
+            state, _ = _run_host(
+                f"docker inspect -f '{{{{.State.Status}}}}' {container} 2>/dev/null", 10
+            )
+            state = state.strip()
+        if state == "running":
+            import shlex
+            out, rc = _run_host(f"docker exec {container} bash -lc {shlex.quote(command)}", KALI_TIMEOUT)
+            return _truncate(out) + f"\nexit={rc}  (via docker:{container})"
+    # No container — run on host (a native Kali box has the tools).
+    out, rc = _run_host(command, KALI_TIMEOUT)
+    hint = "" if _run_host("command -v nmap", 5)[1] == 0 else \
+        f"  [no '{container}' container and Kali tools not on PATH — run `sygnif kali-setup` to provision the full toolset]"
+    return _truncate(out) + f"\nexit={rc}  (on host){hint}"
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -282,6 +527,57 @@ BUILTIN_TOOLS: dict[str, dict] = {
             "args": "object of arguments for that tool",
         },
         "func": tool_commander,
+    },
+    "web": {
+        "desc": (
+            "Reach the internet. Give a 'url' to fetch a page (HTML stripped to "
+            "text by default; pass raw=true for the source), OR a 'query' to run "
+            "a keyless web search and get the top result links. Ground claims in "
+            "what the page actually returned."
+        ),
+        "args": {
+            "url": "URL to GET, e.g. 'https://example.com'",
+            "query": "OR a web-search query when you don't have a URL",
+            "raw": "optional 'true' to return raw HTML instead of stripped text",
+        },
+        "func": tool_web,
+    },
+    "github": {
+        "desc": (
+            "Search GitHub for tools, libraries and repos. Give a 'query'; get the "
+            "top repositories (name, stars, language, description, URL). Set "
+            "kind='code' to search source instead. No key needed; a GITHUB_TOKEN "
+            "in the environment raises the rate limit."
+        ),
+        "args": {
+            "query": "what to search for, e.g. 'subdomain enumeration tool'",
+            "kind": "'repositories' (default) or 'code'",
+            "limit": "how many results (default 10)",
+        },
+        "func": tool_github,
+    },
+    "kali": {
+        "desc": (
+            "Run a pentest tool with the Kali toolset and return its real output. "
+            "Uses the 'sygnif-kali' Docker container when it is up (like the pi "
+            "seat); otherwise runs on this host, which on a native Kali box "
+            "already has the tools. Only act against AUTHORIZED targets."
+        ),
+        "args": {"command": "command to run, e.g. 'nmap -sV target' or 'nikto -h url'"},
+        "func": tool_kali,
+    },
+    "kali_tools": {
+        "desc": (
+            "List the Kali tools actually available (queried live from the "
+            "'sygnif-kali' container), grouped by kill-chain category, or check "
+            "one named tool. Use this before reaching for 'kali' so you never "
+            "assume a tool that is not installed."
+        ),
+        "args": {
+            "category": "optional: recon|web|passwords|smb_ad|exploit|sniff_mitm|wireless|pivot|forensics_re|essentials",
+            "check": "optional: a single tool name to confirm on PATH, e.g. 'nuclei'",
+        },
+        "func": tool_kali_tools,
     },
 }
 

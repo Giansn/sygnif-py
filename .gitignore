@@ -19,3 +19,5 @@ sygnif-desk-full.ps1
 
 # OS cruft
 .DS_Store
+*.bak-*
+config.json.bak-*
