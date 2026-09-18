@@ -424,6 +424,197 @@ def tool_kali_tools(args: dict) -> str:
     return header + "\n" + "\n".join(lines)
 
 
+# --- pentest engagement layer ------------------------------------------------
+# Findings, phases and a shipped methodology, so the seat runs a pentest as a
+# PROCESS, not just a pile of tools. Everything lands in the shared workspace so
+# a 'kali' command in the container and 'read_file' on the host see the same
+# files. Grounded to real evidence: a finding without proof is refused.
+WORKSPACE = os.path.expanduser(
+    os.environ.get("SYGNIF_PY_PENTEST_DIR", "~/sygnif-pentest"))
+FINDINGS = os.path.join(WORKSPACE, "findings.jsonl")
+PHASE_FILE = os.path.join(WORKSPACE, ".phase")
+REPORT_FILE = os.path.join(WORKSPACE, "report.md")
+PHASES = ["recon", "enum", "vuln", "exploit", "postexploit", "report"]
+SEVERITIES = ["info", "low", "medium", "high", "critical"]
+# A finding's evidence must be at least this many chars — a defence against the
+# model recording a conclusion it did not actually observe in tool output.
+MIN_EVIDENCE = int(os.environ.get("SYGNIF_PY_MIN_EVIDENCE", "20"))
+
+
+def _current_phase() -> str:
+    try:
+        p = open(PHASE_FILE, encoding="utf-8").read().strip()
+        return p if p in PHASES else PHASES[0]
+    except OSError:
+        return PHASES[0]
+
+
+def tool_phase(args: dict) -> str:
+    """Get or set the current engagement phase. The phase tags every finding, so
+    the report reads as a methodical walk (recon -> enum -> vuln -> exploit ->
+    postexploit -> report) rather than a heap. Call with no args to see where you
+    are; pass set=<phase> to advance."""
+    want = str(args.get("set", "")).strip().lower()
+    if want:
+        if want not in PHASES:
+            return "unknown phase '" + want + "'. valid: " + " -> ".join(PHASES)
+        try:
+            os.makedirs(WORKSPACE, exist_ok=True)
+            with open(PHASE_FILE, "w", encoding="utf-8") as fh:
+                fh.write(want)
+        except OSError as e:
+            return "[phase: could not save: " + str(e) + "]"
+        return "phase set to '" + want + "'  (order: " + " -> ".join(PHASES) + ")"
+    cur = _current_phase()
+    idx = PHASES.index(cur)
+    nxt = PHASES[idx + 1] if idx + 1 < len(PHASES) else "(last)"
+    return "current phase: " + cur + "   next: " + nxt + "   full order: " + " -> ".join(PHASES)
+
+
+def tool_finding(args: dict) -> str:
+    """Record a verified finding, with evidence REQUIRED. A finding with no
+    evidence, or evidence too short to be real tool output, is refused — proof at
+    every step. Fields: title, severity (info|low|medium|high|critical), target,
+    evidence (the command run and a snippet of its real output), and optional
+    description and recommendation. Findings are appended to the workspace and
+    turned into a report by the 'report' tool."""
+    title = str(args.get("title", "")).strip()
+    severity = str(args.get("severity", "")).strip().lower()
+    target = str(args.get("target", "")).strip()
+    evidence = str(args.get("evidence", "")).strip()
+    description = str(args.get("description", "")).strip()
+    recommendation = str(args.get("recommendation", "")).strip()
+
+    missing = [n for n, v in (("title", title), ("target", target), ("evidence", evidence)) if not v]
+    if missing:
+        return "finding REFUSED — missing required field(s): " + ", ".join(missing)
+    if severity not in SEVERITIES:
+        return "finding REFUSED — severity must be one of: " + ", ".join(SEVERITIES)
+    if len(evidence) < MIN_EVIDENCE:
+        return ("finding REFUSED — evidence too thin (" + str(len(evidence)) + " chars). "
+                "Paste the actual command and a snippet of its real output; a finding must be "
+                "backed by something you observed, not asserted.")
+    try:
+        os.makedirs(WORKSPACE, exist_ok=True)
+        n = 0
+        if os.path.exists(FINDINGS):
+            with open(FINDINGS, encoding="utf-8") as fh:
+                n = sum(1 for _ in fh)
+        rec = {
+            "id": n + 1,
+            "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "phase": _current_phase(),
+            "severity": severity,
+            "title": title,
+            "target": target,
+            "evidence": evidence,
+            "description": description,
+            "recommendation": recommendation,
+        }
+        with open(FINDINGS, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        return "[finding: could not save: " + str(e) + "]"
+    return ("recorded finding #" + str(rec["id"]) + " [" + severity + "] '" + title
+            + "' (phase " + rec["phase"] + ") -> " + FINDINGS)
+
+
+def _read_findings() -> list:
+    out = []
+    try:
+        with open(FINDINGS, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        pass
+    return out
+
+
+def tool_report(args: dict) -> str:
+    """Render all recorded findings into a Markdown pentest report in the
+    workspace, grouped by severity (critical first), each with its evidence,
+    phase, and recommendation. Pulls the engagement header from SCOPE.md when
+    present. Call this at the end, or any time for a running picture."""
+    findings = _read_findings()
+    if not findings:
+        return ("no findings recorded yet — nothing to report. Use the 'finding' tool "
+                "as you confirm issues, then run 'report'.")
+    order = {s: i for i, s in enumerate(reversed(SEVERITIES))}  # critical=0 .. info=4
+    findings.sort(key=lambda f: (order.get(f.get("severity", "info"), 99), f.get("id", 0)))
+
+    lines = ["# SYGNIF pentest report",
+             "",
+             "_Generated " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "_",
+             ""]
+    scope = os.path.join(WORKSPACE, "SCOPE.md")
+    if os.path.exists(scope):
+        try:
+            lines += ["## Scope", "", open(scope, encoding="utf-8").read().strip(), ""]
+        except OSError:
+            pass
+
+    counts = {}
+    for f in findings:
+        counts[f.get("severity", "info")] = counts.get(f.get("severity", "info"), 0) + 1
+    summary = ", ".join(str(counts[s]) + " " + s for s in reversed(SEVERITIES) if s in counts)
+    lines += ["## Summary", "", str(len(findings)) + " finding(s): " + summary, ""]
+
+    lines += ["## Findings", ""]
+    for f in findings:
+        lines.append("### #" + str(f.get("id")) + " [" + f.get("severity", "?").upper() + "] " + f.get("title", ""))
+        lines.append("")
+        lines.append("- **Target:** " + f.get("target", ""))
+        lines.append("- **Phase:** " + f.get("phase", "") + "   **Found:** " + f.get("ts", ""))
+        if f.get("description"):
+            lines += ["", f["description"]]
+        lines += ["", "**Evidence:**", "", "```", f.get("evidence", "").rstrip(), "```"]
+        if f.get("recommendation"):
+            lines += ["", "**Recommendation:** " + f["recommendation"]]
+        lines += ["", "---", ""]
+
+    try:
+        os.makedirs(WORKSPACE, exist_ok=True)
+        with open(REPORT_FILE, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError as e:
+        return "[report: could not write: " + str(e) + "]"
+    return "wrote report: " + str(len(findings)) + " finding(s) (" + summary + ") -> " + REPORT_FILE
+
+
+def tool_playbook(args: dict) -> str:
+    """Return the offline pentest methodology shipped with the seat — the
+    kill-chain checklist and the role modes. Pass section=<phase or role> to get
+    just that part (recon|enum|vuln|exploit|postexploit|report|scout|analyzer|
+    exploiter|reporter). No network needed; use this when the van has no signal."""
+    section = str(args.get("section", "")).strip().lower()
+    path = os.path.join(SEAT_DIR, "methodology.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as e:
+        return "[playbook: methodology.md not found: " + str(e) + "]"
+    if not section:
+        return _truncate(text)
+    blocks = []
+    keep = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            # Exact section-word match on the heading's first token, so 'report'
+            # does not also drag in 'reporter' (nor 'exploit' -> 'exploiter').
+            head_word = line[3:].split()[0].lower() if line[3:].split() else ""
+            keep = head_word == section
+        if keep:
+            blocks.append(line)
+    if not blocks:
+        return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
+                "postexploit, report, scout, analyzer, exploiter, reporter (omit for the whole thing).")
+    return _truncate("\n".join(blocks))
+
+
 def tool_kali(args: dict) -> str:
     """Run a pentest command with the Kali toolset. Prefers the `sygnif-kali`
     Docker container (same as the pi seat) when Docker + the container are
@@ -449,6 +640,20 @@ def tool_kali(args: dict) -> str:
         if state == "running":
             import shlex
             out, rc = _run_host(f"docker exec {container} bash -lc {shlex.quote(command)}", KALI_TIMEOUT)
+            # Punkt 5 — Fehler-Wiederholung: ein Timeout ist oft ein zu langer
+            # erster Scan oder eine Lastspitze, kein echter Fehlschlag. Genau
+            # einmal mit halbem Zeitbudget nachfassen und beide Laeufe kenntlich
+            # machen, statt dem Modell ein abgeschnittenes Nicht-Ergebnis zu geben.
+            if rc == 124:
+                out2, rc2 = _run_host(
+                    f"docker exec {container} bash -lc {shlex.quote(command)}",
+                    max(60, KALI_TIMEOUT // 2))
+                if rc2 != 124:
+                    return (_truncate(out2)
+                            + f"\nexit={rc2}  (via docker:{container}; retried after a timeout)")
+                return (_truncate(out2)
+                        + f"\nexit={rc2}  (via docker:{container}; timed out twice — "
+                        f"narrow the scan, raise SYGNIF_PY_KALI_TIMEOUT, or split the target)")
             return _truncate(out) + f"\nexit={rc}  (via docker:{container})"
     # No container — run on host (a native Kali box has the tools).
     out, rc = _run_host(command, KALI_TIMEOUT)
@@ -578,6 +783,37 @@ BUILTIN_TOOLS: dict[str, dict] = {
             "check": "optional: a single tool name to confirm on PATH, e.g. 'nuclei'",
         },
         "func": tool_kali_tools,
+    },
+    "phase": {
+        "desc": ("Get or set the current pentest phase (recon, enum, vuln, exploit, "
+                 "postexploit, report). The phase tags every finding so the report reads "
+                 "as a methodical walk. No args = show current; set=<phase> to advance."),
+        "args": {"set": "optional: the phase to move to"},
+        "func": tool_phase,
+    },
+    "finding": {
+        "desc": ("Record a verified finding — EVIDENCE REQUIRED. A finding with no proof, "
+                 "or proof too thin to be real tool output, is refused. Fields: title, "
+                 "severity (info|low|medium|high|critical), target, evidence (command + real "
+                 "output snippet), and optional description, recommendation."),
+        "args": {"title": "short name of the issue", "severity": "info|low|medium|high|critical",
+                 "target": "host/IP/URL affected", "evidence": "the command run and a snippet of its real output",
+                 "description": "optional: what it is and impact", "recommendation": "optional: the fix"},
+        "func": tool_finding,
+    },
+    "report": {
+        "desc": ("Render all recorded findings into a Markdown pentest report in the workspace, "
+                 "grouped by severity, each with evidence and a fix. Pulls the header from "
+                 "SCOPE.md. Run at the end or any time for a running picture."),
+        "args": {},
+        "func": tool_report,
+    },
+    "playbook": {
+        "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
+                 "checklist and the role modes. section=<phase or role> for one part. Needs no "
+                 "network; use it when the van has no signal."),
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|scout|analyzer|exploiter|reporter"},
+        "func": tool_playbook,
     },
 }
 
