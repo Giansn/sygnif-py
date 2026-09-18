@@ -378,6 +378,57 @@ def _kali_probe_present(container: str, names: list[str]) -> list[str]:
     return out.split()
 
 
+def tool_metasploit(args: dict) -> str:
+    """Drive the Metasploit Framework through its RPC daemon in the sygnif-kali
+    container — structured, not screen-scraped. This is the same RPC the Kali
+    MetasploitMCP uses, reached in one hop via a bridge script, so results come
+    back as clean data. Only act against AUTHORIZED targets.
+
+    action (required):
+      version                 — confirm the RPC is live and the MSF version
+      search <query>          — find modules (args.query)
+      info <module>           — a module's summary (args.module = full path)
+      options <module>        — a module's options and which are required
+      run <module> <opts>     — set opts (args.options dict) and execute; refuses
+                                if required options are missing
+      sessions                — list open sessions
+      session_read <id>       — read pending output from a session
+      session_write <id> <cmd>— send a command to a session (args.command)
+    """
+    import shlex
+    action = str(args.get("action", "")).strip()
+    if not action:
+        return "metasploit: no action. Try action=version, or search/info/options/run/sessions."
+    container = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+    if _IS_WINDOWS or _run_host("command -v docker", 10)[1] != 0:
+        return "metasploit: docker not available; this tool needs the sygnif-kali container."
+    st, _ = _run_host(
+        "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
+    if st.strip() != "running":
+        _run_host("docker start " + container, 60)
+        st, _ = _run_host(
+            "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
+        if st.strip() != "running":
+            return "metasploit: container '" + container + "' is not running."
+
+    argv = ["python3", "/sygnif-kali/msf-rpc.py", action]
+    if action == "search":
+        argv.append(str(args.get("query", "")).strip())
+    elif action in ("info", "options"):
+        argv.append(str(args.get("module", "")).strip())
+    elif action == "run":
+        argv.append(str(args.get("module", "")).strip())
+        argv.append(json.dumps(args.get("options") or {}))
+    elif action in ("session_read", "session_write"):
+        argv.append(str(args.get("id", "")).strip())
+        if action == "session_write":
+            argv.append(str(args.get("command", "")))
+    inner = " ".join(shlex.quote(a) for a in argv)
+    out, rc = _run_host(
+        "docker exec " + container + " bash -lc " + shlex.quote(inner), KALI_TIMEOUT)
+    return _truncate(out) + ("\nexit=" + str(rc) + "  (msf rpc via docker:" + container + ")")
+
+
 def tool_kali_tools(args: dict) -> str:
     """Report the Kali arsenal actually available, category by category.
 
@@ -783,6 +834,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
             "check": "optional: a single tool name to confirm on PATH, e.g. 'nuclei'",
         },
         "func": tool_kali_tools,
+    },
+    "metasploit": {
+        "desc": ("Drive Metasploit via its RPC daemon in the sygnif-kali container — "
+                 "structured results, not screen-scraping. actions: version, search, info, "
+                 "options, run, sessions, session_read, session_write. AUTHORIZED targets only."),
+        "args": {"action": "version|search|info|options|run|sessions|session_read|session_write",
+                 "query": "for search", "module": "full module path for info/options/run",
+                 "options": "dict of module options for run", "id": "session id",
+                 "command": "for session_write"},
+        "func": tool_metasploit,
     },
     "phase": {
         "desc": ("Get or set the current pentest phase (recon, enum, vuln, exploit, "
