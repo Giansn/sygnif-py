@@ -666,6 +666,41 @@ def tool_playbook(args: dict) -> str:
     return _truncate("\n".join(blocks))
 
 
+def tool_purple(args: dict) -> str:
+    """Run a DEFENSIVE (blue-team) command in the sygnif-purple container — the
+    Kali Purple counterpart of the 'kali' tool. Detection, IR, forensics,
+    log/traffic analysis: suricata, zeek, wireshark/tshark, yara, volatility3,
+    sleuthkit, clamav, rkhunter, and the rest of the detect/respond/forensics
+    sets. Use this for analysis and hardening, not for attacking."""
+    import shlex
+    command = str(args.get("command", "")).strip()
+    if not command:
+        return "purple: empty command"
+    container = os.environ.get("SYGNIF_PY_PURPLE_CONTAINER", "sygnif-purple")
+    have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
+    if not have_docker:
+        return "purple: docker not available; this tool needs the sygnif-purple container."
+    state, _ = _run_host(
+        "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
+    if state.strip() and state.strip() != "running":
+        _run_host("docker start " + container, 60)
+        state, _ = _run_host(
+            "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
+    if state.strip() != "running":
+        return ("purple: container '" + container + "' not available — run the "
+                "purple-up provisioning first.")
+    out, rc = _run_host(
+        "docker exec " + container + " bash -lc " + shlex.quote(command), KALI_TIMEOUT)
+    if rc == 124:
+        out2, rc2 = _run_host(
+            "docker exec " + container + " bash -lc " + shlex.quote(command),
+            max(60, KALI_TIMEOUT // 2))
+        if rc2 != 124:
+            return _truncate(out2) + "\nexit=" + str(rc2) + "  (via docker:" + container + "; retried after timeout)"
+        return _truncate(out2) + "\nexit=" + str(rc2) + "  (via docker:" + container + "; timed out twice)"
+    return _truncate(out) + "\nexit=" + str(rc) + "  (via docker:" + container + ")"
+
+
 def tool_kali(args: dict) -> str:
     """Run a pentest command with the Kali toolset. Prefers the `sygnif-kali`
     Docker container (same as the pi seat) when Docker + the container are
@@ -844,6 +879,14 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "options": "dict of module options for run", "id": "session id",
                  "command": "for session_write"},
         "func": tool_metasploit,
+    },
+    "purple": {
+        "desc": ("Run a DEFENSIVE (blue-team) command in the sygnif-purple container: "
+                 "detection, incident response, forensics, log/traffic analysis (suricata, "
+                 "zeek, wireshark/tshark, yara, volatility3, sleuthkit, clamav, rkhunter). "
+                 "For analysis and hardening, not attacking."),
+        "args": {"command": "defensive command, e.g. 'yara rules.yar sample' or 'zeek -r capture.pcap'"},
+        "func": tool_purple,
     },
     "phase": {
         "desc": ("Get or set the current pentest phase (recon, enum, vuln, exploit, "
