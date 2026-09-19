@@ -321,12 +321,31 @@ def _meta(messages: list[dict], text: str, usage: dict | None, elapsed: float) -
             "tps": tps, "elapsed": elapsed, "measured": measured}
 
 
+def _http_messages(messages: list[dict]) -> list[dict]:
+    """Normalise messages for OpenAI-compatible /chat/completions endpoints.
+    The seat drives tools through a TEXT protocol (a tool call is JSON in the
+    assistant's text; the result comes back as a role:tool message), so there is
+    never a native `tool_calls` field. Strict endpoints (api.openai.com) reject a
+    role:tool message that does not answer a preceding tool_calls, so fold each
+    tool result into a plain user turn. Lenient providers see the same content."""
+    out = []
+    for m in messages:
+        if m.get("role") == "tool":
+            name = m.get("name", "")
+            label = f"Tool({name}) result:" if name else "Tool result:"
+            out.append({"role": "user", "content": f"{label}\n{m.get('content') or ''}"})
+        else:
+            out.append(m)
+    return out
+
+
 def _post_chat(spec: dict, messages: list[dict], t0: float) -> tuple[str, dict]:
     """One non-streaming POST. Returns (text, meta); errors come back as text."""
     url = spec["base_url"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
-        "model": spec["id"], "messages": messages,
-        "max_tokens": spec.get("max_tokens", 4096), "stream": False,
+        "model": spec["id"], "messages": _http_messages(messages),
+        spec.get("token_param", "max_tokens"): spec.get("max_tokens", 4096),
+        "stream": False,
     }).encode()
     headers = {"Content-Type": "application/json"}
     if spec.get("api_key"):
@@ -354,8 +373,8 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple
     caller can fall back to a plain request."""
     url = spec["base_url"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
-        "model": spec["id"], "messages": messages,
-        "max_tokens": spec.get("max_tokens", 4096),
+        "model": spec["id"], "messages": _http_messages(messages),
+        spec.get("token_param", "max_tokens"): spec.get("max_tokens", 4096),
         "stream": True, "stream_options": {"include_usage": True},
     }).encode()
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
