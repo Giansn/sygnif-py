@@ -16,7 +16,21 @@
 #   SYGNIF_PY_PYTHON    python interpreter to run with
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve through symlinks: this launcher is commonly symlinked onto PATH (e.g.
+# into Termux's $PREFIX/bin), and nexus.py sits next to the REAL script, not next
+# to the link. Done by hand rather than with `readlink -f`, which macOS lacks.
+# Bounded, because a link that points at itself would otherwise spin forever.
+SELF="${BASH_SOURCE[0]}"
+_hops=0
+while [ -L "$SELF" ] && [ "$_hops" -lt 20 ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(dirname "$SELF")/$LINK" ;;
+  esac
+  _hops=$((_hops + 1))
+done
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 PY="${SYGNIF_PY_PYTHON:-python3}"
 
 if ! command -v "$PY" >/dev/null 2>&1; then
