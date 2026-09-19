@@ -14,6 +14,7 @@ local llama.cpp server, or the shipped Inkling bridge — whatever speaks
 Usage:
     python3 seat.py                          # REPL, default preset (pentest, Fable 5.1)
     python3 seat.py login                    # log in to your Claude subscription
+    python3 seat.py doctor                    # health check: seat, models, containers, RPC
     python3 seat.py --preset chat            # REPL, chat preset
     python3 seat.py --model claude "hello"   # one-shot on your Claude subscription
     python3 seat.py --confirm                # confirm before each shell exec
@@ -769,9 +770,83 @@ def do_first_run(spec: dict) -> None:
     _mark_firstrun_done()
 
 
+def do_doctor() -> int:
+    """`sygnif doctor` — one-shot health check of the seat and its backends, so
+    the operator can verify everything in a line instead of poking by hand.
+    Exit 0 if nothing is broken (warnings allowed), 1 if a hard check fails."""
+    import shutil
+    ok = "✓"; warn = "⚠"; bad = "✗"
+    hard_fail = False
+
+    def line(sym, label, detail=""):
+        col = "green" if sym == ok else ("yellow" if sym == warn else "red")
+        pix.notice(f"  {sym} {label}" + (f"  {detail}" if detail else ""), col)
+
+    pix.notice(pix.rule() if hasattr(pix, "rule") else "")
+    pix.notice(pix.cyan(pix.bold("  SYGNIF py doctor")) if hasattr(pix, "cyan") else "SYGNIF py doctor")
+
+    # --- config + presets ---
+    try:
+        cfg = models.load_config()
+        presets = models.list_presets(cfg)
+        line(ok, "config + presets", f"{len(presets)} presets: {', '.join(presets)}")
+    except Exception as e:  # noqa: BLE001
+        line(bad, "config", str(e)[:120]); return 1
+
+    # --- tool registry for every preset ---
+    reg_bad = []
+    for pn in presets:
+        _, pr = models.get_preset(cfg, pn)
+        reg = tools.build_registry(pr.get("tools", []))
+        missing = [t for t in pr.get("tools", []) if t not in reg]
+        if missing:
+            reg_bad.append(f"{pn}:{','.join(missing)}")
+    if reg_bad:
+        line(bad, "tool registry", "missing " + "; ".join(reg_bad)); hard_fail = True
+    else:
+        line(ok, "tool registry", "all preset tools resolve")
+
+    # --- default model readiness ---
+    _, dpreset = models.get_preset(cfg, None)
+    mk = dpreset.get("model")
+    st, hint = models.model_status(cfg, mk)
+    line(ok if st in ("ready", "keyless") else warn, f"default model '{mk}'", f"{st} — {hint}")
+
+    # --- workspace ---
+    ws = os.path.expanduser(os.environ.get("SYGNIF_PY_PENTEST_DIR", "~/sygnif-pentest"))
+    line(ok if os.path.isdir(ws) else warn, "pentest workspace",
+         ws if os.path.isdir(ws) else ws + " (missing — created on first run)")
+
+    # --- docker + containers (soft: absence is a warning, not a failure) ---
+    have_docker = bool(shutil.which("docker"))
+    if not have_docker:
+        line(warn, "docker", "not present — kali/purple/metasploit tools unavailable here")
+    else:
+        for cont, label in (("sygnif-kali", "offensive container"),
+                            ("sygnif-purple", "defensive container")):
+            rc = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", cont],
+                                capture_output=True, text=True).stdout.strip()
+            line(ok if rc == "running" else warn, label,
+                 cont + " " + (rc or "absent"))
+        # msfrpcd reachability from inside the kali container
+        try:
+            r = subprocess.run(["docker", "exec", "sygnif-kali", "bash", "-lc",
+                                "ss -ltn 2>/dev/null | grep -q :55553 && echo up || echo down"],
+                               capture_output=True, text=True, timeout=15).stdout.strip()
+            line(ok if r == "up" else warn, "metasploit RPC", "msfrpcd " + (r or "unknown"))
+        except Exception:  # noqa: BLE001
+            line(warn, "metasploit RPC", "could not probe")
+
+    pix.notice("  " + (bad + " doctor: a hard check failed" if hard_fail else ok + " doctor: healthy"),
+               "red" if hard_fail else "green")
+    return 1 if hard_fail else 0
+
+
 def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "login":
         return do_login()
+    if len(sys.argv) >= 2 and sys.argv[1] in ("doctor", "health", "check"):
+        return do_doctor()
     if len(sys.argv) >= 2 and sys.argv[1] in ("kali-setup", "kali_setup"):
         pentest.toolset_status(pix.notice)
         ok = pentest.install_full_toolset(pix.notice)
@@ -852,7 +927,13 @@ def main() -> int:
                 pix.notice("  /preset <name>  /model <name>  /<model>  /models  /tools  /reset  /quit")
                 continue
             if cmd == "models":
-                pix.notice("  " + ", ".join(models.list_models(cfg)))
+                # Show readiness, not just names: a user shouldn't discover a
+                # model needs a login or a key only by trying it. Mark the active.
+                _marks = {"ready": "●", "keyless": "○", "needs-key": "!", "needs-login": "!"}
+                for _m in models.list_models(cfg):
+                    _st, _hint = models.model_status(cfg, _m)
+                    _active = "→ " if _m == model_key else "  "
+                    pix.notice(f"  {_active}{_marks.get(_st,'?')} {_m:16s} {_st:11s} {_hint}")
                 continue
             if cmd == "tools":
                 for tn, ts in reg.items():

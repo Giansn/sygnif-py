@@ -115,6 +115,27 @@ def resolve_model(cfg: dict, name: str) -> dict:
     return spec
 
 
+def model_status(cfg: dict, name: str) -> tuple[str, str]:
+    """(state, hint) for one model, so /models and doctor can show readiness
+    instead of a bare name. States: ready | needs-login | needs-key | keyless.
+    Never runs a network call — it only inspects local presence."""
+    import shutil
+    spec = resolve_model(cfg, name)
+    if spec.get("provider") == "claude-cli":
+        claude = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
+        if not shutil.which(claude):
+            return "needs-login", "claude CLI not installed — see claude.com/claude-code"
+        # Logged-in state is only knowable by trying; treat installed CLI as ready
+        # and let a real turn surface a login prompt if the token is stale.
+        return "ready", "Claude subscription via claude CLI"
+    key_env = spec.get("api_key_env")
+    if key_env:
+        if os.environ.get(key_env):
+            return "ready", "key present in $" + key_env
+        return "needs-key", "set $" + key_env
+    return "keyless", "local/keyless endpoint " + (spec.get("base_url") or "")
+
+
 def get_preset(cfg: dict, name: str | None) -> tuple[str, dict]:
     """Resolve a preset by name, falling back to default_preset.
 
