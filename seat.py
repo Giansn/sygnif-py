@@ -942,6 +942,12 @@ def main() -> int:
             arg = arg.strip()
             if cmd in ("quit", "q", "exit"):
                 return 0
+            # Re-read config on every command: cfg is otherwise frozen at launch,
+            # so a model edited in config.json / ~/.sygnif/sygnif-py.json while the
+            # seat is open would still resolve to its stale spec (e.g. a model
+            # repointed from the claude CLI to an HTTP endpoint kept reporting
+            # "claude CLI not installed"). Two small JSON reads, once per command.
+            cfg = models.load_config()
             if cmd == "help":
                 pix.notice("  /preset <name>  /model <name>  /<model>  /models  /tools  /reset  /quit")
                 continue
