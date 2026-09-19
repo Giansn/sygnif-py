@@ -30,16 +30,19 @@ irm https://raw.githubusercontent.com/Giansn/sygnif-py/main/dist/install.ps1 | i
 
 ## First run — just type `sygnif`
 
-The default model is **Claude Fable 5.1** on your Claude Pro/Max subscription, so
-the first launch is guided. Install the [claude CLI](https://claude.com/claude-code)
-first (that's what carries the subscription login), then:
+The default model is **Claude Fable 5.1** on your Claude Pro/Max subscription. The
+first launch is fully guided — you don't need to install anything by hand first:
 
 ```sh
-sygnif                       # first run: logs you in + preps a pentest workspace
+sygnif                       # first run: installs prerequisites, logs you in, preps a workspace
 ```
 
 That one-time onboarding:
 
+0. **installs the prerequisites the package can't bundle** — the `claude` CLI
+   (via `npm`, or the official installer, offering to add Node.js if needed) and
+   `tmux` (for the `nexus` portal board) — each opt-in and only if missing. Turn
+   this off with `SYGNIF_PY_BOOTSTRAP=0`;
 1. runs `claude setup-token` so Fable 5.1 bills to your Pro/Max plan (not the
    pay-per-use API) — you can skip and run `sygnif login` later;
 2. creates `~/sygnif-pentest/` with a `SCOPE.md` authorization reminder;

@@ -704,15 +704,83 @@ def _mark_firstrun_done() -> None:
         pass
 
 
+def _ensure_prereqs(spec: dict) -> None:
+    """Offer to install the two external things the seat uses but cannot ship:
+    the `claude` CLI (carries the Claude subscription that backs the default
+    model) and `tmux` (portals for `nexus`). Opt-in, TTY-gated, grounded — we
+    re-check with `which` afterwards and report only what actually landed.
+    Skip the whole step with SYGNIF_PY_BOOTSTRAP=0."""
+    if os.environ.get("SYGNIF_PY_BOOTSTRAP") == "0":
+        return
+    mgr = _pkg_manager()
+
+    def _sh(argv: list[str]) -> int:
+        print(pix.dim("  running: " + " ".join(argv) + "\n"))
+        try:
+            return subprocess.call(argv)
+        except Exception as e:  # noqa: BLE001
+            pix.notice(f"  [failed: {e}]", "yellow")
+            return 1
+
+    def _yes(prompt: str) -> bool:
+        try:
+            return input(pix.cyan("  " + prompt + " ") + pix.dim("[Enter = yes, s = skip] ")).strip().lower() in ("", "y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+    # 1. claude CLI — only if the default model actually needs it and it's missing.
+    if spec.get("provider") == "claude-cli" and not shutil.which(CLAUDE_BIN):
+        pix.notice("  The default model (Claude Fable 5.1) runs on your Claude Pro/Max")
+        pix.notice("  subscription via the official `claude` CLI, which isn't installed yet.")
+        if _yes("Install the claude CLI now?"):
+            if shutil.which("npm"):
+                _sh(["npm", "install", "-g", "@anthropic-ai/claude-code"])
+            elif shutil.which("curl"):
+                # official native installer (no Node needed)
+                _sh(["sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"])
+            elif mgr and _yes("npm not found. Install Node.js first (needed for the claude CLI)?"):
+                name, install_argv, update_argv = mgr
+                if update_argv:
+                    _sh(update_argv)
+                _sh(install_argv + (["nodejs", "npm"] if name == "apt" else ["nodejs"]))
+                if shutil.which("npm"):
+                    _sh(["npm", "install", "-g", "@anthropic-ai/claude-code"])
+            else:
+                pix.notice("  No npm/curl found — install the claude CLI manually: https://claude.com/claude-code", "yellow")
+            if shutil.which(CLAUDE_BIN):
+                pix.notice("  claude CLI installed.", "green")
+            else:
+                pix.notice("  claude CLI still not on PATH — you may need to reopen your shell, "
+                           "or install it manually: https://claude.com/claude-code", "yellow")
+        else:
+            pix.notice("  Skipped. Without it, use a keyed model: /model openrouter-free or /model glm", "yellow")
+
+    # 2. tmux — nexus (agent portals) needs it. Nice-to-have, so a light touch.
+    if not shutil.which("tmux") and mgr:
+        name, install_argv, update_argv = mgr
+        pkg = {"apt": "tmux", "dnf": "tmux", "pacman": "tmux", "brew": "tmux"}.get(name, "tmux")
+        if _yes(f"Install tmux (for the `nexus` portal board) with {name}?"):
+            if update_argv:
+                _sh(update_argv)
+            _sh(install_argv + [pkg])
+            pix.notice("  tmux installed." if shutil.which("tmux") else "  tmux still missing — install it manually later.",
+                       "green" if shutil.which("tmux") else "yellow")
+
+
 def do_first_run(spec: dict) -> None:
     """One-time onboarding, run the first time `sygnif` is launched interactively:
-    log in to the Claude subscription that backs the default model (Fable 5.1),
-    then stand up a pentest workspace and report which tools are on the box. Gated
-    by FIRSTRUN_MARKER so it never nags after the first successful run."""
+    install the external prerequisites (claude CLI, tmux), log in to the Claude
+    subscription that backs the default model (Fable 5.1), then stand up a pentest
+    workspace and report which tools are on the box. Gated by FIRSTRUN_MARKER so
+    it never nags after the first successful run."""
     print(pix.rule())
     print(pix.cyan(pix.bold("  Welcome to SYGNIF py")) + pix.dim("  ·  first-run setup"))
-    print(pix.dim("  This runs once. It logs you in and preps your first pentest."))
+    print(pix.dim("  This runs once. It installs prerequisites, logs you in, and preps your first pentest."))
     print(pix.rule())
+
+    # 0. External prerequisites the package can't bundle (claude CLI, tmux).
+    _ensure_prereqs(spec)
 
     # 1. Claude subscription login (only if the default model is subscription-backed).
     if spec.get("provider") == "claude-cli":
