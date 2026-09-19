@@ -74,6 +74,13 @@
       "api_key_env": null,
       "context": 200000,
       "max_tokens": 8192
+    },
+    "glm": {
+      "id": "glm-4.6",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "api_key_env": "GLM_API_KEY",
+      "context": 200000,
+      "max_tokens": 8192
     }
   },
   "default_preset": "pentest",
