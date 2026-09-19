@@ -36,14 +36,6 @@
       "max_tokens": 8192,
       "note": "Your own Claude via the official `claude` CLI, billed to your Claude Pro/Max subscription (not the pay-per-use API). One-time setup: install the claude CLI (https://claude.com/claude-code), then run `sygnif login` (wraps `claude setup-token`). 'id' is passed to the CLI as --model: use 'sonnet', 'opus', 'haiku', or a full model id like 'claude-fable-5-1' / 'claude-opus-5'."
     },
-    "inkling": {
-      "id": "thinkingmachines-inkling-256k",
-      "base_url": "http://127.0.0.1:9223/v1",
-      "api_key_env": null,
-      "context": 262144,
-      "max_tokens": 4096,
-      "note": "ThinkingMachines Inkling 256k, served by a local OpenAI-compatible bridge on :9223. Free, but you must run the bridge yourself. Select with `/model inkling` or set it as a preset's model."
-    },
     "_examples": {
       "_comment": "Templates only \u2014 NOT live (keys under '_examples' are ignored by the seat). To use one, lift it up into 'models' above under a name of your choosing, then point a preset's 'model' at that name. Put the key in the named env var, never here.",
       "openai": {
@@ -68,24 +60,10 @@
         "max_tokens": 4096
       }
     },
-    "claude-remote": {
-      "id": "claude-opus-5",
-      "base_url": "http://100.115.236.97:7879/v1",
-      "api_key_env": null,
-      "context": 200000,
-      "max_tokens": 8192
-    },
     "glm": {
       "id": "glm-4.6",
       "base_url": "https://api.z.ai/api/paas/v4",
       "api_key_env": "GLM_API_KEY",
-      "context": 200000,
-      "max_tokens": 8192
-    },
-    "opus": {
-      "id": "claude-opus-5",
-      "base_url": "http://100.115.236.97:7879/v1",
-      "api_key_env": null,
       "context": 200000,
       "max_tokens": 8192
     }
