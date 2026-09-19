@@ -52,6 +52,7 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 # (hands) each get a .cmd.
 foreach ($pair in @(
     @("sygnif", "sygnif.ps1"),
+    @("nexus", "nexus.ps1"),
     @("sygnif-desk", "sygnif-desk.ps1"),
     @("sygnif-nexus", "sygnif-nexus.ps1"),
     @("sygnif-centre", "sygnif-centre.ps1"),
@@ -68,7 +69,7 @@ if ($userPath -notlike "*$binDir*") {
     Say "added $binDir to your user PATH (open a new terminal to pick it up)."
 }
 
-Say "installed. commands: sygnif (seat), sygnif-desk (browser dashboard), sygnif-nexus (portal board, needs WSL), sygnif-centre (knot point), sygnif-commander (hands)"
+Say "installed. commands: sygnif (seat), nexus (agent portals), sygnif-desk (browser dashboard), sygnif-nexus (portal board, needs WSL), sygnif-centre (knot point), sygnif-commander (hands)"
 Say ""
 Say "FIRST RUN: type  sygnif  once. The default model is Claude Fable 5.1, so the first"
 Say "launch walks you through logging in to your Claude Pro/Max subscription (via the"

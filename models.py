@@ -86,6 +86,23 @@ def load_config() -> dict:
             cfg["presets"].update(user["presets"])
         if user.get("default_preset"):
             cfg["default_preset"] = user["default_preset"]
+        # Anything else the config carries (e.g. the "nexus" block of portal types)
+        # overlays too, one level deep: a per-user file that declares a new portal
+        # type should not have to restate the shipped ones. Without this, keys
+        # other than the three above were silently dropped from the user file.
+        for key, val in user.items():
+            if key in ("models", "presets", "default_preset"):
+                continue
+            if isinstance(val, dict) and isinstance(cfg.get(key), dict):
+                merged = dict(cfg[key])
+                for k, v in val.items():
+                    if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                        merged[k] = {**merged[k], **v}
+                    else:
+                        merged[k] = v
+                cfg[key] = merged
+            else:
+                cfg[key] = val
     return cfg
 
 

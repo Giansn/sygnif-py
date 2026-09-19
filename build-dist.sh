@@ -26,6 +26,7 @@ PKG=(
   sygnif-commander.sh sygnif-commander.ps1
   sygnif-desk.sh sygnif-desk.ps1
   sygnif-nexus.sh sygnif-nexus.ps1
+  nexus.sh nexus.ps1
   README.md custom_tools.py.example methodology.md
 )
 

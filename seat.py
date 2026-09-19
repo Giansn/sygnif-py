@@ -19,7 +19,7 @@ Usage:
     python3 seat.py --model claude "hello"   # one-shot on your Claude subscription
     python3 seat.py --confirm                # confirm before each shell exec
 
-REPL commands: /preset <name>  /model <name>  /models  /tools  /reset  /help  /quit
+REPL commands: /preset <name>  /model <name>  /models  /tools  /nexus  /reset  /help  /quit
 """
 from __future__ import annotations
 
@@ -949,7 +949,7 @@ def main() -> int:
             # "claude CLI not installed"). Two small JSON reads, once per command.
             cfg = models.load_config()
             if cmd == "help":
-                pix.notice("  /preset <name>  /model <name>  /<model>  /models  /tools  /reset  /quit")
+                pix.notice("  /preset <name>  /model <name>  /<model>  /models  /tools  /nexus  /reset  /quit")
                 continue
             if cmd == "models":
                 # Show readiness, not just names: a user shouldn't discover a
@@ -987,6 +987,43 @@ def main() -> int:
                 messages = [{"role": "system", "content": system}]
                 state.used = None
                 pix.notice("  conversation reset")
+                continue
+            if cmd == "nexus":
+                # The Nexus from inside the seat: see the portals, open or close
+                # one, without leaving the conversation. Attaching stays a
+                # terminal action (you cannot nest a TUI inside this one), so we
+                # hand back the command to run instead of pretending to attach.
+                try:
+                    import nexus as _nx  # noqa: PLC0415 — optional module
+                except Exception as e:  # noqa: BLE001
+                    pix.notice(f"  [nexus unavailable: {e}]", "red")
+                    continue
+                if not _nx.have_tmux():
+                    pix.notice("  nexus needs tmux (portals ARE tmux sessions)", "yellow")
+                    continue
+                _nx.refresh_types()
+                parts = arg.split()
+                if not parts:
+                    ps = _nx.list_portals()
+                    if not ps:
+                        pix.notice("  no live portals")
+                    for p in ps:
+                        dot = "●" if p["state"] == "attached" else "○"
+                        pix.notice(f"  {dot} {p['name']:<28} {p['state']:<9} {p['size']}")
+                    pix.notice(f"  types: {', '.join(_nx.TYPES)}", "cyan")
+                    pix.notice("  /nexus <type> [label] → open · /nexus kill <name> → close")
+                elif parts[0] == "kill" and len(parts) > 1:
+                    r = _nx.kill_portal(parts[1])
+                    pix.notice("  " + (f"killed {parts[1]}" if r.get("ok")
+                                       else str(r.get("error"))),
+                               "cyan" if r.get("ok") else "red")
+                else:
+                    r = _nx.create_portal(parts[0], parts[1] if len(parts) > 1 else "main")
+                    if r.get("ok"):
+                        pix.notice(f"  portal {r['name']} up — attach with: nexus {r['name']}",
+                                   "cyan")
+                    else:
+                        pix.notice("  " + str(r.get("error")), "red")
                 continue
             if cmd in models.list_models(cfg):
                 model_key = cmd

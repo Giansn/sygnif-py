@@ -167,51 +167,104 @@ Knobs (all optional):
 > can reach it, and it will **not** run shell commands unless you explicitly set
 > `SYGNIF_DESK_EXEC=1`. Don't expose it to a public address.
 
-## Nexus — a portal board for your agent sessions
+## Nexus — labeled portals for your agent sessions
 
-`sygnif-nexus` puts a live board of your **tmux sessions** in the browser. Every
-tmux session named `<type>` or `<type>-<label>` (e.g. `sygnif-thesis`,
-`claude-recon`) is a *portal*: a running agent you can see, spawn, rename and
-kill from the page, and attach to from any terminal.
+A **portal** is a persistent, individually-attachable tmux session named
+`<type>-<label>` (e.g. `sygnif-thesis`, `claude-recon`), so you can run many of
+the same agent side by side and tell them apart. Detach and it keeps running;
+SSH back in tomorrow and drop straight into it.
 
-**Setup** (Linux/macOS; on Windows run it inside WSL):
+Two front ends, one launch table: the `nexus` command in your terminal, and a web
+board in the browser. Install tmux first (`apt/dnf/pkg/brew install tmux`; on
+Windows run inside WSL) — portals *are* tmux sessions.
 
-1. Install tmux if you don't have it: `sudo apt install tmux` / `brew install tmux`.
-2. Start the board:
-
-   ```sh
-   sygnif-nexus                    # serves http://127.0.0.1:8910
-   ```
-
-3. Open <http://127.0.0.1:8910>. Pick a type, give the portal a label (e.g.
-   `thesis`), hit **spawn** — a detached tmux session starts with that agent
-   already running in it.
-4. To sit down at a portal, click its card to copy the attach command, then run
-   it in any terminal: `tmux attach -t <name>`. Detach again with `Ctrl-b d` —
-   the agent keeps running.
-
-Portal types are discovered from what your machine has: `sygnif` (the seat
-itself), `claude` (if the Claude CLI is on PATH), and `shell` (your login
-shell). Add your own agents via env:
+### From the terminal — `nexus`
 
 ```sh
-SYGNIF_NEXUS_TYPES="aider=aider,ipython=ipython" sygnif-nexus
+nexus                          # picker: table of live portals, choose one
+nexus claude thesis            # attach-or-create the claude-thesis portal
+nexus new                      # interactive: pick a type, give it a label
+nexus ls                       # list live portals
+nexus types                    # what this machine can spawn, and from where
+nexus hub                      # 3-pane command center (list + preview + activity)
+nexus -h                       # full help
 ```
+
+Fresh spawns ask **where to start** with a visual directory chooser: `Enter` takes
+the current dir, `a`..`z` drill into a subdir, `1`..`9` jump to a recent one, `..`
+goes up, `+name` creates one. Non-TTY callers skip it and take `~`, so scripts
+never hang on a prompt nobody can answer.
+
+Scripting and automation (no TTY required):
+
+```sh
+nexus spawn claude recon ~/work      # create WITHOUT attaching
+nexus prime claude recon "read the scope file first"
+                                    # create, then type a first prompt into it
+nexus send claude-recon "status?"    # type text into a live portal
+nexus preview claude-recon 40        # print its screen
+nexus rename claude-recon audit      # relabel (keeps attached clients)
+nexus kill claude-audit              # refuses if attached; -f overrides
+nexus resume                         # reopen a past conversation as a portal
+```
+
+`nexus resume` needs to know how to list and reopen a type's past conversations,
+so it is data rather than code — it ships knowing `claude`, and you can teach it
+any agent:
+
+```json
+{"nexus": {"resume": {"myagent": {"sessions": "~/.myagent/**/*.jsonl",
+                                  "cmd": "myagent --resume {id}"}}}}
+```
+
+### From the browser — `sygnif-nexus`
+
+```sh
+sygnif-nexus                   # serves http://127.0.0.1:8910
+```
+
+Pick a type, give the portal a label, hit **spawn** — a detached session starts
+with that agent already running. Attaching stays a terminal action: cards hand you
+`nexus <name>` to run. Working on a remote box? Don't expose the port, tunnel to
+it: `ssh -N -L 8910:127.0.0.1:8910 <host>`, then open `http://localhost:8910`.
+
+### From inside the seat — `/nexus`
+
+```
+/nexus                    list live portals
+/nexus claude thesis      open one
+/nexus kill claude-thesis close one
+```
+
+### Portal types are discovered, not hardcoded
+
+`sygnif` (the seat itself), `shell` (your login shell), and any known agent CLI
+actually installed — `claude`, `grok`, `codex`, `opencode`, `aider`, `cline`,
+`gemini`, `qwen`, `devin`, `cursor-agent`, `goose`. Declare your own, which always
+wins, in `config.json` or `~/.sygnif/sygnif-py.json`:
+
+```json
+{"nexus": {"types": {"aider": "aider --model sonnet", "ipython": "ipython3"}}}
+```
+
+...or for one run, via env: `SYGNIF_NEXUS_TYPES="aider=aider,ipython=ipython"`.
 
 Knobs (all optional):
 
 | env var | default | what it does |
 |---|---|---|
-| `SYGNIF_NEXUS_PORT` | `8910` | port to serve on |
+| `SYGNIF_NEXUS_PORT` | `8910` | port the web board serves on |
 | `SYGNIF_NEXUS_BIND` | `127.0.0.1` | bind address — keep it loopback |
 | `SYGNIF_NEXUS_TYPES` | — | extra portal types, `name=command,name2=command2` |
+| `SYGNIF_NEXUS_STATE` | `~/.sygnif` | where recent dirs / hub state are kept |
+| `NEXUS_HUB_ACTIVITY_CMD` | — | what the hub's activity pane tails |
 
-Working on a remote box? Don't expose the port — tunnel to it:
-`ssh -N -L 8910:127.0.0.1:8910 <host>`, then open `http://localhost:8910`.
-
-> **Safety:** the Nexus binds to loopback only, and it refuses to kill a portal
-> that someone is currently attached to (detach first). Same zero-dependency
-> deal: pure Python standard library — the only system requirement is tmux.
+> **Safety:** the web board binds to loopback only, and **both** front ends refuse
+> to kill a portal someone is attached to — that session may be a live console,
+> and killing it cuts the person off mid-sentence. Pass `-f` (or `{"force": true}`)
+> when you really mean it. Both planes call the same functions, so the terminal and
+> the page cannot drift into disagreeing about what a portal is or who may close
+> one. Zero dependencies: pure Python standard library, plus tmux.
 
 ## Models — bring your own
 

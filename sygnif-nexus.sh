@@ -28,4 +28,7 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 127
 fi
 
+# No args = the web board (what `sygnif-nexus` has always meant). The full
+# terminal control plane lives on the `nexus` launcher.
+if [ "$#" -eq 0 ]; then exec "$PY" "$HERE/nexus.py" serve; fi
 exec "$PY" "$HERE/nexus.py" "$@"
