@@ -162,6 +162,17 @@ SYGNIF_PY_KALI_METAPACKAGE=kali-tools-web sygnif kali-setup
 pass it with `--api-token <TOK>`. Same rule as always: only your own targets,
 and every finding backed by a reproducible request/response.
 
+### Full engagement (`--preset redteam`)
+For an authorized red-team engagement. Structured, **auth-gated** wrappers around the
+standard full-power tools — `recon`, `nuclei`, `wpscan`, `msf` (Metasploit),
+`exploit_search` (searchsploit), `bruteforce` (hydra), `crack` (hashcat/john),
+`postexploit` (linpeas, local enum only), `wifi_capture`/`wifi_crack` (hcxdumptool +
+hashcat). **Every offensive tool refuses without a `target` and an `authorization`
+attestation**, and is confined to `~/sygnif-pentest/SCOPE.md` when it lists targets.
+No mass targeting, no persistence, no evasion — authorized scope only. Read
+`playbook section=redteam` for the tool map, and install the tools with
+`sygnif kali-setup` (or run inside the `sygnif-kali` container).
+
 ## Desk — chat + workflows in your browser
 
 `sygnif-desk` starts a small web dashboard so you can use the same models from a

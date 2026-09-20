@@ -643,7 +643,7 @@ def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
     just that part (recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|
-    hosting|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
+    hosting|redteam|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
     try:
@@ -664,7 +664,7 @@ def tool_playbook(args: dict) -> str:
             blocks.append(line)
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
-                "postexploit, report, webapp, wpsec, hosting, scout, analyzer, exploiter, "
+                "postexploit, report, webapp, wpsec, hosting, redteam, scout, analyzer, exploiter, "
                 "reporter (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
@@ -1011,6 +1011,298 @@ def tool_vuln_check(args: dict) -> str:
 
 
 
+# --- Offensive capability tools (AUTHORIZED ENGAGEMENTS ONLY) ----------------
+# Structured wrappers around the standard full-power pentest binaries. Every tool
+# here REQUIRES two things from the operator and refuses without them:
+#   target        — a single named host / domain / URL / interface (never a mass sweep)
+#   authorization — a short attestation of who authorized testing that target
+# When ~/sygnif-pentest/SCOPE.md lists in-scope hosts, the target must match one.
+# Deliberately NOT built: C2 / persistence, detection-evasion, or mass targeting.
+# Tools shell out to the sygnif-kali container when present, else the host, so
+# they work on a Kali box or a plain Linux install alike.
+import shlex
+
+OFFENSIVE_TIMEOUT = int(os.environ.get("SYGNIF_PY_OFFENSIVE_TIMEOUT", "1800"))
+SCOPE_FILE = os.path.expanduser(os.environ.get("SYGNIF_PY_SCOPE_FILE", "~/sygnif-pentest/SCOPE.md"))
+_KALI_CONTAINER = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+
+
+def _scope_targets() -> set | None:
+    """In-scope hosts parsed from SCOPE.md, or None if the file is absent/empty."""
+    try:
+        txt = open(SCOPE_FILE, encoding="utf-8").read()
+    except OSError:
+        return None
+    found = set(re.findall(r"\b(?:\d{1,3}(?:\.\d{1,3}){3}|[a-z0-9][a-z0-9.\-]*\.[a-z]{2,})\b",
+                           txt, re.I))
+    # drop the boilerplate example/label tokens the template ships with
+    found = {f.lower() for f in found if f.lower() not in ("hosts.ips.urls", "e.g")}
+    return found or None
+
+
+def _bare_host(target: str) -> str:
+    t = str(target).strip()
+    t = re.sub(r"^\w+://", "", t)
+    return t.split("/")[0].split(":")[0].lower()
+
+
+def _authz(args: dict, target: str) -> str | None:
+    """Authorization gate. Returns a refusal string, or None when cleared."""
+    if not target:
+        return "REFUSED: no 'target' given (a single host / domain / URL / interface)."
+    auth = str(args.get("authorization", "") or args.get("auth", "")).strip()
+    if len(auth) < 6:
+        return ("REFUSED: set 'authorization' — a short attestation that you are authorized to "
+                f"test '{target}' (owner / engagement / ticket). Authorized targets only; this "
+                "tool will not run without it.")
+    scoped = _scope_targets()
+    if scoped:
+        t = _bare_host(target)
+        if not any(t == s or t.endswith("." + s) for s in scoped):
+            return (f"REFUSED: '{t}' is not in SCOPE.md. In scope: "
+                    f"{', '.join(sorted(scoped))[:200]}. Add it to your authorized scope first.")
+    return None
+
+
+def _off_run(command: str, timeout: int | None = None) -> tuple[str, int, str]:
+    """Run an offensive command in the kali container if up, else on the host."""
+    timeout = timeout or OFFENSIVE_TIMEOUT
+    if not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0:
+        st, rc = _run_host(f"docker inspect -f '{{{{.State.Status}}}}' {_KALI_CONTAINER} 2>/dev/null", 10)
+        if rc == 0 and st.strip() == "running":
+            out, rc = _run_host(f"docker exec {_KALI_CONTAINER} bash -lc {shlex.quote(command)}", timeout)
+            return out, rc, f"docker:{_KALI_CONTAINER}"
+    out, rc = _run_host(command, timeout)
+    return out, rc, "host"
+
+
+def _off_report(title: str, auth: str, cmd: str, out: str, rc: int, where: str) -> str:
+    return _truncate(f"[{title} | authorized-by: {auth} | via {where}]\n$ {cmd}\n\n{out}\n"
+                     f"exit={rc}")
+
+
+def _have(binname: str) -> bool:
+    o, rc, _ = _off_run(f"command -v {shlex.quote(binname)} >/dev/null 2>&1 && echo yes", 15)
+    return "yes" in o
+
+
+# 1. recon / OSINT — subdomains, DNS, tech, live hosts (passive-first)
+def tool_recon(args: dict) -> str:
+    target = str(args.get("target", "") or args.get("domain", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    dom = _bare_host(target)
+    extra = str(args.get("extra", "")).strip()
+    q = shlex.quote(dom)
+    cmd = (
+        f"echo '== subfinder =='; subfinder -silent -d {q} 2>/dev/null | tee /tmp/_subs.txt; "
+        f"echo '== dns =='; dig +short {q} A; dig +short {q} MX; "
+        f"echo '== SPF/DMARC =='; dig +short TXT {q}; dig +short TXT _dmarc.{q}; "
+        f"echo '== whatweb =='; whatweb -q {q} 2>/dev/null; "
+        f"echo '== live hosts (httpx) =='; ( [ -s /tmp/_subs.txt ] && httpx -silent -title -tech-detect -status-code < /tmp/_subs.txt 2>/dev/null | head -50 )"
+        + (f"; {extra}" if extra else "")
+    )
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 900))
+    return _off_report("recon", args.get("authorization", ""), "recon " + dom, out, rc, where)
+
+
+# 2. nuclei — templated vulnerability scan (community + optional Wordfence WP CVEs)
+def tool_nuclei(args: dict) -> str:
+    target = str(args.get("target", "") or args.get("url", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    tags = str(args.get("tags", "")).strip()
+    sev = str(args.get("severity", "")).strip()
+    extra = str(args.get("extra", "")).strip()
+    xtpl = os.environ.get("SYGNIF_PY_NUCLEI_EXTRA_TEMPLATES", "").strip()
+    parts = [f"nuclei -u {shlex.quote(target)} -silent -nc"]
+    if tags:
+        parts.append(f"-tags {shlex.quote(tags)}")
+    if sev:
+        parts.append(f"-severity {shlex.quote(sev)}")
+    if xtpl:
+        parts.append(f"-t {shlex.quote(xtpl)}")  # e.g. the nuclei-wordfence-cve template dir
+    if extra:
+        parts.append(extra)
+    out, rc, where = _off_run(" ".join(parts))
+    if rc != 0 and not _have("nuclei"):
+        return ("nuclei not installed — `SYGNIF_PY_KALI_METAPACKAGE=kali-tools-web sygnif kali-setup` "
+                "or `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest`. Add the "
+                "Wordfence WP CVE templates and point SYGNIF_PY_NUCLEI_EXTRA_TEMPLATES at them.")
+    return _off_report("nuclei", args.get("authorization", ""), " ".join(parts), out, rc, where)
+
+
+# 3. wpscan — full WordPress enumeration (structured wp_vulnscan's active sibling)
+def tool_wpscan(args: dict) -> str:
+    target = str(args.get("target", "") or args.get("url", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    enum = str(args.get("enumerate", "vp,vt,u,cb,dbe")).strip()
+    tok = os.environ.get("WPSCAN_API_TOKEN", "").strip()
+    extra = str(args.get("extra", "")).strip()
+    parts = [f"wpscan --url {shlex.quote(target)} --no-banner --format cli-no-color",
+             f"--enumerate {shlex.quote(enum)}", "--random-user-agent"]
+    if tok:
+        parts.append(f"--api-token {shlex.quote(tok)}")
+    if extra:
+        parts.append(extra)
+    out, rc, where = _off_run(" ".join(parts))
+    if not tok and "--api-token" not in out:
+        out += "\n[no WPSCAN_API_TOKEN set — enumeration ran but CVE data is limited; free token at wpscan.com/api]"
+    return _off_report("wpscan", args.get("authorization", ""), " ".join(parts), out, rc, where)
+
+
+# 4. exploit_search — offline Exploit-DB lookup (searchsploit). DB search, ungated.
+def tool_exploit_search(args: dict) -> str:
+    query = str(args.get("query", "") or args.get("cve", "")).strip()
+    if not query:
+        return "exploit_search: give a 'query' (product/version) or a 'cve' id."
+    if re.fullmatch(r"(?i)cve-\d{4}-\d+", query):
+        cmd = f"searchsploit --cve {shlex.quote(query.upper())}"
+    else:
+        cmd = f"searchsploit {shlex.quote(query)}"
+    out, rc, where = _off_run(cmd, 120)
+    if rc != 0 and not _have("searchsploit"):
+        return "searchsploit not installed (part of exploitdb; `sygnif kali-setup` or apt install exploitdb)."
+    return _off_report("exploit_search", "n/a (offline DB)", cmd, out, rc, where)
+
+
+# 5. metasploit driver — run an msf module non-interactively (exploitation framework)
+def tool_msf(args: dict) -> str:
+    target = str(args.get("target", "") or args.get("rhosts", "")).strip()
+    module = str(args.get("module", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    if not module:
+        return ("msf: give a 'module' (e.g. 'auxiliary/scanner/http/wordpress_login_enum') and any "
+                "'options' dict. Validate the module and blast radius before firing; least-destructive first.")
+    opts = args.get("options", {}) or {}
+    setlines = [f"set RHOSTS {shlex.quote(target)}"]
+    for k, v in opts.items():
+        setlines.append(f"set {k} {shlex.quote(str(v))}")
+    action = str(args.get("action", "run")).strip() or "run"
+    rc_script = "; ".join([f"use {module}"] + setlines + [action, "exit"])
+    cmd = f"msfconsole -q -x {shlex.quote(rc_script)}"
+    out, rc, where = _off_run(cmd)
+    return _off_report("metasploit", args.get("authorization", ""), cmd, out, rc, where)
+
+
+# 6. bruteforce — online credential testing (hydra). Loud + can lock accounts.
+def tool_bruteforce(args: dict) -> str:
+    target = str(args.get("target", "")).strip()
+    service = str(args.get("service", "")).strip()  # ssh, ftp, http-post-form, wordpress...
+    g = _authz(args, target)
+    if g:
+        return g
+    if not service:
+        return ("bruteforce: give a 'service' (ssh|ftp|smb|http-get|http-post-form|...), plus "
+                "'userlist'+'passlist' (or 'user'/'password'). Online brute is LOUD and can lock "
+                "accounts — authorized + rate-agreed engagements only.")
+    users = str(args.get("userlist", "")).strip()
+    passl = str(args.get("passlist", "")).strip()
+    u = f"-L {shlex.quote(users)}" if users else (f"-l {shlex.quote(args['user'])}" if args.get("user") else "")
+    p = f"-P {shlex.quote(passl)}" if passl else (f"-p {shlex.quote(args['password'])}" if args.get("password") else "")
+    if not u or not p:
+        return "bruteforce: need a user source (userlist|user) and a password source (passlist|password)."
+    extra = str(args.get("extra", "")).strip()
+    path = str(args.get("path", "")).strip()
+    cmd = f"hydra {u} {p} -t 4 -f {shlex.quote(target)} {shlex.quote(service)} {path} {extra}".strip()
+    out, rc, where = _off_run(cmd)
+    if rc != 0 and not _have("hydra"):
+        return "hydra not installed (`sygnif kali-setup` or apt install hydra)."
+    return _off_report("bruteforce", args.get("authorization", ""), cmd, out, rc, where)
+
+
+# 7. crack — offline hash cracking (hashcat, else john). Operate on hashes you are
+#    authorized to hold; the 'target' names the engagement/host they came from.
+def tool_crack(args: dict) -> str:
+    target = str(args.get("target", "") or "offline-hashes").strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    hashfile = str(args.get("hashfile", "")).strip()
+    if not hashfile:
+        return "crack: give a 'hashfile' path, a hashcat 'mode' (e.g. 22000 WPA, 0 MD5, 1000 NTLM), and a 'wordlist'."
+    mode = str(args.get("mode", "")).strip()
+    wl = str(args.get("wordlist", "/usr/share/wordlists/rockyou.txt")).strip()
+    extra = str(args.get("extra", "")).strip()
+    if _have("hashcat") and mode:
+        cmd = f"hashcat -m {shlex.quote(mode)} {shlex.quote(hashfile)} {shlex.quote(wl)} --quiet {extra}".strip()
+    else:
+        cmd = f"john --wordlist={shlex.quote(wl)} {shlex.quote(hashfile)} {extra}".strip()
+    out, rc, where = _off_run(cmd)
+    return _off_report("crack", args.get("authorization", ""), cmd, out, rc, where)
+
+
+# 8. postexploit — LOCAL privilege-escalation enumeration on an authorized host.
+#    Enumeration only (no persistence / no lateral movement). RoE-gated.
+def tool_postexploit(args: dict) -> str:
+    target = str(args.get("target", "") or "localhost").strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    if _have("linpeas") or _have("linpeas.sh"):
+        cmd = "linpeas -q 2>/dev/null || linpeas.sh -q"
+    elif str(args.get("fetch", "")).lower() in ("1", "true", "yes"):
+        cmd = "curl -fsSL https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh | sh"
+    else:
+        # built-in quick local enum, no downloads
+        cmd = ("echo '== id =='; id; echo '== sudo -l =='; sudo -n -l 2>&1 | head; "
+               "echo '== kernel =='; uname -a; echo '== SUID =='; find / -perm -4000 -type f 2>/dev/null | head -40; "
+               "echo '== world-writable dirs =='; find / -writable -type d 2>/dev/null | grep -vE '^/proc|^/sys' | head -30; "
+               "echo '== listening =='; ss -tlnp 2>/dev/null | head -30; echo '== cron =='; ls -la /etc/cron* 2>/dev/null")
+    out, rc, where = _off_run(cmd, 600)
+    return _off_report("postexploit(local-enum)", args.get("authorization", ""), "local enumeration", out, rc, where)
+
+
+# 9. wifi_capture — WPA handshake / PMKID capture on an authorized network.
+#    Requires a monitor-mode interface and an explicit BSSID/SSID authorization.
+def tool_wifi_capture(args: dict) -> str:
+    iface = str(args.get("interface", "") or args.get("iface", "")).strip()
+    bssid = str(args.get("bssid", "") or args.get("ssid", "")).strip()
+    target = bssid or iface
+    g = _authz(args, target)
+    if g:
+        return g
+    if not iface:
+        return ("wifi_capture: give a monitor-mode 'interface' (e.g. wlan0mon) and the 'bssid' of "
+                "the network YOU are authorized to test. PMKID via hcxdumptool by default.")
+    out_file = str(args.get("out", "/tmp/capture.pcapng")).strip()
+    secs = int(args.get("seconds", 60))
+    extra = str(args.get("extra", "")).strip()
+    filt = f"--filterlist_ap={shlex.quote(bssid)} --filtermode=2" if bssid else ""
+    cmd = (f"timeout {secs} hcxdumptool -i {shlex.quote(iface)} -w {shlex.quote(out_file)} "
+           f"{filt} {extra}").strip()
+    out, rc, where = _off_run(cmd, secs + 30)
+    if rc != 0 and not _have("hcxdumptool"):
+        return "hcxdumptool not installed (`apt install hcxdumptool`); or use airodump-ng via the shell tool."
+    tail = "\n[convert to a crackable hash: hcxpcapngtool -o hash.22000 " + out_file + " ; then the 'crack' tool with mode 22000]"
+    return _off_report("wifi_capture", args.get("authorization", ""), cmd, out + tail, rc, where)
+
+
+# 10. wifi_crack — turn a capture into a hash and crack it (offline).
+def tool_wifi_crack(args: dict) -> str:
+    cap = str(args.get("capture", "") or args.get("pcapng", "")).strip()
+    target = str(args.get("target", "") or cap or "wifi-capture").strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    if not cap:
+        return "wifi_crack: give the 'capture' file (.pcapng/.cap) and a 'wordlist'."
+    wl = str(args.get("wordlist", "/usr/share/wordlists/rockyou.txt")).strip()
+    hashf = "/tmp/_wifi.22000"
+    conv = (f"hcxpcapngtool -o {hashf} {shlex.quote(cap)} 2>/dev/null || "
+            f"(aircrack-ng {shlex.quote(cap)} -w {shlex.quote(wl)})")
+    cmd = f"{conv}; [ -s {hashf} ] && hashcat -m 22000 {hashf} {shlex.quote(wl)} --quiet"
+    out, rc, where = _off_run(cmd)
+    return _off_report("wifi_crack", args.get("authorization", ""), cmd, out, rc, where)
+
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -1175,6 +1467,71 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "args": {},
         "func": tool_report,
     },
+    "recon": {
+        "desc": ("Recon/OSINT on an authorized target domain: subdomains (subfinder), DNS + "
+                 "SPF/DMARC, tech fingerprint (whatweb), and live-host probing (httpx). Requires "
+                 "'target' + 'authorization'; SCOPE.md-confined when present."),
+        "args": {"target": "domain you are authorized to test", "authorization": "who authorized it (owner/engagement/ticket)", "extra": "optional extra shell to append"},
+        "func": tool_recon,
+    },
+    "nuclei": {
+        "desc": ("Templated vulnerability scan (nuclei) of an authorized URL — CVEs, misconfig, "
+                 "exposures. Set SYGNIF_PY_NUCLEI_EXTRA_TEMPLATES to add the Wordfence WP-CVE "
+                 "template set. Requires 'target'+'authorization'."),
+        "args": {"target": "URL you are authorized to test", "authorization": "attestation", "tags": "optional nuclei tags e.g. wordpress,cve", "severity": "optional e.g. critical,high", "extra": "optional extra flags"},
+        "func": tool_nuclei,
+    },
+    "wpscan": {
+        "desc": ("Full WordPress enumeration (wpscan): vulnerable plugins/themes, users, config "
+                 "backups, db exports. Uses WPSCAN_API_TOKEN for CVE data if set. Requires "
+                 "'target'+'authorization'. (Passive detection alternative: wp_vulnscan.)"),
+        "args": {"target": "WordPress URL you are authorized to test", "authorization": "attestation", "enumerate": "wpscan --enumerate value (default vp,vt,u,cb,dbe)", "extra": "optional extra flags"},
+        "func": tool_wpscan,
+    },
+    "exploit_search": {
+        "desc": "Offline Exploit-DB lookup (searchsploit) by product/version or CVE id. DB search only.",
+        "args": {"query": "product/version text", "cve": "or a CVE id"},
+        "func": tool_exploit_search,
+    },
+    "msf": {
+        "desc": ("Run a Metasploit module non-interactively against an authorized target. Requires "
+                 "'target'+'authorization'+'module'; pass module 'options' as a dict. Validate the "
+                 "module and blast radius first; least-destructive proof."),
+        "args": {"target": "RHOSTS you are authorized to test", "authorization": "attestation", "module": "msf module path", "options": "dict of module options", "action": "run|check|exploit (default run)"},
+        "func": tool_msf,
+    },
+    "bruteforce": {
+        "desc": ("Online credential testing (hydra) against an authorized service. LOUD and can "
+                 "lock accounts — authorized + rate-agreed only. Requires 'target'+'authorization'+"
+                 "'service' and a user/pass source."),
+        "args": {"target": "host you are authorized to test", "authorization": "attestation", "service": "ssh|ftp|smb|http-post-form|...", "userlist": "path", "passlist": "path", "user": "or a single user", "password": "or a single password", "path": "form/path spec for http services", "extra": "optional flags"},
+        "func": tool_bruteforce,
+    },
+    "crack": {
+        "desc": ("Offline hash cracking (hashcat, else john) on hashes you are authorized to hold. "
+                 "Requires 'authorization', a 'hashfile', a hashcat 'mode' and a 'wordlist'."),
+        "args": {"target": "engagement/host the hashes came from", "authorization": "attestation", "hashfile": "path to hashes", "mode": "hashcat mode e.g. 22000/0/1000", "wordlist": "path (default rockyou)", "extra": "optional flags"},
+        "func": tool_crack,
+    },
+    "postexploit": {
+        "desc": ("LOCAL privilege-escalation ENUMERATION on an authorized host (linpeas if present, "
+                 "else a built-in quick enum). Enumeration only — no persistence/lateral movement. "
+                 "Requires 'authorization'. fetch=true allows downloading linpeas."),
+        "args": {"target": "host (default localhost)", "authorization": "attestation + RoE permits post-ex", "fetch": "optional 'true' to fetch linpeas"},
+        "func": tool_postexploit,
+    },
+    "wifi_capture": {
+        "desc": ("Capture a WPA handshake / PMKID on a network YOU are authorized to test "
+                 "(hcxdumptool). Requires a monitor-mode 'interface', a 'bssid', and 'authorization'."),
+        "args": {"interface": "monitor-mode iface e.g. wlan0mon", "bssid": "target AP BSSID/SSID you are authorized to test", "authorization": "attestation", "seconds": "capture window (default 60)", "out": "output pcapng path", "extra": "optional flags"},
+        "func": tool_wifi_capture,
+    },
+    "wifi_crack": {
+        "desc": ("Convert a WPA capture to a hash and crack it offline (hcxpcapngtool + hashcat, "
+                 "else aircrack-ng). Requires 'authorization', a 'capture' file and a 'wordlist'."),
+        "args": {"capture": "path to .pcapng/.cap", "authorization": "attestation", "wordlist": "path (default rockyou)", "target": "network/engagement label"},
+        "func": tool_wifi_crack,
+    },
     "wp_vulnscan": {
         "desc": ("Scan a WordPress site you own/are authorized to test: passively detect "
                  "core, plugins and themes with their versions, flag out-of-date components "
@@ -1200,7 +1557,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
                  "checklist and the role modes. section=<phase or role> for one part. Needs no "
                  "network; use it when the van has no signal."),
-        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|scout|analyzer|exploiter|reporter"},
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|scout|analyzer|exploiter|reporter"},
         "func": tool_playbook,
     },
 }

@@ -130,3 +130,23 @@ For the server/hosting behind your own sites.
   webroot, directory listing, and default/weak credentials on anything found.
 - Backups & secrets in the webroot: `.sql` dumps, `.env`, archive files served
   over HTTP. These are critical if present.
+
+## redteam — role mode: full authorized engagement (structured offensive tools)
+Only ever inside a signed authorization; record scope in `~/sygnif-pentest/SCOPE.md` first.
+The seat ships structured, auth-gated wrappers around the standard full-power tools —
+each REFUSES without a `target` and an `authorization` attestation, and is confined to
+SCOPE.md when it lists targets:
+- `recon` — subfinder + DNS/SPF/DMARC + whatweb + httpx (recon/OSINT).
+- `nuclei` — templated CVE/misconfig scan (add the Wordfence WP-CVE templates via
+  `SYGNIF_PY_NUCLEI_EXTRA_TEMPLATES`).
+- `wpscan` — full WordPress enumeration (`WPSCAN_API_TOKEN` for CVE data).
+- `wp_vulnscan` / `vuln_check` — passive WP component detection / NVD+WPScan CVE lookup.
+- `exploit_search` — offline Exploit-DB (searchsploit).
+- `msf` — run a Metasploit module non-interactively (validate blast radius; least-destructive first).
+- `bruteforce` — hydra online credential testing (loud, can lock accounts; rate-agreed only).
+- `crack` — offline hash cracking (hashcat/john) on hashes you are authorized to hold.
+- `postexploit` — LOCAL privesc enumeration only (linpeas); no persistence/lateral movement.
+- `wifi_capture` / `wifi_crack` — WPA handshake/PMKID capture (hcxdumptool) + offline crack,
+  on a network you are authorized to test, monitor-mode interface required.
+Discipline: no mass targeting, no persistence, no evasion. Every finding = reproducible
+evidence. Re-check scope before exploit/post-ex/wifi steps.
