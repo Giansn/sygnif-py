@@ -167,7 +167,8 @@ For an authorized red-team engagement. Structured, **auth-gated** wrappers aroun
 standard full-power tools — `recon`, `nuclei`, `wpscan`, `msf` (Metasploit),
 `exploit_search` (searchsploit), `bruteforce` (hydra), `crack` (hashcat/john),
 `postexploit` (linpeas, local enum only), `wifi_capture`/`wifi_crack` (hcxdumptool +
-hashcat). **Every offensive tool refuses without a `target` and an `authorization`
+hashcat), and `c2` (Sliver — authorized adversary emulation, standard
+framework only). **Every offensive tool refuses without a `target` and an `authorization`
 attestation**, and is confined to `~/sygnif-pentest/SCOPE.md` when it lists targets.
 No mass targeting, no persistence, no evasion — authorized scope only. Read
 `playbook section=redteam` for the tool map, and install the tools with

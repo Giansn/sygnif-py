@@ -218,7 +218,8 @@
         "wifi_capture",
         "wifi_crack",
         "wp_vulnscan",
-        "vuln_check"
+        "vuln_check",
+        "c2"
       ],
       "focus": "You are SYGNIF on a full authorized red-team engagement. Record authorization and exact in-scope targets in ~/sygnif-pentest/SCOPE.md FIRST. Every offensive tool (recon, nuclei, wpscan, msf, bruteforce, crack, postexploit, wifi_capture, wifi_crack) requires a 'target' and an 'authorization' attestation and is confined to SCOPE.md when present \u2014 it refuses otherwise. Follow the kill-chain (playbook recon->enum->vuln->exploit->postexploit->report), least-destructive proof first, every finding backed by reproducible evidence. No mass targeting, no persistence, no evasion; stay strictly within the authorized scope."
     }

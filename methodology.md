@@ -148,5 +148,6 @@ SCOPE.md when it lists targets:
 - `postexploit` — LOCAL privesc enumeration only (linpeas); no persistence/lateral movement.
 - `wifi_capture` / `wifi_crack` — WPA handshake/PMKID capture (hcxdumptool) + offline crack,
   on a network you are authorized to test, monitor-mode interface required.
+- `c2` — orchestrate a Sliver C2 (listener / generate beacon / sessions / exec) for authorized adversary emulation. Standard framework only; no custom implants or evasion. Live interactive control belongs in sliver-client.
 Discipline: no mass targeting, no persistence, no evasion. Every finding = reproducible
 evidence. Re-check scope before exploit/post-ex/wifi steps.

