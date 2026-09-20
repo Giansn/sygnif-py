@@ -640,8 +640,8 @@ def tool_report(args: dict) -> str:
 def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
-    just that part (recon|enum|vuln|exploit|postexploit|report|scout|analyzer|
-    exploiter|reporter). No network needed; use this when the van has no signal."""
+    just that part (recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|
+    hosting|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
     try:
@@ -662,7 +662,8 @@ def tool_playbook(args: dict) -> str:
             blocks.append(line)
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
-                "postexploit, report, scout, analyzer, exploiter, reporter (omit for the whole thing).")
+                "postexploit, report, webapp, wpsec, hosting, scout, analyzer, exploiter, "
+                "reporter (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
 
@@ -916,7 +917,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
                  "checklist and the role modes. section=<phase or role> for one part. Needs no "
                  "network; use it when the van has no signal."),
-        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|scout|analyzer|exploiter|reporter"},
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|scout|analyzer|exploiter|reporter"},
         "func": tool_playbook,
     },
 }

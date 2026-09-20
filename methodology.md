@@ -64,3 +64,61 @@ confirmed issue, then record it with `finding`.
 Adopt at the end. Read every finding, check each is backed by evidence, dedupe,
 order by severity, and run `report`. Write for the asset owner: what, where,
 impact, and the concrete fix.
+
+## webapp — role mode: testing your own web application
+For a developer testing pages you own or are authorized to test.
+- Fingerprint first: `whatweb <url>`, `wafw00f <url>`. Know the stack and what
+  filters you before you make noise.
+- Content discovery for things that should never be public: `ffuf`/`feroxbuster`
+  against a wordlist for `.git/`, `.env`, `.DS_Store`, `*.bak`/`*.sql`/`*.zip`
+  backups, `/admin`, `/phpinfo.php`, `/.well-known`, source maps (`.js.map`).
+  A live `.git/` or `.env` is a critical finding — record it with the exact URL
+  and the leaked content as evidence.
+- Vulnerability sweep, low-noise: `nuclei -u <url>` (CVEs, misconfig, exposures),
+  `nikto -h <url>`. Corroborate before asserting.
+- Injection on YOUR OWN parameters only: `sqlmap -u '<url?param=1>' --batch` for
+  SQLi; test reflected/stored XSS by hand; check SSRF/SSTI/IDOR on endpoints you
+  control. Never point these at third-party sites.
+- Response hygiene (cheap wins devs usually miss): security headers
+  (`curl -sI <url>` -> CSP, Strict-Transport-Security, X-Content-Type-Options,
+  X-Frame-Options, Referrer-Policy, Permissions-Policy), cookie flags
+  (HttpOnly, Secure, SameSite), CORS (`Access-Control-Allow-Origin: *` with
+  credentials is a finding), and CSRF protection on state-changing forms.
+- Each issue becomes a `finding` only with a reproducible request/response pair.
+
+## wpsec — role mode: WordPress security review
+For your own WordPress site. WPScan's vuln data needs a free API token
+(https://wpscan.com/api) — pass it with `--api-token <TOK>`; without it you get
+enumeration but no CVE matches.
+- Enumerate: `wpscan --url <url> --enumerate vp,vt,u,cb,dbe --api-token <TOK>`
+  — vulnerable plugins (vp), vulnerable themes (vt), users (u), config backups
+  (cb), db exports (dbe). Version + outdated plugins/themes are the usual way in.
+- User enumeration also via the REST API: `/wp-json/wp/v2/users` and
+  `/?rest_route=/wp/v2/users`. If it lists usernames, that feeds brute force.
+- `xmlrpc.php`: check it's reachable (`curl -s <url>/xmlrpc.php`); `system.multicall`
+  enables login brute-force amplification and pingback SSRF/DDoS. Disable if unused.
+- Exposure checks: `wp-config.php`/`wp-config.php.bak`/`.swp`, `/wp-content/uploads/`
+  directory listing, `readme.html` (version disclosure), `/wp-content/debug.log`,
+  exposed `/wp-admin/install.php`.
+- CVE sweep with `nuclei -u <url> -tags wordpress`.
+- Hardening to verify (report as findings if missing): login throttling / lockout,
+  2FA on admin, `DISALLOW_FILE_EDIT` set, admin only over TLS, latest core +
+  plugins, least-privilege DB user, file permissions (`wp-config.php` not world-
+  readable), and a WAF/security plugin.
+
+## hosting — role mode: hosting and infrastructure review
+For the server/hosting behind your own sites.
+- Exposed surface: `nmap -sV -sC <host>` — confirm ONLY what should be public is
+  (80/443 yes; SSH/DB/panels usually should be firewalled or IP-restricted).
+- TLS: `testssl.sh <host>` or `sslscan <host>` — protocol versions (no SSLv3/TLS1.0),
+  weak ciphers, cert validity/chain, HSTS. A weak/expired cert is a finding.
+- Mail spoofing (often wide open on small hosts): check DNS `SPF`, `DKIM`, `DMARC`
+  (`dig TXT <domain>`, `dig TXT _dmarc.<domain>`). Missing DMARC = anyone can
+  spoof your domain — record it.
+- Subdomains + takeover: `subfinder -d <domain>` / `amass enum -d <domain>`, then
+  check any CNAME pointing at an unclaimed service (GitHub Pages, S3, Heroku...)
+  — a dangling CNAME is a subdomain-takeover finding.
+- Panels & defaults: look for phpMyAdmin, cPanel/Plesk, Adminer, `.git` on the
+  webroot, directory listing, and default/weak credentials on anything found.
+- Backups & secrets in the webroot: `.sql` dumps, `.env`, archive files served
+  over HTTP. These are critical if present.

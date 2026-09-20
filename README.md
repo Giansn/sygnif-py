@@ -138,6 +138,30 @@ the **`dev_apply_and_test`** tool: it writes your file(s) and runs a check/build
 command in one step, reporting PASS/FAIL — so a change is never "done" until its
 test actually ran. Work small, prove each step.
 
+### Web & WordPress security (`--preset webdev`)
+For a developer testing their **own** sites, hosting and WordPress (record the
+authorization in `SCOPE.md` first). It's a web-focused slice of the pentest
+toolset — drive `wpscan`, `nuclei`, `nikto`, `sqlmap`, `whatweb`, `wafw00f`,
+`ffuf`/`feroxbuster`, `httpx`, `sslscan`/`testssl.sh`, `subfinder`/`amass` through
+the `shell`/`kali` tools, and read the concrete checklists with the playbook:
+
+```
+/preset webdev
+playbook section=webapp     # own web app: content discovery, headers, cookies, injection
+playbook section=wpsec      # WordPress: wpscan enumerate, xmlrpc, REST user enum, hardening
+playbook section=hosting    # server: exposed ports, TLS, SPF/DKIM/DMARC, subdomain takeover
+```
+
+Install the lighter web toolset (instead of the multi-GB full kill-chain):
+
+```sh
+SYGNIF_PY_KALI_METAPACKAGE=kali-tools-web sygnif kali-setup
+```
+
+`wpscan`'s CVE data needs a free [WPScan API token](https://wpscan.com/api) —
+pass it with `--api-token <TOK>`. Same rule as always: only your own targets,
+and every finding backed by a reproducible request/response.
+
 ## Desk — chat + workflows in your browser
 
 `sygnif-desk` starts a small web dashboard so you can use the same models from a

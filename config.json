@@ -160,6 +160,24 @@
         "playbook"
       ],
       "focus": "You are SYGNIF in field pentest mode on a rootless Android tablet (Termux). Generation runs on the e14 seat-proxy over the tailnet, on the owner's Claude subscription (OAuth) \u2014 no local model, no API key here. No Docker on the tablet, so the kali/metasploit/purple container tools are unavailable; you work with the real Termux shell (shell tool), web/github research, file read/write, and the process tools (phase, finding with evidence gate, report, playbook). Keep findings evidence-backed. For heavy tooling, hand off to the e14 seat over the tailnet."
+    },
+    "webdev": {
+      "model": "fable",
+      "tools": [
+        "shell",
+        "kali",
+        "kali_tools",
+        "web",
+        "github",
+        "read_file",
+        "write_file",
+        "note",
+        "phase",
+        "finding",
+        "report",
+        "playbook"
+      ],
+      "focus": "You are SYGNIF helping a web developer security-test their OWN sites, hosting and WordPress \u2014 only targets they own or are authorized to test (record authorization in SCOPE.md). Web-focused kill-chain: read the playbook sections 'webapp', 'wpsec' and 'hosting' for the concrete checklists. Drive the toolset through the shell/kali tools (wpscan, nuclei, nikto, sqlmap, whatweb, wafw00f, ffuf/feroxbuster, httpx, sslscan, testssl.sh, subfinder/amass). wpscan CVE data needs a free WPScan API token (--api-token). Pair with the lighter web toolset: install it with SYGNIF_PY_KALI_METAPACKAGE=kali-tools-web sygnif kali-setup. Ground every finding in a reproducible request/response or command output; never point injection/exploit tools at third-party sites."
     }
   }
 }
