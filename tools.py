@@ -22,8 +22,10 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SEAT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -749,6 +751,266 @@ def tool_kali(args: dict) -> str:
     return _truncate(out) + f"\nexit={rc}  (on host){hint}"
 
 
+# --- WordPress plugin/theme vulnerability scanning --------------------------
+# Two grounded tools for the webdev preset:
+#   wp_vulnscan  — detect a site's WordPress core/plugins/themes + versions
+#                  (passive HTTP), flag out-of-date components, and (with a
+#                  WPScan token, or cves=true for keyless NVD) list known CVEs.
+#   vuln_check   — the known-vulnerability tester: look up CVEs for a given
+#                  product+version or a specific CVE id.
+# Data sources, in order of quality: the WPScan API (needs WPSCAN_API_TOKEN,
+# free tier at wpscan.com/api — exact affected-version ranges), else keyless
+# NVD keyword search (rich but version matching is best-effort) plus the keyless
+# WordPress.org plugin API for the latest-version / out-of-date signal.
+_BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+NVD_CVE_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+WPORG_PLUGIN_API = "https://api.wordpress.org/plugins/info/1.0/{slug}.json"
+WPSCAN_API_TOKEN = os.environ.get("WPSCAN_API_TOKEN", "").strip()
+WPVULN_MAX = int(os.environ.get("SYGNIF_PY_WPVULN_MAX", "25"))
+
+
+def _wp_fetch(url: str) -> tuple[str, int, str]:
+    return _http_get(url, headers={"User-Agent": _BROWSER_UA,
+                                   "Accept-Language": "en,de;q=0.8"})
+
+
+def _norm_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    return u.rstrip("/")
+
+
+def _plugin_latest(slug: str) -> str:
+    """Latest published version from the keyless WordPress.org plugin API."""
+    body, status, _ = _wp_fetch(WPORG_PLUGIN_API.format(slug=slug))
+    if status == 200 and body:
+        try:
+            v = json.loads(body).get("version")
+            if isinstance(v, str):
+                return v
+        except Exception:  # noqa: BLE001
+            pass
+    return ""
+
+
+def _readme_stable(base: str, slug: str) -> str:
+    """Installed plugin version from its readme.txt 'Stable tag', if reachable."""
+    body, status, _ = _wp_fetch(f"{base}/wp-content/plugins/{slug}/readme.txt")
+    if status == 200 and body:
+        m = re.search(r"(?im)^\s*Stable tag:\s*([0-9][0-9A-Za-z.\-]*)", body)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _detect_wp(url: str) -> dict:
+    """Passively enumerate WordPress core, plugins and themes with versions.
+
+    Version source per plugin/theme: the `?ver=` on its asset URLs in the page
+    (usually the real installed version), else its readme.txt / style.css.
+    """
+    base = _norm_url(url)
+    home, status, err = _wp_fetch(base + "/")
+    out = {"base": base, "is_wp": False, "core": "", "plugins": {}, "themes": {},
+           "status": status, "error": err}
+    if status != 200 or not home:
+        # try /readme.html and /wp-login.php as secondary signals
+        rl, rs, _ = _wp_fetch(base + "/wp-login.php")
+        if rs != 200:
+            return out
+        home = rl
+    blob = home
+    # core version
+    m = re.search(r'name=["\']generator["\']\s+content=["\']WordPress\s+([0-9.]+)', blob, re.I)
+    if not m:
+        rh, rs, _ = _wp_fetch(base + "/readme.html")
+        if rs == 200:
+            m = re.search(r'Version\s+([0-9.]+)', rh)
+    if m:
+        out["core"] = m.group(1)
+    # plugins: slug + optional ?ver=
+    for slug, ver in re.findall(
+            r'/wp-content/plugins/([a-zA-Z0-9\-_]+)/[^"\'?]*(?:\?[^"\']*?ver=([0-9][0-9.]*))?',
+            blob):
+        out.setdefault("plugins", {})
+        cur = out["plugins"].get(slug, "")
+        if ver and not cur:
+            out["plugins"][slug] = ver
+        else:
+            out["plugins"].setdefault(slug, cur)
+    # themes: slug (version from style.css later)
+    for slug in set(re.findall(r'/wp-content/themes/([a-zA-Z0-9\-_]+)/', blob)):
+        out["themes"].setdefault(slug, "")
+    out["is_wp"] = bool(out["core"] or out["plugins"] or out["themes"]
+                        or "/wp-content/" in blob or "wp-json" in blob)
+    # fill missing plugin versions from readme.txt (authoritative Stable tag)
+    for slug in list(out["plugins"]):
+        if not out["plugins"][slug]:
+            out["plugins"][slug] = _readme_stable(base, slug)
+    # theme versions from style.css
+    for slug in list(out["themes"]):
+        css, cs, _ = _wp_fetch(f"{base}/wp-content/themes/{slug}/style.css")
+        if cs == 200:
+            tm = re.search(r"(?im)^\s*Version:\s*([0-9][0-9A-Za-z.\-]*)", css)
+            if tm:
+                out["themes"][slug] = tm.group(1)
+    return out
+
+
+def _wpscan_lookup(kind: str, slug: str) -> list | None:
+    """WPScan API v3 vulnerabilities for a plugin/theme slug. None if no token."""
+    if not WPSCAN_API_TOKEN:
+        return None
+    body, status, _ = _http_get(
+        f"https://wpscan.com/api/v3/{kind}/{slug}",
+        headers={"Authorization": f"Token token={WPSCAN_API_TOKEN}"})
+    if status != 200 or not body:
+        return []
+    try:
+        data = json.loads(body).get(slug, {})
+        vulns = []
+        for v in data.get("vulnerabilities", []) or []:
+            cves = (v.get("references", {}) or {}).get("cve", []) or []
+            vulns.append({
+                "title": v.get("title", ""),
+                "cve": ", ".join("CVE-" + c for c in cves) if cves else "",
+                "fixed_in": v.get("fixed_in") or "?",
+            })
+        return vulns
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _nvd_lookup(keyword: str, limit: int = 5, cve_id: str = "") -> list:
+    """Keyless NVD lookup by keyword or exact CVE id. Best-effort, never raises."""
+    if cve_id:
+        q = f"{NVD_CVE_API}?cveId={cve_id}"
+    else:
+        q = (f"{NVD_CVE_API}?keywordSearch={urllib.parse.quote(keyword)}"
+             f"&resultsPerPage={limit}")
+    body, status, _ = _http_get(q, headers={"User-Agent": _BROWSER_UA})
+    if status != 200 or not body:
+        return []
+    try:
+        d = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for item in d.get("vulnerabilities", [])[:max(limit, 1)]:
+        c = item.get("cve", {})
+        score = ""
+        metrics = c.get("metrics", {}) or {}
+        for k in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+            if metrics.get(k):
+                score = metrics[k][0].get("cvssData", {}).get("baseScore", "")
+                break
+        desc = ""
+        for dd in c.get("descriptions", []):
+            if dd.get("lang") == "en":
+                desc = dd.get("value", "")
+                break
+        out.append({"cve": c.get("id", ""), "cvss": score,
+                    "published": (c.get("published", "") or "")[:10],
+                    "desc": " ".join(desc.split())[:160]})
+    return out
+
+
+def tool_wp_vulnscan(args: dict) -> str:
+    """Detect a WordPress site's components and flag outdated / vulnerable ones."""
+    url = _norm_url(str(args.get("url", "")))
+    if not url:
+        return "wp_vulnscan: give a 'url' (a site you own or are authorized to test)."
+    want_cves = str(args.get("cves", "")).lower() in ("1", "true", "yes") or bool(WPSCAN_API_TOKEN)
+    det = _detect_wp(url)
+    if det.get("error") and not det.get("is_wp"):
+        return f"wp_vulnscan: could not reach {url} ({det['error']})."
+    if not det.get("is_wp"):
+        return (f"wp_vulnscan: {url} does not look like WordPress "
+                f"(no wp-content/wp-json/generator signals). Nothing to enumerate.")
+    lines = [f"WordPress scan of {url}"]
+    if det["core"]:
+        lines.append(f"  core: WordPress {det['core']}")
+        if want_cves:
+            for v in _nvd_lookup(f"wordpress {det['core']}", 3):
+                lines.append(f"    CVE {v['cve']} (cvss {v['cvss']}): {v['desc']}")
+    comps = ([("plugins", s, v) for s, v in det["plugins"].items()]
+             + [("themes", s, v) for s, v in det["themes"].items()])
+    if not comps:
+        lines.append("  no plugins/themes detected from the homepage (try an authenticated "
+                     "scan or wpscan for depth).")
+    flagged = 0
+    for kind, slug, ver in comps[:WPVULN_MAX]:
+        latest = _plugin_latest(slug) if kind == "plugins" else ""
+        outdated = bool(ver and latest and ver != latest)
+        tag = f"{kind[:-1]} {slug}"
+        vtxt = f"v{ver}" if ver else "version?"
+        parts = [f"  {tag}: {vtxt}"]
+        if latest:
+            parts.append(f"(latest {latest}{' — OUTDATED' if outdated else ''})")
+        lines.append(" ".join(parts))
+        if outdated:
+            flagged += 1
+        if want_cves:
+            wp = _wpscan_lookup(kind, slug)
+            if wp is not None:
+                for v in wp:
+                    lines.append(f"      VULN {v['title']} [{v['cve']}] fixed in {v['fixed_in']}")
+                    flagged += 1
+            else:
+                for v in _nvd_lookup(slug.replace("-", " "), 3):
+                    lines.append(f"      CVE {v['cve']} (cvss {v['cvss']}): {v['desc']}")
+    if len(comps) > WPVULN_MAX:
+        lines.append(f"  ... {len(comps) - WPVULN_MAX} more (raise SYGNIF_PY_WPVULN_MAX)")
+    src = ("WPScan API (token set)" if WPSCAN_API_TOKEN
+           else ("keyless NVD keyword + WordPress.org latest-version" if want_cves
+                 else "outdated-check only — pass cves=true or set WPSCAN_API_TOKEN for CVE matching"))
+    lines.append(f"  [source: {src}. Verify each hit; version detection is passive and "
+                 f"can be masked. Only scan sites you are authorized to test.]")
+    if flagged:
+        lines.insert(1, f"  ⚠ {flagged} outdated/vulnerable signal(s) — see below.")
+    return _truncate("\n".join(lines))
+
+
+def tool_vuln_check(args: dict) -> str:
+    """Known-vulnerability tester: CVEs for a product+version, a WP slug, or a CVE id."""
+    cve = str(args.get("cve", "")).strip().upper()
+    product = str(args.get("product", "") or args.get("slug", "")).strip()
+    version = str(args.get("version", "")).strip()
+    kind = str(args.get("kind", "plugins")).strip() or "plugins"
+    if cve:
+        hits = _nvd_lookup("", cve_id=cve)
+        if not hits:
+            return f"vuln_check: no NVD record for {cve} (check the id)."
+        v = hits[0]
+        return (f"{v['cve']}  cvss {v['cvss']}  published {v['published']}\n{v['desc']}\n"
+                f"[source: NVD. Confirm applicability to your exact version.]")
+    if not product:
+        return ("vuln_check: give a 'product' (or 'slug'), optional 'version'; or a 'cve' id. "
+                "e.g. {product:'elementor', version:'3.5.0'} or {cve:'CVE-2024-...'}")
+    # WP slug via WPScan when a token is set (exact affected ranges)
+    wp = _wpscan_lookup(kind, product) if WPSCAN_API_TOKEN else None
+    if wp is not None:
+        if not wp:
+            return f"vuln_check: WPScan lists no known vulnerabilities for {kind[:-1]} '{product}'."
+        out = [f"Known vulnerabilities for {kind[:-1]} '{product}' (WPScan):"]
+        for v in wp:
+            out.append(f"  {v['title']} [{v['cve']}] fixed in {v['fixed_in']}")
+        return _truncate("\n".join(out))
+    kw = f"{product} {version}".strip()
+    hits = _nvd_lookup(kw, 8)
+    if not hits:
+        return (f"vuln_check: NVD returned nothing for '{kw}'. Try the plain product name, "
+                f"or set WPSCAN_API_TOKEN for WordPress plugin/theme coverage.")
+    out = [f"NVD matches for '{kw}' (keyless keyword search — verify each applies to your version):"]
+    for v in hits:
+        out.append(f"  {v['cve']} (cvss {v['cvss']}, {v['published']}): {v['desc']}")
+    return _truncate("\n".join(out))
+
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -912,6 +1174,27 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "SCOPE.md. Run at the end or any time for a running picture."),
         "args": {},
         "func": tool_report,
+    },
+    "wp_vulnscan": {
+        "desc": ("Scan a WordPress site you own/are authorized to test: passively detect "
+                 "core, plugins and themes with their versions, flag out-of-date components "
+                 "(via the WordPress.org API), and list known CVEs. With WPSCAN_API_TOKEN set "
+                 "it uses the WPScan vulnerability DB (exact affected ranges); otherwise pass "
+                 "cves=true for a keyless NVD keyword lookup (best-effort). Authorized targets only."),
+        "args": {"url": "the WordPress site URL (yours / authorized)",
+                 "cves": "optional 'true' to also run keyless CVE lookups (slower)"},
+        "func": tool_wp_vulnscan,
+    },
+    "vuln_check": {
+        "desc": ("Known-vulnerability tester. Look up CVEs for a product+version, a WordPress "
+                 "plugin/theme slug, or a specific CVE id. Uses the WPScan API when "
+                 "WPSCAN_API_TOKEN is set (WordPress components, exact ranges), else keyless NVD."),
+        "args": {"product": "product or software name, e.g. 'elementor'",
+                 "slug": "alternatively a WordPress plugin/theme slug",
+                 "version": "optional version to narrow the match",
+                 "kind": "'plugins' (default) or 'themes' for a WP slug",
+                 "cve": "alternatively a CVE id to fetch its details, e.g. CVE-2024-1234"},
+        "func": tool_vuln_check,
     },
     "playbook": {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "

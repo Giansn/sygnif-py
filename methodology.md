@@ -101,6 +101,14 @@ enumeration but no CVE matches.
   directory listing, `readme.html` (version disclosure), `/wp-content/debug.log`,
   exposed `/wp-admin/install.php`.
 - CVE sweep with `nuclei -u <url> -tags wordpress`.
+- Built-in shortcut: the **`wp_vulnscan`** tool detects core/plugins/themes + versions
+  and flags out-of-date ones; **`vuln_check`** looks up CVEs for a component+version or a
+  CVE id. Set `WPSCAN_API_TOKEN` (free at wpscan.com/api) for exact affected-version
+  ranges; otherwise they use keyless NVD (best-effort) + the WordPress.org latest-version
+  signal. Passive detection can be masked — confirm with `wpscan` for depth.
+- Watch the components your builds actually use: **Elementor** (+ its add-ons) and the
+  **LiteSpeed Cache** plugin have both had critical CVEs; keep them current and version-check
+  every site on each maintenance pass.
 - Hardening to verify (report as findings if missing): login throttling / lockout,
   2FA on admin, `DISALLOW_FILE_EDIT` set, admin only over TLS, latest core +
   plugins, least-privilege DB user, file permissions (`wp-config.php` not world-
