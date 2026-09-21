@@ -41,7 +41,7 @@ with `report`. Only ever act inside the authorization recorded in SCOPE.md.
 - Pivoting: proxychains4, chisel. Loot handling per the agreed rules.
 
 ## privesc — escalate an authorized foothold to root/owner
-- Only inside an engagement whose RoE permits post-exploitation. Confirm-gated.
+- Only inside an engagement whose RoE permits post-exploitation.
 - Order of work: enumerate first, exploit last, and verify every candidate.
   1. `privesc {mode:suggest}` — linux-exploit-suggester-2 lists CANDIDATE kernel
      exploits from `uname`. Candidates, not confirmed: a patched box still shows

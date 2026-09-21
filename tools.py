@@ -1107,15 +1107,47 @@ def _authz(args: dict, target: str) -> str | None:
     return None
 
 
-def _off_run(command: str, timeout: int | None = None) -> tuple[str, int, str]:
-    """Run a command in sygnif-py's Docker toolbox if available, else on the host."""
+def _off_run(command: str, timeout: int | None = None,
+             need=None, pipefail: bool = False) -> tuple[str, int, str]:
+    """Run a command in sygnif-py's Docker toolbox if available, else on the host.
+
+    need=    binaries the command requires (str or list). If any are absent the
+             command is NOT run and a clear 'missing tool' string is returned with
+             rc 127 — so a missing tool never masquerades as an empty (clean) result.
+    pipefail run under `set -o pipefail` so a failing stage in a pipe is not hidden
+             by a succeeding tail. Off by default: a trailing head/tail would turn a
+             normal SIGPIPE into a non-zero exit, so enable it only for head-free pipes."""
     timeout = timeout or OFFENSIVE_TIMEOUT
+    if need:
+        miss = _need(need)
+        if miss:
+            return miss, 127, "preflight"
+    if pipefail:
+        command = "set -o pipefail; " + command
     box = _toolbox_name(auto_create=False)
     if box:
         out, rc = _run_host("docker exec " + shlex.quote(box) + " bash -lc " + shlex.quote(command), timeout)
         return out, rc, f"docker:{box}"
     out, rc = _run_host(command, timeout)
     return out, rc, "host"
+
+
+def _need(bins) -> str:
+    """'' if every binary in `bins` is present in the run context (toolbox or host),
+    else a clear message naming the missing ones. One exec, not one per binary."""
+    names = [b for b in (bins if isinstance(bins, (list, tuple)) else [bins]) if b]
+    if not names:
+        return ""
+    checks = "; ".join("command -v " + shlex.quote(b) + " >/dev/null 2>&1 || echo MISSING:" + b
+                       for b in names)
+    out, _rc, where = _off_run(checks, 30)
+    missing = sorted({ln.split("MISSING:", 1)[1].strip()
+                      for ln in out.splitlines() if ln.startswith("MISSING:")})
+    if not missing:
+        return ""
+    loc = "the toolbox" if where.startswith("docker") else "this host"
+    return ("MISSING TOOL(S): " + ", ".join(missing) + " — not installed in " + loc
+            + ". Run `sygnif kali-setup` to provision the toolbox, or install them, then retry.")
 
 
 def _off_report(title: str, auth: str, cmd: str, out: str, rc: int, where: str) -> str:
@@ -1138,11 +1170,11 @@ def tool_recon(args: dict) -> str:
     extra = str(args.get("extra", "")).strip()
     q = shlex.quote(dom)
     cmd = (
-        f"echo '== subfinder =='; subfinder -silent -d {q} 2>/dev/null | tee /tmp/_subs.txt; "
+        f"echo '== subfinder =='; command -v subfinder >/dev/null 2>&1 && subfinder -silent -d {q} 2>/dev/null | tee /tmp/_subs.txt || echo '(subfinder not installed)'; "
         f"echo '== dns =='; dig +short {q} A; dig +short {q} MX; "
         f"echo '== SPF/DMARC =='; dig +short TXT {q}; dig +short TXT _dmarc.{q}; "
-        f"echo '== whatweb =='; whatweb -q {q} 2>/dev/null; "
-        f"echo '== live hosts (httpx) =='; ( [ -s /tmp/_subs.txt ] && httpx -silent -title -tech-detect -status-code < /tmp/_subs.txt 2>/dev/null | head -50 )"
+        f"echo '== whatweb =='; command -v whatweb >/dev/null 2>&1 && whatweb -q {q} 2>/dev/null || echo '(whatweb not installed)'; "
+        f"echo '== live hosts (httpx) =='; command -v httpx >/dev/null 2>&1 && ( [ -s /tmp/_subs.txt ] && httpx -silent -title -tech-detect -status-code < /tmp/_subs.txt 2>/dev/null | head -50 ) || echo '(httpx not installed or no subdomains found)'"
         + (f"; {extra}" if extra else "")
     )
     out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 900))
@@ -1191,7 +1223,7 @@ def tool_wpscan(args: dict) -> str:
         parts.append(f"--api-token {shlex.quote(tok)}")
     if extra:
         parts.append(extra)
-    out, rc, where = _off_run(" ".join(parts))
+    out, rc, where = _off_run(" ".join(parts), need=("wpscan",))
     if not tok and "--api-token" not in out:
         out += "\n[no WPSCAN_API_TOKEN set — enumeration ran but CVE data is limited; free token at wpscan.com/api]"
     return _off_report("wpscan", args.get("authorization", ""), " ".join(parts), out, rc, where)
@@ -1347,7 +1379,7 @@ def tool_privesc(args: dict) -> str:
                + " -o $les 2>/dev/null; echo '== target kernel =='; uname -a 2>/dev/null; echo; "
                "echo '== candidate kernel exploits — CANDIDATES, verify before firing =='; "
                "perl $les " + kflag + " 2>/dev/null | head -80")
-        out, rc, where = _off_run(cmd, 180)
+        out, rc, where = _off_run(cmd, 180, need=("perl", "curl"))
         return _off_report("privesc(suggest)", auth, "linux-exploit-suggester-2", out, rc, where)
 
     if mode == "spy":
@@ -1357,14 +1389,14 @@ def tool_privesc(args: dict) -> str:
                "echo '== pspy: watching processes/cron for " + str(secs)
                + "s (root-run jobs, writable scripts) =='; "
                "timeout " + str(secs) + " $p -pf -i 1000 2>/dev/null | tail -100")
-        out, rc, where = _off_run(cmd, secs + 40)
+        out, rc, where = _off_run(cmd, secs + 40, need=("curl",))
         return _off_report("privesc(spy)", auth, "pspy64", out, rc, where)
 
     if mode == "container":
         cmd = ("d=/tmp/deepce.sh; [ -s $d ] || curl -fsSL " + _PRIVESC_SRC["deepce"]
                + " -o $d 2>/dev/null; echo '== deepce: container-escape enumeration =='; "
                "bash $d --no-color 2>/dev/null | head -140")
-        out, rc, where = _off_run(cmd, 300)
+        out, rc, where = _off_run(cmd, 300, need=("curl", "bash"))
         return _off_report("privesc(container)", auth, "deepce", out, rc, where)
 
     if mode == "auto":
@@ -1376,7 +1408,7 @@ def tool_privesc(args: dict) -> str:
         # traitor -a is analysis only (lists exploitable vectors, exploits nothing).
         cmd = (pre + "echo '== traitor: exploitable vectors (analysis, no exploit) =='; "
                "$t -a 2>/dev/null | head -70")
-        out, rc, where = _off_run(cmd, 240)
+        out, rc, where = _off_run(cmd, 240, need=("curl",))
         rep = _off_report("privesc(auto)", auth, "traitor -a (+ gtfonow fetched)", out, rc, where)
         rep += ("\n\n[GTFONow fetched to /tmp/gtfonow.py — it is interactive without -a and "
                 "AUTO-EXPLOITS with -a, so it is not run unattended here. Run it yourself via the "
@@ -1680,9 +1712,10 @@ def tool_takeover(args: dict) -> str:
     if g:
         return g
     d = _bare_host(domain)
-    cmd = (f"subfinder -silent -d {shlex.quote(d)} 2>/dev/null | tee /tmp/_subs.txt | wc -l | xargs echo 'subdomains:'; "
-           f"echo '== subjack =='; subjack -w /tmp/_subs.txt -ssl -t 50 -timeout 15 2>/dev/null | grep -iv 'Not Vulnerable' | head -40; "
-           f"echo '== nuclei takeover =='; nuclei -silent -l /tmp/_subs.txt -tags takeover 2>/dev/null | head -40")
+    q = shlex.quote(d)
+    cmd = (f"echo '== subfinder =='; command -v subfinder >/dev/null 2>&1 && (subfinder -silent -d {q} 2>/dev/null | tee /tmp/_subs.txt | wc -l | xargs echo 'subdomains:') || echo '(subfinder not installed)'; "
+           f"echo '== subjack =='; command -v subjack >/dev/null 2>&1 && (subjack -w /tmp/_subs.txt -ssl -t 50 -timeout 15 2>/dev/null | grep -iv 'Not Vulnerable' | head -40 || echo '(no takeover candidates)') || echo '(subjack not installed)'; "
+           f"echo '== nuclei takeover =='; command -v nuclei >/dev/null 2>&1 && (nuclei -silent -l /tmp/_subs.txt -tags takeover 2>/dev/null | head -40) || echo '(nuclei not installed)'")
     out, rc, where = _off_run(cmd, 900)
     return _off_report("takeover", args.get("authorization", ""), "takeover " + d, out, rc, where)
 
@@ -1696,7 +1729,7 @@ def tool_osint(args: dict) -> str:
     uname = str(args.get("username", "")).strip()
     if uname:
         cmd = "sherlock " + shlex.quote(uname) + " --timeout 15 --print-found 2>/dev/null | head -60"
-        out, rc, where = _off_run(cmd, 300)
+        out, rc, where = _off_run(cmd, 300, need=("sherlock",))
         return _off_report("osint(username)", args.get("authorization", ""), "sherlock " + uname, out, rc, where)
     d = shlex.quote(_bare_host(domain))
     cmd = (f"echo '== theHarvester =='; theHarvester -d {d} -b duckduckgo,crtsh,bing -l 200 2>/dev/null | grep -iE '@|host|ip' | head -60; "
