@@ -1897,6 +1897,117 @@ def tool_website(args: dict) -> str:
     return _truncate("\n".join(lines))
 
 
+# --- shodan — internet-wide passive intelligence ----------------------------
+# Queries Shodan's data ABOUT a host (no packets to the target). Keyless via
+# InternetDB (ports, CVEs, hostnames, CPEs); full host lookup / search / dns /
+# count when SHODAN_API_KEY is set. Passive OSINT — use on hosts you're allowed
+# to research.
+SHODAN_API = "https://api.shodan.io"
+SHODAN_IDB = "https://internetdb.shodan.io/"
+
+
+def _shodan_key() -> str:
+    return os.environ.get("SHODAN_API_KEY", "").strip()
+
+
+def tool_shodan(args: dict) -> str:
+    op = str(args.get("op", "host")).strip().lower()
+    key = _shodan_key()
+
+    def api(path: str):
+        sep = "&" if "?" in path else "?"
+        return _http_get(SHODAN_API + path + sep + "key=" + urllib.parse.quote(key),
+                         headers={"User-Agent": _BROWSER_UA})
+
+    if op in ("host", "lookup", "ip", ""):
+        tgt = str(args.get("target", "") or args.get("ip", "") or args.get("domain", "")).strip()
+        if not tgt:
+            return "shodan host: give a 'target' (IP or domain)."
+        ip = tgt
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", tgt):
+            import socket
+            try:
+                ip = socket.gethostbyname(_bare_host(tgt))
+            except Exception as e:  # noqa: BLE001
+                return f"shodan: cannot resolve {tgt}: {e}"
+        if key:
+            body, st, err = api(f"/shodan/host/{ip}")
+            if st != 200:
+                return f"shodan host {ip}: HTTP {st} {err}".strip()
+            try:
+                d = json.loads(body)
+            except Exception:  # noqa: BLE001
+                return "shodan host: bad response."
+            ports = d.get("ports", [])
+            vulns = list((d.get("vulns") or {}).keys()) if isinstance(d.get("vulns"), dict) else (d.get("vulns") or [])
+            prods = sorted({s.get("product", "") for s in d.get("data", []) if s.get("product")})
+            return _truncate(
+                f"Shodan host {ip} ({d.get('org','?')}, {d.get('country_name','?')}):\n"
+                f"  hostnames: {', '.join(d.get('hostnames', [])[:5]) or '-'}\n"
+                f"  ports: {sorted(ports)}\n"
+                f"  products: {', '.join(prods[:12]) or '-'}\n"
+                f"  CVEs: {', '.join(sorted(vulns)) or 'none listed'}\n"
+                f"  last update: {d.get('last_update','?')}  [full Shodan API]")
+        # keyless InternetDB
+        body, st, err = _http_get(SHODAN_IDB + ip, headers={"User-Agent": _BROWSER_UA})
+        if st == 404:
+            return f"shodan: {ip} not in InternetDB (no recent Shodan scan on record)."
+        if st != 200:
+            return f"shodan: {err or ('HTTP ' + str(st))}"
+        try:
+            d = json.loads(body)
+        except Exception:  # noqa: BLE001
+            return "shodan: bad InternetDB response."
+        return _truncate(
+            f"Shodan InternetDB {ip} ({', '.join(d.get('hostnames', [])[:4]) or 'no PTR'}):\n"
+            f"  ports: {d.get('ports', [])}\n"
+            f"  CVEs: {', '.join(d.get('vulns', [])) or 'none listed'}\n"
+            f"  cpes: {', '.join(d.get('cpes', [])[:8]) or '-'}\n"
+            f"  tags: {d.get('tags', []) or '-'}\n"
+            f"  [keyless InternetDB — passive, from Shodan's last scan. Set SHODAN_API_KEY "
+            f"for full banners, search and DNS.]")
+
+    if not key:
+        return (f"shodan {op}: needs SHODAN_API_KEY (get one at account.shodan.io). Only 'host' "
+                f"works keyless via InternetDB.")
+    if op == "search":
+        q = str(args.get("query", "")).strip()
+        if not q:
+            return "shodan search: give a 'query' (e.g. 'product:nginx country:CH', 'org:\"...\"')."
+        body, st, err = api("/shodan/host/search?query=" + urllib.parse.quote(q) + "&minify=true")
+        if st != 200:
+            return f"shodan search: HTTP {st} {err}".strip()
+        d = json.loads(body)
+        out = [f"Shodan search '{q}': {d.get('total', 0)} results (showing up to 15):"]
+        for m in d.get("matches", [])[:15]:
+            out.append(f"  {m.get('ip_str')}:{m.get('port')}  {m.get('org','')}  "
+                       f"{m.get('location',{}).get('country_code','')}  {(m.get('product') or '')}")
+        return _truncate("\n".join(out))
+    if op == "count":
+        q = str(args.get("query", "")).strip()
+        body, st, err = api("/shodan/host/count?query=" + urllib.parse.quote(q))
+        if st != 200:
+            return f"shodan count: HTTP {st} {err}".strip()
+        d = json.loads(body)
+        facets = d.get("facets", {})
+        return f"shodan count '{q}': {d.get('total', 0)}" + (f"\n  facets: {facets}" if facets else "")
+    if op == "dns":
+        dom = _bare_host(str(args.get("domain", "") or args.get("target", "")))
+        body, st, err = api(f"/dns/domain/{dom}")
+        if st != 200:
+            return f"shodan dns: HTTP {st} {err}".strip()
+        d = json.loads(body)
+        subs = d.get("subdomains", [])
+        return _truncate(f"Shodan DNS {dom}: {len(subs)} subdomains\n  " + ", ".join(subs[:60]))
+    if op in ("info", "api-info"):
+        body, st, err = api("/api-info")
+        return f"shodan api-info: {body[:300]}" if st == 200 else f"shodan info: HTTP {st}"
+    if op == "myip":
+        body, st, err = api("/tools/myip")
+        return f"your external IP (per Shodan): {body.strip()}" if st == 200 else f"shodan myip: HTTP {st}"
+    return "shodan: op = host | search | count | dns | info | myip"
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -2137,6 +2248,13 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": "Encode/decode/hash/hmac/JWT-decode/identify/magic-decrypt. Local + deterministic (identify+magic use the toolbox).",
         "args": {"op": "encode|decode|hash|hmac|jwt|identify|magic", "data": "the input", "algo": "base64|hex|url|rot13 or md5|sha256|...", "key": "for hmac"},
         "func": tool_crypto,
+    },
+    "shodan": {
+        "desc": ("Internet-wide PASSIVE intelligence via Shodan (no packets to the target). "
+                 "op=host looks up an IP/domain's exposed ports+CVEs (keyless InternetDB, or full "
+                 "data with SHODAN_API_KEY); search/count/dns/info/myip need the key."),
+        "args": {"op": "host|search|count|dns|info|myip", "target": "IP or domain (host)", "query": "Shodan search query", "domain": "for dns"},
+        "func": tool_shodan,
     },
     "website": {
         "desc": "Quick website recon: robots/sitemap/security.txt, DNS, whois, tech fingerprint, wayback snapshot count. Passive.",
