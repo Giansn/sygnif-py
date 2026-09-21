@@ -58,6 +58,19 @@ with `report`. Only ever act inside the authorization recorded in SCOPE.md.
 - Tools are fetched to /tmp on first use; on a repeat engagement they are cached
   in the toolbox by `sygnif kali-setup`. Clean them up when the engagement ends.
 
+## dast — headless dynamic scan (OWASP ZAP)
+- Burp Suite Community cannot be automated (no scan CLI, no REST API); use Burp
+  Repeater/Proxy by hand and ZAP for the scriptable scan. Burp Pro's REST API is
+  the only automatable Burp, and it is licensed.
+- `dast {mode:quick}` — fast passive recon (zapit): tech + obvious issues, no attack.
+- `dast {mode:baseline}` — spider + passive scan. Quiet: no attack payloads are sent,
+  safe against production. Good first pass on a site you own.
+- `dast {mode:active}` — spider + active scan: sends injection/XSS/etc. payloads.
+  Louder and can create data; authorized targets only, ideally staging.
+- Findings come back grouped by risk with CWE ids. Confirm the interesting ones by
+  hand (Burp Repeater) before recording with `finding`. ZAP finds reflected/technical
+  issues; business-logic flaws (BOLA/IDOR/auth bypass) still need a human.
+
 ## report — the deliverable
 - Run `report` to render findings.jsonl into report.md, grouped by severity.
 - Each finding must carry: target, evidence, impact, and a fix recommendation.

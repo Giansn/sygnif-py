@@ -642,7 +642,7 @@ def tool_report(args: dict) -> str:
 def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
-    just that part (recon|enum|vuln|exploit|postexploit|privesc|report|webapp|wpsec|
+    just that part (recon|enum|vuln|exploit|postexploit|privesc|report|webapp|wpsec|dast|
     hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
@@ -664,7 +664,7 @@ def tool_playbook(args: dict) -> str:
             blocks.append(line)
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
-                "postexploit, privesc, report, webapp, wpsec, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
+                "postexploit, privesc, report, webapp, wpsec, dast, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
                 "reporter (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
@@ -1424,6 +1424,105 @@ def tool_privesc(args: dict) -> str:
             "suggest=kernel-CVE candidates (LES2); gtfo=GTFOBins lookup for a 'binary'; "
             "spy=pspy process/cron watch; container=deepce escape check; "
             "auto=traitor+GTFONow exploitable-vector analysis. All need target+authorization.")
+
+
+# 8c. dast — headless dynamic web-app scan driving OWASP ZAP via its REST API.
+#     Burp Community cannot be automated (no scan CLI / no REST API); ZAP is the
+#     agent-drivable DAST. modes:
+#       quick    (default) `zaproxy -cmd -zapit` — fast passive reconnaissance, no daemon
+#       baseline daemon + spider + PASSIVE scan only (quiet: no attack payloads sent)
+#       active   daemon + spider + ACTIVE scan (sends attack payloads) — louder, authorized only
+#     Requires 'target' + 'authorization'; SCOPE.md-confined. Alerts grouped by risk.
+_DAST_DRIVER = (
+    "import sys, time\n"
+    "try:\n"
+    "    from zapv2 import ZAPv2\n"
+    "except Exception as e:\n"
+    "    print('DAST_ERROR: zapv2 client not available (' + str(e) + ')'); sys.exit(3)\n"
+    "port, key, target, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n"
+    "base = 'http://127.0.0.1:' + port\n"
+    "zap = ZAPv2(apikey=key, proxies={'http': base, 'https': base})\n"
+    "try:\n"
+    "    zap.urlopen(target); time.sleep(2)\n"
+    "except Exception:\n"
+    "    pass\n"
+    "try:\n"
+    "    sid = zap.spider.scan(target); t0 = time.time()\n"
+    "    while int(zap.spider.status(sid)) < 100 and time.time() - t0 < 300:\n"
+    "        time.sleep(3)\n"
+    "except Exception as e:\n"
+    "    print('DAST_ERROR: spider failed: ' + str(e)); sys.exit(4)\n"
+    "t0 = time.time()\n"
+    "try:\n"
+    "    while int(zap.pscan.records_to_scan) > 0 and time.time() - t0 < 120:\n"
+    "        time.sleep(2)\n"
+    "except Exception:\n"
+    "    pass\n"
+    "if mode == 'active':\n"
+    "    try:\n"
+    "        aid = zap.ascan.scan(target); t0 = time.time()\n"
+    "        while int(zap.ascan.status(aid)) < 100 and time.time() - t0 < 1200:\n"
+    "            time.sleep(5)\n"
+    "    except Exception as e:\n"
+    "        print('DAST_WARN: active scan issue: ' + str(e))\n"
+    "try:\n"
+    "    alerts = zap.core.alerts(baseurl=target)\n"
+    "except Exception as e:\n"
+    "    print('DAST_ERROR: could not read alerts: ' + str(e)); sys.exit(5)\n"
+    "order = {'High': 0, 'Medium': 1, 'Low': 2, 'Informational': 3}\n"
+    "buckets = {}\n"
+    "for a in alerts:\n"
+    "    r = a.get('risk', 'Informational'); nm = a.get('alert') or a.get('name') or '?'\n"
+    "    b = buckets.setdefault(r, {}); e = b.setdefault(nm, {'count': 0, 'url': a.get('url', ''), 'cwe': a.get('cweid', ''), 'conf': a.get('confidence', '')})\n"
+    "    e['count'] += 1\n"
+    "print('ZAP DAST (' + mode + ') -- ' + target)\n"
+    "print(str(len(alerts)) + ' alert instances across ' + str(sum(len(v) for v in buckets.values())) + ' types')\n"
+    "for r in sorted(buckets, key=lambda x: order.get(x, 9)):\n"
+    "    items = buckets[r]\n"
+    "    print(''); print('== ' + r + ' (' + str(sum(v['count'] for v in items.values())) + ') ==')\n"
+    "    for nm in sorted(items, key=lambda n: -items[n]['count']):\n"
+    "        v = items[nm]\n"
+    "        print('  - ' + nm + '  x' + str(v['count']) + '  CWE-' + str(v['cwe']) + '  conf=' + str(v['conf']))\n"
+    "        print('      e.g. ' + str(v['url'])[:120])\n"
+)
+
+
+def tool_dast(args: dict) -> str:
+    target = _norm_url(str(args.get("target", "") or args.get("url", "")))
+    mode = str(args.get("mode", "quick")).strip().lower()
+    g = _authz(args, target)
+    if g:
+        return g
+
+    if mode == "quick":
+        cmd = "zaproxy -cmd -zapit " + shlex.quote(target) + " 2>&1 | tail -60"
+        out, rc, where = _off_run(cmd, 300, need=("zaproxy",))
+        return _off_report("dast(quick)", args.get("authorization", ""), "zap -zapit " + target, out, rc, where)
+
+    if mode not in ("baseline", "active"):
+        return ("dast: mode = quick | baseline | active.  quick=passive recon (zapit); "
+                "baseline=spider + passive scan (quiet); active=spider + active scan (sends "
+                "attack payloads). All need target + authorization.")
+
+    # baseline / active: spin a headless ZAP daemon, drive it via the REST API, tear it down.
+    driver = _DAST_DRIVER
+    tmo = 1500 if mode == "active" else 600
+    cmd = (
+        "PORT=$((8090 + RANDOM % 200)); KEY=sygnifdast$$; SESS=/tmp/zapsess_$$; "
+        "nohup zaproxy -daemon -host 127.0.0.1 -port $PORT -config api.key=$KEY "
+        "-config api.disablekey=false -newsession $SESS >/tmp/zap_$$.log 2>&1 & ZPID=$!; "
+        "up=0; for i in $(seq 1 90); do "
+        "curl -s \"http://127.0.0.1:$PORT/JSON/core/view/version/?apikey=$KEY\" 2>/dev/null | grep -q version && { up=1; break; }; "
+        "sleep 2; done; "
+        "if [ \"$up\" != 1 ]; then echo 'DAST_ERROR: ZAP daemon did not come up'; tail -20 /tmp/zap_$$.log 2>/dev/null; kill $ZPID 2>/dev/null; exit 6; fi; "
+        "python3 - $PORT $KEY " + shlex.quote(target) + " " + shlex.quote(mode) + " <<'ZAPPY'\n"
+        + driver +
+        "ZAPPY\n"
+        "RC=$?; curl -s \"http://127.0.0.1:$PORT/JSON/core/action/shutdown/?apikey=$KEY\" >/dev/null 2>&1; "
+        "kill $ZPID 2>/dev/null; rm -rf $SESS* /tmp/zap_$$.log 2>/dev/null; exit $RC"
+    )
+    out, rc, where = _off_run(cmd, tmo, need=("zaproxy", "curl", "python3"))
+    return _off_report("dast(" + mode + ")", args.get("authorization", ""), "zap " + mode + " " + target, out, rc, where)
 
 
 # 9. wifi_capture — WPA handshake / PMKID capture on an authorized network.
@@ -2572,6 +2671,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "Candidate CVEs are NOT confirmed — verify before firing. Fetches tools to /tmp."),
         "args": {"mode": "suggest|gtfo|spy|container|auto", "target": "authorized host (default localhost)", "authorization": "attestation + RoE permits post-ex", "binary": "(gtfo) binary you hold sudo/SUID/caps on", "kernel": "(suggest) kernel version if remote e.g. 5.4.0", "seconds": "(spy) watch window, default 25", "exploit": "(auto) 'true' for exploitation instructions"},
         "func": tool_privesc,
+    },
+    "dast": {
+        "desc": ("Headless dynamic web-app scan (DAST) driving OWASP ZAP via its REST API — the "
+                 "agent-drivable equivalent of a Burp active scan (Burp Community has no automation). "
+                 "modes: quick=passive reconnaissance (zapit, fast, no daemon); baseline=spider + "
+                 "PASSIVE scan (quiet, no attack payloads); active=spider + ACTIVE scan (sends attack "
+                 "payloads, louder). Alerts grouped by risk with CWE. Requires 'target'+'authorization'; "
+                 "SCOPE.md-confined. For manual work use Burp Repeater/Proxy by hand."),
+        "args": {"mode": "quick|baseline|active", "target": "the web app URL (yours/authorized)", "authorization": "attestation"},
+        "func": tool_dast,
     },
     "wifi_capture": {
         "desc": ("Capture a WPA handshake / PMKID on a network YOU are authorized to test "
