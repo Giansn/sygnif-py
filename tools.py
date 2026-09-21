@@ -401,7 +401,7 @@ def tool_metasploit(args: dict) -> str:
     action = str(args.get("action", "")).strip()
     if not action:
         return "metasploit: no action. Try action=version, or search/info/options/run/sessions."
-    container = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+    container = _toolbox_name(auto_create=True) or TOOLBOX_NAME
     if _IS_WINDOWS or _run_host("command -v docker", 10)[1] != 0:
         return "metasploit: docker not available; this tool needs the sygnif-kali container."
     st, _ = _run_host(
@@ -442,7 +442,7 @@ def tool_kali_tools(args: dict) -> str:
     """
     category = str(args.get("category", "")).strip().lower()
     check = str(args.get("check", "")).strip()
-    container = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+    container = _toolbox_name(auto_create=True) or TOOLBOX_NAME
     have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
     live = False
     if have_docker:
@@ -712,7 +712,7 @@ def tool_kali(args: dict) -> str:
     command = str(args.get("command", "")).strip()
     if not command:
         return "kali: empty command"
-    container = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+    container = _toolbox_name(auto_create=True) or TOOLBOX_NAME
     have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
     if have_docker:
         state, _ = _run_host(
@@ -1024,7 +1024,50 @@ import shlex
 
 OFFENSIVE_TIMEOUT = int(os.environ.get("SYGNIF_PY_OFFENSIVE_TIMEOUT", "1800"))
 SCOPE_FILE = os.path.expanduser(os.environ.get("SYGNIF_PY_SCOPE_FILE", "~/sygnif-pentest/SCOPE.md"))
-_KALI_CONTAINER = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-kali")
+# --- self-contained Docker toolbox ------------------------------------------
+# sygnif-py OWNS its pentest toolbox so the offensive/network tools depend on
+# nothing pre-existing. It ADOPTS an already-present container (env override,
+# then sygnif-py-toolbox, then legacy sygnif-kali), else self-provisions
+# sygnif-py-toolbox from the Kali image. Host is the fallback when Docker is absent.
+TOOLBOX_IMAGE = os.environ.get("SYGNIF_PY_KALI_IMAGE", "kalilinux/kali-rolling")
+TOOLBOX_NAME = os.environ.get("SYGNIF_PY_KALI_CONTAINER", "sygnif-py-toolbox")
+_TOOLBOX_CANDIDATES = list(dict.fromkeys([TOOLBOX_NAME, "sygnif-py-toolbox", "sygnif-kali"]))
+
+
+def _docker_ok() -> bool:
+    return not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
+
+
+def _container_state(name: str) -> str:
+    out, rc = _run_host("docker inspect -f '{{.State.Status}}' " + shlex.quote(name) + " 2>/dev/null", 10)
+    return out.strip() if rc == 0 else ""
+
+
+def _toolbox_name(auto_create: bool = False) -> str:
+    """Resolve a usable toolbox container name, or '' for host-only.
+
+    Adopts an existing candidate (starting it if stopped). With auto_create,
+    provisions sygnif-py-toolbox from the Kali image when none exists and Docker
+    is available (one-time base-image pull)."""
+    if not _docker_ok():
+        return ""
+    for name in _TOOLBOX_CANDIDATES:
+        st = _container_state(name)
+        if st == "running":
+            return name
+        if st in ("exited", "created", "paused"):
+            _run_host("docker start " + shlex.quote(name), 60)
+            if _container_state(name) == "running":
+                return name
+    if not auto_create:
+        return ""
+    _run_host("docker run -d --name " + shlex.quote(TOOLBOX_NAME) + " --restart unless-stopped "
+              "--network host --cap-add=NET_ADMIN --cap-add=NET_RAW " + shlex.quote(TOOLBOX_IMAGE)
+              + " sleep infinity", 900)
+    return TOOLBOX_NAME if _container_state(TOOLBOX_NAME) == "running" else ""
+
+
+_KALI_CONTAINER = TOOLBOX_NAME
 
 
 def _scope_targets() -> set | None:
@@ -1065,13 +1108,12 @@ def _authz(args: dict, target: str) -> str | None:
 
 
 def _off_run(command: str, timeout: int | None = None) -> tuple[str, int, str]:
-    """Run an offensive command in the kali container if up, else on the host."""
+    """Run a command in sygnif-py's Docker toolbox if available, else on the host."""
     timeout = timeout or OFFENSIVE_TIMEOUT
-    if not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0:
-        st, rc = _run_host(f"docker inspect -f '{{{{.State.Status}}}}' {_KALI_CONTAINER} 2>/dev/null", 10)
-        if rc == 0 and st.strip() == "running":
-            out, rc = _run_host(f"docker exec {_KALI_CONTAINER} bash -lc {shlex.quote(command)}", timeout)
-            return out, rc, f"docker:{_KALI_CONTAINER}"
+    box = _toolbox_name(auto_create=False)
+    if box:
+        out, rc = _run_host("docker exec " + shlex.quote(box) + " bash -lc " + shlex.quote(command), timeout)
+        return out, rc, f"docker:{box}"
     out, rc = _run_host(command, timeout)
     return out, rc, "host"
 
@@ -1440,31 +1482,47 @@ def _resp_headers(url: str) -> tuple[dict, int, str]:
 
 
 # 1. secrets_scan — trufflehog + gitleaks over a repo/dir you own (runs on host)
+def _local_or_toolbox(path: str, cmd_tmpl: str, need_bin: str, timeout: int = 900):
+    """Run a file-scanning command where the files live. Host binary first; else
+    copy the path into sygnif-py's Docker toolbox (if it has the binary) and run
+    there — so these work with zero host installs when Docker is present."""
+    ap = os.path.abspath(os.path.expanduser(path))
+    if _run_host("command -v " + shlex.quote(need_bin), 10)[1] == 0:
+        out, rc = _run_host(cmd_tmpl.format(p=shlex.quote(ap)), timeout)
+        return out, rc, "host"
+    box = _toolbox_name(auto_create=True)
+    if box and _run_host("docker exec " + box + " command -v " + shlex.quote(need_bin), 15)[1] == 0:
+        dst = "/tmp/scan_" + str(abs(hash(ap)) % 100000)
+        _run_host(f"docker cp {shlex.quote(ap)} {box}:{dst}", 300)
+        out, rc = _run_host("docker exec " + box + " bash -lc " + shlex.quote(cmd_tmpl.format(p=dst)), timeout)
+        _run_host(f"docker exec {box} rm -rf {shlex.quote(dst)}", 30)
+        return out, rc, f"docker:{box}"
+    return "", 127, "missing:" + need_bin
+
+
 def tool_secrets_scan(args: dict) -> str:
     path = os.path.expanduser(str(args.get("path") or args.get("repo") or "."))
     if not os.path.exists(path):
         return f"secrets_scan: path not found: {path}"
-    q = shlex.quote(path)
-    cmd = (f"echo '== trufflehog =='; trufflehog filesystem {q} --no-update 2>/dev/null | head -200; "
-           f"echo '== gitleaks =='; gitleaks detect --source {q} --no-banner -v 2>/dev/null | head -200")
-    out, rc = _run_host(cmd, 600)
-    if not out.strip() or ("trufflehog" not in _run_host("command -v trufflehog gitleaks", 10)[0]):
-        return ("secrets_scan needs trufflehog and/or gitleaks on this host. Install: "
-                "trufflehog (github.com/trufflesecurity/trufflehog) + gitleaks "
-                "(github.com/gitleaks/gitleaks), or run the seat where they are installed.")
-    return _off_report("secrets_scan", "own code", f"scan {path}", out, rc, "host")
+    tmpl = ("echo '== trufflehog =='; trufflehog filesystem {p} --no-update 2>/dev/null | head -200; "
+            "echo '== gitleaks =='; gitleaks detect --source {p} --no-banner -v 2>/dev/null | head -200")
+    out, rc, where = _local_or_toolbox(path, tmpl, "trufflehog", 600)
+    if where.startswith("missing"):
+        return ("secrets_scan needs trufflehog/gitleaks. Either install them on this host, or "
+                "provision the toolbox with `sygnif kali-setup` (Docker) and they'll run there.")
+    return _off_report("secrets_scan", "own code", f"scan {path}", out, rc, where)
 
 
 # 2. sast — semgrep static analysis of your own source (runs on host)
 def tool_sast(args: dict) -> str:
     path = os.path.expanduser(str(args.get("path") or "."))
     cfg = str(args.get("config", "auto")).strip() or "auto"
-    if _run_host("command -v semgrep", 10)[1] != 0:
-        return ("sast needs semgrep: pip install semgrep  (or pipx install semgrep). Then rerun. "
-                "It scans YOUR source for injection/XSS/secrets/misconfig via community rules.")
-    cmd = f"semgrep --config {shlex.quote(cfg)} {shlex.quote(path)} --quiet --error 2>&1 | head -300"
-    out, rc = _run_host(cmd, 900)
-    return _off_report("sast (semgrep)", "own code", f"semgrep {cfg} {path}", out, rc, "host")
+    tmpl = "semgrep --config " + shlex.quote(cfg) + " {p} --quiet 2>&1 | head -300"
+    out, rc, where = _local_or_toolbox(path, tmpl, "semgrep", 900)
+    if where.startswith("missing"):
+        return ("sast needs semgrep. Install on host (pipx install semgrep), or provision the "
+                "toolbox with `sygnif kali-setup` (Docker) and it'll run there.")
+    return _off_report("sast (semgrep)", "own code", f"semgrep {cfg} {path}", out, rc, where)
 
 
 # 3. tls_check — testssl / sslscan on an authorized host

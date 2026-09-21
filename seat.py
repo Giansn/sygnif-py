@@ -837,7 +837,7 @@ def do_first_run(spec: dict) -> None:
         mode = pentest.choose_mode()
         prompt = {
             "host": "  Install the full Kali toolset (metapackages) on this Kali host now?",
-            "docker": "  Set up the full Kali toolset in a `sygnif-kali` Docker container now?",
+            "docker": "  Set up the full Kali toolset in the `sygnif-py-toolbox` Docker container now?",
             "fallback": "  Install a curated pentest tool set with your package manager now?",
         }.get(mode, "  Install the pentest toolset now?")
         pix.notice(prompt)
@@ -904,25 +904,24 @@ def do_doctor() -> int:
     line(ok if os.path.isdir(ws) else warn, "pentest workspace",
          ws if os.path.isdir(ws) else ws + " (missing — created on first run)")
 
-    # --- docker + containers (soft: absence is a warning, not a failure) ---
-    have_docker = bool(shutil.which("docker"))
-    if not have_docker:
-        line(warn, "docker", "not present — kali/purple/metasploit tools unavailable here")
+    # --- Docker toolbox (self-contained; absence is a warning, not a failure) ---
+    if not tools._docker_ok():
+        line(warn, "docker", "not present — network/offensive tools run on host binaries only")
     else:
-        for cont, label in (("sygnif-kali", "offensive container"),
-                            ("sygnif-purple", "defensive container")):
-            rc = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", cont],
-                                capture_output=True, text=True).stdout.strip()
-            line(ok if rc == "running" else warn, label,
-                 cont + " " + (rc or "absent"))
-        # msfrpcd reachability from inside the kali container
-        try:
-            r = subprocess.run(["docker", "exec", "sygnif-kali", "bash", "-lc",
-                                "ss -ltn 2>/dev/null | grep -q :55553 && echo up || echo down"],
-                               capture_output=True, text=True, timeout=15).stdout.strip()
-            line(ok if r == "up" else warn, "metasploit RPC", "msfrpcd " + (r or "unknown"))
-        except Exception:  # noqa: BLE001
-            line(warn, "metasploit RPC", "could not probe")
+        box = tools._toolbox_name()
+        if not box:
+            line(warn, "toolbox", "none yet — run `sygnif toolbox up` (bare) or "
+                 "`sygnif kali-setup` (full toolset)")
+        else:
+            line(ok, "toolbox", box + " (running)")
+            try:
+                r = subprocess.run(["docker", "exec", box, "bash", "-lc",
+                                    "command -v nmap nuclei wpscan >/dev/null 2>&1 && echo yes || echo no"],
+                                   capture_output=True, text=True, timeout=15).stdout.strip()
+                line(ok if r == "yes" else warn, "toolset",
+                     "core tools present" if r == "yes" else "sparse — run `sygnif kali-setup`")
+            except Exception:  # noqa: BLE001
+                line(warn, "toolset", "could not probe the toolbox")
 
     pix.notice("  " + (bad + " doctor: a hard check failed" if hard_fail else ok + " doctor: healthy"),
                "red" if hard_fail else "green")
@@ -938,6 +937,33 @@ def main() -> int:
         pentest.toolset_status(pix.notice)
         ok = pentest.install_full_toolset(pix.notice)
         return 0 if ok else 1
+    if len(sys.argv) >= 2 and sys.argv[1] == "toolbox":
+        # sygnif-py's own Docker pentest toolbox: status | up | rebuild
+        sub = sys.argv[2] if len(sys.argv) >= 3 else "status"
+        box = tools._toolbox_name(auto_create=(sub == "up"))
+        if sub == "status":
+            pix.notice(f"  toolbox: {box or '(none — host-only)'}"
+                       + (f"  image={tools.TOOLBOX_IMAGE}" if box else ""),
+                       "green" if box else "yellow")
+            if not box and tools._docker_ok():
+                pix.notice("  Docker is present. Provision it with:  sygnif toolbox up   "
+                           "(bare) or  sygnif kali-setup  (full toolset).")
+            elif not tools._docker_ok():
+                pix.notice("  Docker not found — tools fall back to host binaries.", "yellow")
+            return 0
+        if sub == "up":
+            pix.notice(f"  toolbox ready: {box}" if box else "  could not provision (need Docker).",
+                       "green" if box else "yellow")
+            pix.notice("  add the full toolset with:  sygnif kali-setup")
+            return 0 if box else 1
+        if sub == "rebuild":
+            subprocess.call(["docker", "rm", "-f", tools.TOOLBOX_NAME])
+            box = tools._toolbox_name(auto_create=True)
+            pix.notice(f"  rebuilt: {box}" if box else "  rebuild failed (need Docker).",
+                       "green" if box else "yellow")
+            return 0 if box else 1
+        pix.notice("  usage: sygnif toolbox [status|up|rebuild]", "yellow")
+        return 1
     ap = argparse.ArgumentParser(description="SYGNIF py — the generic SYGNIF seat")
     ap.add_argument("--preset", default=None, help="preset name (default: config default_preset)")
     ap.add_argument("--model", default=None, help="override model (a key in the models table)")
