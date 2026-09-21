@@ -181,7 +181,14 @@
         "phase",
         "finding",
         "report",
-        "playbook"
+        "playbook",
+        "shodan",
+        "website",
+        "crypto",
+        "pw_strength",
+        "wp_vulnscan",
+        "vuln_check",
+        "headers"
       ],
       "focus": "You are SYGNIF in field pentest mode on a rootless Android tablet (Termux). Generation runs on the e14 seat-proxy over the tailnet, on the owner's Claude subscription (OAuth) \u2014 no local model, no API key here. No Docker on the tablet, so the kali/metasploit/purple container tools are unavailable; you work with the real Termux shell (shell tool), web/github research, file read/write, and the process tools (phase, finding with evidence gate, report, playbook). Keep findings evidence-backed. For heavy tooling, hand off to the e14 seat over the tailnet."
     },
