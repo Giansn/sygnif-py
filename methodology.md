@@ -305,3 +305,29 @@ transition mode).
   whatweb DOMAIN                                  # tech stack
 Passive first means no packets to the target's own infra where possible — build the
 asset map before active scanning. The `recon` seat tool runs the core of this.
+
+## network — role mode: network security testing (authorized)
+Map and enumerate a network you are authorized to test.
+- `portscan` — nmap -sV -sC (service/version + default scripts); or raw nmap via kali.
+- `netenum` — SMB (enum4linux-ng, smbmap, nxc --shares: null sessions, shares, users) or
+  SNMP (onesixtyone + snmpwalk with community strings).
+- `tls_check` — testssl/sslscan per exposed TLS service.
+- Sniffing/analysis: tshark / tcpdump on an interface you own (passive).
+- Lateral/AD: nxc (CrackMapExec) for spray/exec, BloodHound for attack paths — scope-gated.
+Chain: portscan -> per service netenum -> vuln/exploit. Every finding = reproducible output.
+
+## passwords — role mode: credential strength & testing
+- `pw_strength` — test a password locally + HaveIBeenPwned (k-anonymity; the password never
+  leaves the machine). Use it to prove weak/breached passwords in a policy review.
+- Online testing: `bruteforce` (hydra) — loud, lockout risk, rate-agreed only.
+- Offline: `crack` (hashcat -m <mode>, -r rules) on hashes you are authorized to hold.
+- Build target wordlists with cewl; base lists in seclists (/usr/share/seclists).
+
+## cellular — role mode: DEFENSIVE cellular / network link (authorized, own device)
+Observation only. Transmitting on cellular bands or intercepting others' traffic is illegal
+and NOT provided here.
+- `cell_info mode=serving` — your OWN modem's serving cell (operator, RAT, signal, cell id)
+  via ModemManager (mmcli). Useful for a van/field uplink health + coverage.
+- `cell_info mode=lookup` — geolocate a tower by mcc/mnc/lac/cellid (OpenCellID, free key).
+- `cell_info mode=detect` — IMSI-catcher / rogue-base-station DETECTION guidance (SnoopSnitch,
+  Crocodile Hunter): watch for forced 2G downgrade, unknown strong CellID, cipher downgrade.

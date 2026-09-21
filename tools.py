@@ -643,7 +643,7 @@ def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
     just that part (recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|
-    hosting|redteam|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
+    hosting|redteam|network|passwords|cellular|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
     try:
@@ -664,7 +664,7 @@ def tool_playbook(args: dict) -> str:
             blocks.append(line)
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
-                "postexploit, report, webapp, wpsec, hosting, redteam, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
+                "postexploit, report, webapp, wpsec, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
                 "reporter (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
@@ -1410,6 +1410,249 @@ def tool_c2(args: dict) -> str:
             "exec (see op=help).")
 
 
+# --- Gap-fill tools: code security, TLS/headers, takeover, OSINT, network,
+#     password strength, cellular (defensive) ----------------------------------
+# Local-file tools (secrets_scan, sast) run on the HOST where the seat runs, so
+# they see your own code; network tools run in the kali container if present.
+# Cellular here is DEFENSIVE ONLY: your own modem's serving cell + tower lookup +
+# IMSI-catcher detection. No transmitting, no interception — that is illegal.
+import hashlib
+import math
+
+HIBP_RANGE = "https://api.pwnedpasswords.com/range/"
+OPENCELLID = "https://opencellid.org/cell/get"
+OPENCELLID_KEY = os.environ.get("OPENCELLID_API_KEY", "").strip()
+
+
+def _resp_headers(url: str) -> tuple[dict, int, str]:
+    """GET a URL and return (headers_dict_lowercased, status, error)."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": _BROWSER_UA, "Accept": "*/*"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            h = {k.lower(): v for k, v in r.headers.items()}
+            return h, getattr(r, "status", 200), ""
+    except urllib.error.HTTPError as e:
+        h = {k.lower(): v for k, v in (e.headers or {}).items()}
+        return h, e.code, f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return {}, 0, f"{type(e).__name__}: {e}"
+
+
+# 1. secrets_scan — trufflehog + gitleaks over a repo/dir you own (runs on host)
+def tool_secrets_scan(args: dict) -> str:
+    path = os.path.expanduser(str(args.get("path") or args.get("repo") or "."))
+    if not os.path.exists(path):
+        return f"secrets_scan: path not found: {path}"
+    q = shlex.quote(path)
+    cmd = (f"echo '== trufflehog =='; trufflehog filesystem {q} --no-update 2>/dev/null | head -200; "
+           f"echo '== gitleaks =='; gitleaks detect --source {q} --no-banner -v 2>/dev/null | head -200")
+    out, rc = _run_host(cmd, 600)
+    if not out.strip() or ("trufflehog" not in _run_host("command -v trufflehog gitleaks", 10)[0]):
+        return ("secrets_scan needs trufflehog and/or gitleaks on this host. Install: "
+                "trufflehog (github.com/trufflesecurity/trufflehog) + gitleaks "
+                "(github.com/gitleaks/gitleaks), or run the seat where they are installed.")
+    return _off_report("secrets_scan", "own code", f"scan {path}", out, rc, "host")
+
+
+# 2. sast — semgrep static analysis of your own source (runs on host)
+def tool_sast(args: dict) -> str:
+    path = os.path.expanduser(str(args.get("path") or "."))
+    cfg = str(args.get("config", "auto")).strip() or "auto"
+    if _run_host("command -v semgrep", 10)[1] != 0:
+        return ("sast needs semgrep: pip install semgrep  (or pipx install semgrep). Then rerun. "
+                "It scans YOUR source for injection/XSS/secrets/misconfig via community rules.")
+    cmd = f"semgrep --config {shlex.quote(cfg)} {shlex.quote(path)} --quiet --error 2>&1 | head -300"
+    out, rc = _run_host(cmd, 900)
+    return _off_report("sast (semgrep)", "own code", f"semgrep {cfg} {path}", out, rc, "host")
+
+
+# 3. tls_check — testssl / sslscan on an authorized host
+def tool_tls_check(args: dict) -> str:
+    target = str(args.get("target", "") or args.get("host", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    host = _bare_host(target)
+    if _have("testssl") or _have("testssl.sh"):
+        cmd = f"(testssl --quiet --color 0 {shlex.quote(host)} 2>/dev/null || testssl.sh --quiet {shlex.quote(host)}) | head -120"
+    else:
+        cmd = f"sslscan --no-colour {shlex.quote(host)} 2>/dev/null | head -120"
+    out, rc, where = _off_run(cmd, 600)
+    return _off_report("tls_check", args.get("authorization", ""), cmd, out, rc, where)
+
+
+# 4. headers — security header + cookie grade (keyless, one GET, passive)
+def tool_headers(args: dict) -> str:
+    url = _norm_url(str(args.get("url", "") or args.get("target", "")))
+    if not url:
+        return "headers: give a 'url' (yours / authorized)."
+    h, status, err = _resp_headers(url)
+    if not h and err:
+        return f"headers: could not fetch {url} ({err})."
+    want = {
+        "content-security-policy": "CSP — controls script/resource origins (XSS defence)",
+        "strict-transport-security": "HSTS — forces HTTPS",
+        "x-content-type-options": "nosniff — stops MIME sniffing",
+        "x-frame-options": "clickjacking defence (or CSP frame-ancestors)",
+        "referrer-policy": "limits referrer leakage",
+        "permissions-policy": "restricts browser features",
+    }
+    lines = [f"Security headers for {url} (HTTP {status}):"]
+    missing = []
+    for k, why in want.items():
+        v = h.get(k)
+        if v:
+            lines.append(f"  OK  {k}: {v[:80]}")
+        else:
+            missing.append(k)
+            lines.append(f"  --  MISSING {k}  ({why})")
+    server = h.get("server")
+    if server:
+        lines.append(f"  info server: {server} (version disclosure — consider hiding)")
+    cookies = h.get("set-cookie", "")
+    if cookies:
+        flags = [f for f in ("HttpOnly", "Secure", "SameSite") if f.lower() not in cookies.lower()]
+        lines.append("  cookie flags missing: " + (", ".join(flags) if flags else "none — good"))
+    aco = h.get("access-control-allow-origin")
+    if aco == "*":
+        lines.append("  ⚠ CORS: Access-Control-Allow-Origin: * (risk if credentials are allowed)")
+    lines.insert(1, f"  score: {len(want)-len(missing)}/{len(want)} present"
+                    + (f" — add: {', '.join(missing)}" if missing else " — all present"))
+    return _truncate("\n".join(lines))
+
+
+# 5. takeover — subdomain takeover check (subfinder -> subjack / nuclei)
+def tool_takeover(args: dict) -> str:
+    domain = str(args.get("domain", "") or args.get("target", "")).strip()
+    g = _authz(args, domain)
+    if g:
+        return g
+    d = _bare_host(domain)
+    cmd = (f"subfinder -silent -d {shlex.quote(d)} 2>/dev/null | tee /tmp/_subs.txt | wc -l | xargs echo 'subdomains:'; "
+           f"echo '== subjack =='; subjack -w /tmp/_subs.txt -ssl -t 50 -timeout 15 2>/dev/null | grep -iv 'Not Vulnerable' | head -40; "
+           f"echo '== nuclei takeover =='; nuclei -silent -l /tmp/_subs.txt -tags takeover 2>/dev/null | head -40")
+    out, rc, where = _off_run(cmd, 900)
+    return _off_report("takeover", args.get("authorization", ""), "takeover " + d, out, rc, where)
+
+
+# 6. osint — passive intelligence on an authorized domain
+def tool_osint(args: dict) -> str:
+    domain = str(args.get("domain", "") or args.get("target", "")).strip()
+    g = _authz(args, domain)
+    if g:
+        return g
+    d = shlex.quote(_bare_host(domain))
+    cmd = (f"echo '== theHarvester =='; theHarvester -d {d} -b duckduckgo,crtsh,bing -l 200 2>/dev/null | grep -iE '@|host|ip' | head -60; "
+           f"echo '== dns =='; dnsx -silent -a -resp -d {d} 2>/dev/null | head -20; "
+           f"echo '== SPF/DMARC =='; dig +short TXT {d}; dig +short TXT _dmarc.{d}")
+    out, rc, where = _off_run(cmd, 600)
+    return _off_report("osint", args.get("authorization", ""), "osint " + _bare_host(domain), out, rc, where)
+
+
+# 7. portscan — structured nmap on an authorized target
+def tool_portscan(args: dict) -> str:
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    ports = str(args.get("ports", "")).strip()
+    extra = str(args.get("extra", "")).strip()
+    pflag = f"-p {shlex.quote(ports)}" if ports else "--top-ports 1000"
+    cmd = f"nmap -sV -sC {pflag} -Pn {shlex.quote(target)} {extra} 2>&1 | head -150"
+    out, rc, where = _off_run(cmd, 900)
+    return _off_report("portscan", args.get("authorization", ""), cmd, out, rc, where)
+
+
+# 8. netenum — SMB / SNMP / service enumeration on an authorized host
+def tool_netenum(args: dict) -> str:
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    svc = str(args.get("service", "smb")).lower()
+    t = shlex.quote(target)
+    if svc == "snmp":
+        cmd = f"onesixtyone {t} public 2>/dev/null; echo '=='; snmpwalk -v2c -c public -Cc {t} 2>/dev/null | head -60"
+    else:  # smb
+        cmd = (f"echo '== enum4linux-ng =='; enum4linux-ng -A {t} 2>/dev/null | head -120; "
+               f"echo '== smbmap =='; smbmap -H {t} 2>/dev/null | head -40; "
+               f"echo '== nxc =='; nxc smb {t} --shares 2>/dev/null | head -40")
+    out, rc, where = _off_run(cmd, 600)
+    return _off_report("netenum(" + svc + ")", args.get("authorization", ""), cmd, out, rc, where)
+
+
+# 9. pw_strength — local strength estimate + HaveIBeenPwned breach check.
+#    The password is NEVER sent: only the first 5 chars of its SHA-1 hash (HIBP
+#    k-anonymity). Purely a defensive self-test.
+def tool_pw_strength(args: dict) -> str:
+    pw = str(args.get("password", "") or args.get("pw", ""))
+    if not pw:
+        return ("pw_strength: give a 'password' to test. It is checked LOCALLY; only a 5-char "
+                "SHA-1 prefix is sent to HaveIBeenPwned, never the password itself.")
+    cs = (26 if re.search(r"[a-z]", pw) else 0) + (26 if re.search(r"[A-Z]", pw) else 0) \
+        + (10 if re.search(r"\d", pw) else 0) + (33 if re.search(r"[^A-Za-z0-9]", pw) else 0)
+    entropy = round(len(pw) * math.log2(cs), 1) if cs else 0.0
+    verdict = ("very weak" if entropy < 28 else "weak" if entropy < 36
+               else "reasonable" if entropy < 60 else "strong" if entropy < 128 else "very strong")
+    notes = []
+    if len(pw) < 12:
+        notes.append("under 12 chars — length matters most")
+    if re.fullmatch(r"[a-z]+|\d+", pw):
+        notes.append("single character class")
+    if re.search(r"(.)\1\1", pw):
+        notes.append("repeated characters")
+    h = hashlib.sha1(pw.encode()).hexdigest().upper()
+    body, status, _ = _http_get(HIBP_RANGE + h[:5], headers={"User-Agent": _BROWSER_UA, "Add-Padding": "true"})
+    breached = 0
+    for line in (body or "").splitlines():
+        p = line.strip().split(":")
+        if len(p) == 2 and p[0] == h[5:]:
+            breached = int(p[1])
+            break
+    out = [f"Password strength (length {len(pw)}): {verdict}  (~{entropy} bits, charset {cs})"]
+    if notes:
+        out.append("  weaknesses: " + "; ".join(notes))
+    if breached:
+        out.append(f"  ⚠ BREACHED: seen {breached:,} times in known breaches (HIBP) — do NOT use it.")
+    else:
+        out.append("  not found in HIBP breach corpus (good, but that alone doesn't make it strong).")
+    return "\n".join(out)
+
+
+# 10. cell_info — DEFENSIVE cellular: own modem serving cell + tower lookup +
+#     IMSI-catcher detection guidance. No transmitting / no interception.
+def tool_cell_info(args: dict) -> str:
+    mode = str(args.get("mode", "serving")).lower()
+    if mode == "lookup":
+        for k in ("mcc", "mnc", "lac", "cellid"):
+            if not str(args.get(k, "")).strip():
+                return "cell_info lookup: give mcc, mnc, lac, cellid (from a tower you can see). Needs OPENCELLID_API_KEY."
+        if not OPENCELLID_KEY:
+            return "cell_info lookup: set OPENCELLID_API_KEY (free at opencellid.org) to geolocate a cell tower."
+        qs = urllib.parse.urlencode({"key": OPENCELLID_KEY, "mcc": args["mcc"], "mnc": args["mnc"],
+                                     "lac": args["lac"], "cellid": args["cellid"], "format": "json"})
+        body, status, err = _http_get(OPENCELLID + "?" + qs, headers={"User-Agent": _BROWSER_UA})
+        return f"OpenCellID lookup (HTTP {status}):\n{body[:600]}" if body else f"cell_info: {err}"
+    if mode == "detect":
+        return ("IMSI-catcher / rogue-base-station DETECTION (defensive):\n"
+                "- Watch for a sudden drop to 2G/GSM, a new unknown CellID with strong signal, or "
+                "  cipher downgrade. Tools: SnoopSnitch (rooted Android) or Crocodile Hunter (SDR).\n"
+                "- Compare the serving CellID/LAC against OpenCellID for the area (mode=lookup).\n"
+                "- This tool only OBSERVES your own link. Transmitting on cellular bands or "
+                "intercepting others' traffic is illegal and not provided.")
+    # serving: read the OWN modem via ModemManager
+    if _run_host("command -v mmcli", 10)[1] != 0:
+        return ("cell_info serving: ModemManager (mmcli) not found. It reads YOUR OWN modem's "
+                "serving cell (operator, tech, signal, cell id). Install: apt install modemmanager.")
+    cmd = ("m=$(mmcli -L 2>/dev/null | grep -oE '/Modem/[0-9]+' | head -1); "
+           "[ -n \"$m\" ] && mmcli -m \"$m\" 2>/dev/null | grep -iE 'operator|access tech|signal|state|3gpp|registration' "
+           "&& mmcli -m \"$m\" --location-get 2>/dev/null | grep -iE 'cell|lac|mcc|mnc|operator' "
+           "|| echo 'no modem found via ModemManager'")
+    out, rc = _run_host(cmd, 30)
+    return _off_report("cell_info(serving, own modem)", "own device", "mmcli serving cell", out, rc, "host")
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -1574,6 +1817,58 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "args": {},
         "func": tool_report,
     },
+    "secrets_scan": {
+        "desc": "Scan a repo/dir you own for leaked secrets (API keys, tokens, creds) with trufflehog + gitleaks. Runs on this host.",
+        "args": {"path": "repo/dir to scan (default .)"},
+        "func": tool_secrets_scan,
+    },
+    "sast": {
+        "desc": "Static analysis of YOUR source for vulns (injection/XSS/secrets/misconfig) via semgrep. Runs on this host (needs semgrep).",
+        "args": {"path": "source dir (default .)", "config": "semgrep config (default auto)"},
+        "func": tool_sast,
+    },
+    "tls_check": {
+        "desc": "TLS/SSL audit of an authorized host (testssl/sslscan): protocol versions, weak ciphers, cert. Requires target+authorization.",
+        "args": {"target": "host you are authorized to test", "authorization": "attestation"},
+        "func": tool_tls_check,
+    },
+    "headers": {
+        "desc": "Grade a URL's security headers + cookie flags + CORS (keyless, single GET). Passive.",
+        "args": {"url": "URL to check"},
+        "func": tool_headers,
+    },
+    "takeover": {
+        "desc": "Subdomain-takeover check on an authorized domain (subfinder -> subjack/nuclei). Requires target+authorization.",
+        "args": {"domain": "domain you are authorized to test", "authorization": "attestation"},
+        "func": tool_takeover,
+    },
+    "osint": {
+        "desc": "Passive OSINT on an authorized domain (theHarvester, dnsx, SPF/DMARC). Requires target+authorization.",
+        "args": {"domain": "domain you are authorized to test", "authorization": "attestation"},
+        "func": tool_osint,
+    },
+    "portscan": {
+        "desc": "Structured nmap service scan of an authorized target. Requires target+authorization.",
+        "args": {"target": "host/range you are authorized to test", "authorization": "attestation", "ports": "e.g. 1-1000 (default top-1000)", "extra": "extra nmap flags"},
+        "func": tool_portscan,
+    },
+    "netenum": {
+        "desc": "Network service enumeration (SMB via enum4linux-ng/smbmap/nxc, or SNMP) on an authorized host. Requires target+authorization.",
+        "args": {"target": "host you are authorized to test", "authorization": "attestation", "service": "smb (default) or snmp"},
+        "func": tool_netenum,
+    },
+    "pw_strength": {
+        "desc": "Test a password's strength locally + check HaveIBeenPwned (k-anonymity: only a SHA-1 prefix is sent, never the password). Defensive self-test.",
+        "args": {"password": "the password to test"},
+        "func": tool_pw_strength,
+    },
+    "cell_info": {
+        "desc": ("DEFENSIVE cellular info: your OWN modem's serving cell (mode=serving, via mmcli), "
+                 "tower geolocation (mode=lookup, OpenCellID), or IMSI-catcher detection guidance "
+                 "(mode=detect). No transmitting / no interception."),
+        "args": {"mode": "serving (default) | lookup | detect", "mcc": "for lookup", "mnc": "for lookup", "lac": "for lookup", "cellid": "for lookup"},
+        "func": tool_cell_info,
+    },
     "recon": {
         "desc": ("Recon/OSINT on an authorized target domain: subdomains (subfinder), DNS + "
                  "SPF/DMARC, tech fingerprint (whatweb), and live-host probing (httpx). Requires "
@@ -1673,7 +1968,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
                  "checklist and the role modes. section=<phase or role> for one part. Needs no "
                  "network; use it when the van has no signal."),
-        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|scout|analyzer|exploiter|reporter"},
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|scout|analyzer|exploiter|reporter"},
         "func": tool_playbook,
     },
 }
