@@ -1230,18 +1230,75 @@ def tool_wpscan(args: dict) -> str:
 
 
 # 4. exploit_search — offline Exploit-DB lookup (searchsploit). DB search, ungated.
+def _poc_search(query: str, cve: str = "") -> str:
+    """Find public exploit/PoC repos on GitHub (keyless). GitHub repo-search by stars
+    is primary (surfaces high-signal PoCs that Exploit-DB lacks, e.g. amlweems/xzbot
+    for CVE-2024-3094); the nomi-sec PoC-in-GitHub index (CVE-keyed) supplements it.
+    Star-ranked, deduped. Set GITHUB_TOKEN for a higher unauthenticated search rate."""
+    hdr = {"Accept": "application/vnd.github+json"}
+    tok = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "")
+    if tok:
+        hdr["Authorization"] = "token " + tok
+    found: dict = {}
+    gq = urllib.parse.quote(cve or query)
+    body, status, _ = _http_get(
+        "https://api.github.com/search/repositories?q=" + gq + "&sort=stars&order=desc&per_page=12",
+        headers=hdr)
+    if status == 200:
+        try:
+            for r in (json.loads(body).get("items") or []):
+                fn = r.get("full_name", "")
+                if fn:
+                    found[fn] = {"stars": int(r.get("stargazers_count", 0) or 0),
+                                 "url": r.get("html_url", ""),
+                                 "desc": (r.get("description") or "").strip(),
+                                 "upd": str(r.get("pushed_at", ""))[:10]}
+        except Exception:  # noqa: BLE001
+            pass
+    if cve:
+        body, status, _ = _http_get("https://poc-in-github.motikan2010.net/api/v1/?cve_id=" + cve)
+        if status == 200:
+            try:
+                for p in (json.loads(body).get("pocs") or []):
+                    fn = p.get("full_name", "")
+                    if not fn:
+                        continue
+                    st = int(p.get("stargazers_count", 0) or 0)
+                    cur = found.get(fn)
+                    if not cur or st > cur["stars"]:
+                        found[fn] = {"stars": st, "url": p.get("html_url", ""),
+                                     "desc": (p.get("description") or "").strip(),
+                                     "upd": str(p.get("updated_at", ""))[:10]}
+            except Exception:  # noqa: BLE001
+                pass
+    if not found:
+        return ("  (no public PoC repos found, or GitHub rate-limited — try the CVE id, or set "
+                "GITHUB_TOKEN for a higher rate.)")
+    lines = []
+    for r in sorted(found.values(), key=lambda x: -x["stars"])[:12]:
+        lines.append("  * %-5d %s  (upd %s)" % (r["stars"], r["url"], r["upd"] or "?"))
+        if r["desc"]:
+            lines.append("        " + r["desc"][:100])
+    return "\n".join(lines)
+
+
 def tool_exploit_search(args: dict) -> str:
     query = str(args.get("query", "") or args.get("cve", "")).strip()
     if not query:
         return "exploit_search: give a 'query' (product/version) or a 'cve' id."
-    if re.fullmatch(r"(?i)cve-\d{4}-\d+", query):
-        cmd = f"searchsploit --cve {shlex.quote(query.upper())}"
-    else:
-        cmd = f"searchsploit {shlex.quote(query)}"
+    is_cve = bool(re.fullmatch(r"(?i)cve-\d{4}-\d+", query))
+    cmd = (f"searchsploit --cve {shlex.quote(query.upper())}" if is_cve
+           else f"searchsploit {shlex.quote(query)}")
     out, rc, where = _off_run(cmd, 120)
     if rc != 0 and not _have("searchsploit"):
-        return "searchsploit not installed (part of exploitdb; `sygnif kali-setup` or apt install exploitdb)."
-    return _off_report("exploit_search", "n/a (offline DB)", cmd, out, rc, where)
+        edb = ("[exploit-db] searchsploit not installed (part of exploitdb; "
+               "`sygnif kali-setup` or apt install exploitdb).")
+    else:
+        edb = _off_report("exploit_search (Exploit-DB)", "n/a (offline DB)", cmd, out, rc, where)
+    pocs = _poc_search(query, query.upper() if is_cve else "")
+    return _truncate(edb + "\n\n== public PoCs (GitHub — community code, UNVETTED: read before "
+                     "running; execute deliberately via the shell/kali tool on an authorized target) ==\n"
+                     + pocs)
 
 
 # 5. metasploit driver — run an msf module non-interactively (exploitation framework)
@@ -2631,7 +2688,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "func": tool_wpscan,
     },
     "exploit_search": {
-        "desc": "Offline Exploit-DB lookup (searchsploit) by product/version or CVE id. DB search only.",
+        "desc": "Find exploits/PoCs: offline Exploit-DB (searchsploit) PLUS public PoC repos on GitHub (keyless, star-ranked; surfaces PoCs Exploit-DB lacks, e.g. xzbot for CVE-2024-3094). By product/version or CVE id.",
         "args": {"query": "product/version text", "cve": "or a CVE id"},
         "func": tool_exploit_search,
     },
