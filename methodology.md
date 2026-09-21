@@ -351,6 +351,13 @@ Guidelines: it is passive, but only research hosts you are authorized to look at
 NEVER auto-scan/exploit an IP just because it appeared in a search — that needs its
 own authorization. Data is as fresh as Shodan's last crawl; confirm before acting.
 Pivot: shodan host -> confirm live with `portscan`/`nuclei` (authorized) -> `finding`.
+Keyless (no key, no payment) beyond host: shodan {op:cve, cve:"CVE-..."} and
+shodan {op:cvesearch, product:"wordpress", kev:true} query Shodan's CVEDB — CVSS +
+EPSS (exploit-likelihood) + CISA-KEV (known-exploited), sorted by EPSS. Great for
+PRIORITISING findings (fix KEV/high-EPSS first). Free-tier reality: the useful
+Shodan data is keyless (InternetDB host lookup + CVEDB). A free ACCOUNT key adds
+only fuller host banners + DNS resolve; `search`/`count` need paid query credits,
+so treat search as unavailable unless a key with credits is set.
 
 ## containers — image / IaC / dependency security (trivy)
 Use `container_scan`. type=image scans a registry image (no local Docker needed —

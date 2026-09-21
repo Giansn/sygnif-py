@@ -1967,9 +1967,46 @@ def tool_shodan(args: dict) -> str:
             f"  [keyless InternetDB — passive, from Shodan's last scan. Set SHODAN_API_KEY "
             f"for full banners, search and DNS.]")
 
+    if op in ("cve", "cvedb"):
+        cid = str(args.get("cve", "") or args.get("id", "")).strip().upper()
+        if not re.fullmatch(r"CVE-\d{4}-\d+", cid):
+            return "shodan cve: give a 'cve' id, e.g. CVE-2024-3400."
+        body, st, err = _http_get("https://cvedb.shodan.io/cve/" + cid, headers={"User-Agent": _BROWSER_UA})
+        if st != 200:
+            return f"shodan cve {cid}: HTTP {st} (not found?)"
+        d = json.loads(body)
+        refs = ", ".join((d.get("references") or [])[:3])
+        return _truncate(
+            f"{d.get('cve_id')}  cvss {d.get('cvss')} (v{d.get('cvss_version')})  "
+            f"EPSS {d.get('epss')}  KEV {d.get('kev')}"
+            + chr(10) + (d.get("summary") or "").strip()[:400]
+            + chr(10) + "  refs: " + refs
+            + chr(10) + "  [Shodan CVEDB — keyless. EPSS = exploit-likelihood, KEV = known-exploited.]")
+    if op in ("cvesearch", "cves"):
+        prod = str(args.get("product", "") or args.get("query", "")).strip()
+        if not prod:
+            return "shodan cvesearch: give a 'product' (CPE product name, e.g. wordpress, nginx, openssh)."
+        kev = "&is_kev=true" if str(args.get("kev", "")).lower() in ("1", "true", "yes") else ""
+        qs = ("cves?product=" + urllib.parse.quote(prod) + "&sort_by_epss=true&limit="
+              + str(int(args.get("limit", 10))) + kev)
+        body, st, err = _http_get("https://cvedb.shodan.io/" + qs, headers={"User-Agent": _BROWSER_UA})
+        if st != 200:
+            return f"shodan cvesearch '{prod}': HTTP {st} {err}".strip()
+        try:
+            rows = json.loads(body).get("cves", [])
+        except Exception:  # noqa: BLE001
+            return "shodan cvesearch: no data (check the product/CPE name)."
+        if not rows:
+            return f"shodan cvesearch '{prod}': no CVEs (try the exact CPE product name)."
+        out = [f"Shodan CVEDB '{prod}' (top by EPSS, keyless):"]
+        for c in rows:
+            out.append(f"  {c.get('cve_id')}  cvss {c.get('cvss')}  EPSS {c.get('epss')}  "
+                       f"KEV {c.get('kev')}  " + (c.get("summary") or "")[:70])
+        return _truncate(chr(10).join(out))
+
     if not key:
-        return (f"shodan {op}: needs SHODAN_API_KEY (get one at account.shodan.io). Only 'host' "
-                f"works keyless via InternetDB.")
+        return (f"shodan {op}: needs SHODAN_API_KEY (get one at account.shodan.io). Keyless ops: "
+                f"host (InternetDB), cve + cvesearch (CVEDB). search/count/dns need the key.")
     if op == "search":
         q = str(args.get("query", "")).strip()
         if not q:
@@ -2253,7 +2290,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Internet-wide PASSIVE intelligence via Shodan (no packets to the target). "
                  "op=host looks up an IP/domain's exposed ports+CVEs (keyless InternetDB, or full "
                  "data with SHODAN_API_KEY); search/count/dns/info/myip need the key."),
-        "args": {"op": "host|search|count|dns|info|myip", "target": "IP or domain (host)", "query": "Shodan search query", "domain": "for dns"},
+        "args": {"op": "host|cve|cvesearch|search|count|dns|info|myip", "target": "IP/domain (host)", "cve": "CVE id (cve)", "product": "product (cvesearch)", "query": "Shodan search query", "domain": "for dns"},
         "func": tool_shodan,
     },
     "website": {
