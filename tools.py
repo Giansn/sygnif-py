@@ -643,7 +643,7 @@ def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
     just that part (recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|
-    hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
+    hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
     try:
@@ -2045,6 +2045,83 @@ def tool_shodan(args: dict) -> str:
     return "shodan: op = host | search | count | dns | info | myip"
 
 
+# --- api_scan — API security testing (OWASP API Top 10 oriented) -------------
+# Modes: discover (surface + params + exposures), spec (schemathesis fuzz an
+# OpenAPI/Swagger spec), graphql (graphw00f + introspection), jwt (token analysis
+# + weak-secret crack path). Auth-gated; auto-installs the missing bits into the
+# toolbox. Logic flaws (BOLA/IDOR/mass-assignment) still need a human — this finds
+# surface, spec violations, and the common auth/JWT/GraphQL weak spots.
+def tool_api_scan(args: dict) -> str:
+    target = _norm_url(str(args.get("target", "") or args.get("url", "")))
+    mode = str(args.get("mode", "discover")).strip().lower()
+
+    if mode == "jwt":
+        tok = str(args.get("token", "") or args.get("jwt", "")).strip()
+        if not tok or tok.count(".") < 2:
+            return "api_scan jwt: give a 'token' (header.payload.signature)."
+        import base64 as _bb
+        def dec(seg):
+            return _bb.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)).decode(errors="replace")
+        parts = tok.split(".")
+        try:
+            hdr = json.loads(dec(parts[0]))
+        except Exception:  # noqa: BLE001
+            return "api_scan jwt: header not valid base64url JSON."
+        alg = str(hdr.get("alg", "?"))
+        out = ["JWT analysis (decode only, NOT verified):",
+               "  header:  " + json.dumps(hdr),
+               "  payload: " + dec(parts[1])[:300]]
+        if alg.lower() == "none":
+            out.append("  ⚠ CRITICAL: alg=none — server may accept unsigned tokens. Forge claims and test.")
+        if alg.upper().startswith("HS"):
+            out.append("  HS* (HMAC): try a weak-secret crack — write the token to a file and run "
+                       "crack {hashfile:<file>, mode:16500, wordlist:...} (hashcat JWT). If it cracks, "
+                       "you can re-sign arbitrary claims.")
+        if alg.upper().startswith(("RS", "ES", "PS")):
+            out.append("  Asymmetric — test alg-confusion (RS256->HS256 using the public key as HMAC secret).")
+        if "kid" in hdr:
+            out.append("  'kid' present — test kid header injection / path traversal / SQLi in kid.")
+        out.append("  Deeper: jwt_tool <token> -M at (all-tests). ("
+                   "install: pipx install jwt_tool, or it's in the toolbox after kali-setup.)")
+        return _truncate("\n".join(out))
+
+    g = _authz(args, target)
+    if g:
+        return g
+
+    if mode == "spec":
+        spec = str(args.get("spec", "") or target).strip()
+        ensure = ("command -v schemathesis >/dev/null 2>&1 || pipx install schemathesis >/dev/null 2>&1 "
+                  "|| pip install --break-system-packages schemathesis >/dev/null 2>&1; ")
+        cmd = ensure + f"schemathesis run {shlex.quote(spec)} --checks all --max-examples 15 2>&1 | tail -140"
+        out, rc, where = _off_run(cmd, 1200)
+        return _off_report("api_scan(spec)", args.get("authorization", ""), "schemathesis " + spec, out, rc, where)
+
+    if mode == "graphql":
+        ep = shlex.quote(target)
+        ensure = ("command -v graphw00f >/dev/null 2>&1 || pipx install graphw00f >/dev/null 2>&1 "
+                  "|| pip install --break-system-packages graphw00f >/dev/null 2>&1; ")
+        introspect = ('{"query":"{__schema{queryType{name} types{name}}}"}')
+        cmd = (ensure + f"echo '== graphw00f =='; graphw00f -d -f -t {ep} 2>&1 | tail -30; "
+               f"echo '== introspection (enabled?) =='; curl -s -X POST {ep} "
+               f"-H 'content-type: application/json' -d {shlex.quote(introspect)} 2>/dev/null | head -c 500")
+        out, rc, where = _off_run(cmd, 300)
+        return _off_report("api_scan(graphql)", args.get("authorization", ""), "graphql " + target, out, rc, where)
+
+    # discover (default)
+    base = shlex.quote(target)
+    probes = " ".join(["/openapi.json", "/swagger.json", "/v3/api-docs", "/api-docs",
+                       "/swagger-ui.html", "/graphql", "/api", "/.well-known/openapi.json"])
+    cmd = (
+        f"echo '== fingerprint =='; whatweb -q {base} 2>/dev/null; wafw00f {base} 2>/dev/null | tail -2; "
+        f"echo '== API surface probes =='; for p in {probes}; do "
+        f"c=$(curl -s -o /dev/null -w '%{{http_code}}' -m 8 {base}$p); echo \"$p -> $c\"; done; "
+        f"echo '== params (arjun) =='; arjun -u {base} -q 2>/dev/null | tail -20; "
+        f"echo '== nuclei (api/exposure/auth) =='; nuclei -u {base} -silent -tags exposure,api,swagger,graphql,auth 2>/dev/null | head -40")
+    out, rc, where = _off_run(cmd, 900)
+    return _off_report("api_scan(discover)", args.get("authorization", ""), "api discover " + target, out, rc, where)
+
+
 # name -> {desc, args (name->hint), func}
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
@@ -2293,6 +2370,15 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "args": {"op": "host|cve|cvesearch|search|count|dns|info|myip", "target": "IP/domain (host)", "cve": "CVE id (cve)", "product": "product (cvesearch)", "query": "Shodan search query", "domain": "for dns"},
         "func": tool_shodan,
     },
+    "api_scan": {
+        "desc": ("API security testing (OWASP API Top 10-oriented). mode=discover (surface + "
+                 "params + exposures via nuclei/arjun), spec (schemathesis fuzz an OpenAPI/Swagger "
+                 "URL), graphql (graphw00f + introspection), jwt (analyse a token + weak-secret "
+                 "crack path). Requires target+authorization (jwt mode is local). Auto-installs "
+                 "schemathesis/graphw00f as needed."),
+        "args": {"target": "API base URL you are authorized to test", "authorization": "attestation", "mode": "discover|spec|graphql|jwt", "spec": "OpenAPI/Swagger URL (spec mode)", "token": "JWT (jwt mode)"},
+        "func": tool_api_scan,
+    },
     "website": {
         "desc": "Quick website recon: robots/sitemap/security.txt, DNS, whois, tech fingerprint, wayback snapshot count. Passive.",
         "args": {"url": "the site URL"},
@@ -2397,7 +2483,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
                  "checklist and the role modes. section=<phase or role> for one part. Needs no "
                  "network; use it when the van has no signal."),
-        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|scout|analyzer|exploiter|reporter"},
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter"},
         "func": tool_playbook,
     },
 }

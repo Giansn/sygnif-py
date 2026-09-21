@@ -391,3 +391,19 @@ inspection only; it does not check or forge signatures.
 Use `website {url:...}`. Passive: robots.txt, sitemap.xml, /.well-known/security.txt,
 DNS (A/MX/TXT), whois, tech fingerprint (whatweb), and a Wayback snapshot count.
 A fast first look before the deeper `webapp`/`wpsec`/`hosting` playbook flows.
+
+## api — role mode: API security testing (OWASP API Top 10)
+Test an API you own / are authorized to test. Use the `api_scan` tool + the kit.
+- Discover the surface:  api_scan {target, mode:discover} — probes swagger/openapi/
+  graphql endpoints, mines params (arjun), runs nuclei exposure/api/auth templates.
+  Also: kiterunner for route brute, paramspider for params from the Wayback data.
+- Spec-driven fuzzing:  api_scan {target, mode:spec, spec:"<openapi url>"} — schemathesis
+  generates and sends valid+invalid requests from the schema (finds 500s, schema breaks).
+- GraphQL:  api_scan {target:"<graphql url>", mode:graphql} — graphw00f fingerprint +
+  introspection check; if introspection is on, pull the schema (InQL/clairvoyance).
+- JWT:  api_scan {mode:jwt, token:"<jwt>"} — flags alg=none, HS* weak-secret (crack with
+  `crack {mode:16500}`), RS256->HS256 confusion, kid injection. jwt_tool -M at for the full set.
+- The logic flaws that matter most — BOLA/IDOR (swap an id and see another user's object),
+  broken function-level auth, mass assignment, excessive data exposure — are MANUAL: replay
+  a request in Burp/ZAP with a different id or role and compare. Scanners won't find these.
+Every confirmed issue -> `finding` with the request/response pair as evidence.
