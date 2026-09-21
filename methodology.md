@@ -40,6 +40,24 @@ with `report`. Only ever act inside the authorization recorded in SCOPE.md.
   explicitly out of scope. If unsure, ask the operator before proceeding.
 - Pivoting: proxychains4, chisel. Loot handling per the agreed rules.
 
+## privesc — escalate an authorized foothold to root/owner
+- Only inside an engagement whose RoE permits post-exploitation. Confirm-gated.
+- Order of work: enumerate first, exploit last, and verify every candidate.
+  1. `privesc {mode:suggest}` — linux-exploit-suggester-2 lists CANDIDATE kernel
+     exploits from `uname`. Candidates, not confirmed: a patched box still shows
+     them. Cross-check the CVE against the running package version before firing.
+  2. `privesc {mode:spy, seconds:30}` — pspy shows root cron/processes with no
+     root needed. A world-writable script run by root cron is the cleanest win.
+  3. `privesc {mode:gtfo, binary:<bin>}` — for any binary you hold via `sudo -l`,
+     SUID (`find / -perm -4000`), or capabilities, GTFOBins gives the exact escape.
+  4. `privesc {mode:container}` — deepce, when the foothold is a container: checks
+     for the docker socket, privileged mode, dangerous caps, and mount escapes.
+  5. `privesc {mode:auto}` — traitor + GTFONow enumerate exploitable sudo/suid/cap
+     vectors. Actual exploitation spawns a root shell and needs an interactive PTY;
+     run `/tmp/traitor -a -p` or `python3 /tmp/gtfonow.py` yourself via the shell tool.
+- Tools are fetched to /tmp on first use; on a repeat engagement they are cached
+  in the toolbox by `sygnif kali-setup`. Clean them up when the engagement ends.
+
 ## report — the deliverable
 - Run `report` to render findings.jsonl into report.md, grouped by severity.
 - Each finding must carry: target, evidence, impact, and a fix recommendation.

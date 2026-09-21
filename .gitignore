@@ -21,3 +21,6 @@ sygnif-desk-full.ps1
 .DS_Store
 *.bak-*
 config.json.bak-*
+*.pre-*
+*.bak
+*.bak.*

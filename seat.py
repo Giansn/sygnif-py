@@ -53,7 +53,7 @@ HISTORY_MSG_HEAD_CHARS = int(os.environ.get("SYGNIF_PY_MSG_HEAD", "1200"))
 COMPACT_KEEP_TURNS = int(os.environ.get("SYGNIF_PY_COMPACT_KEEP_TURNS", "4"))
 COMPACT_SUMMARY = os.environ.get("SYGNIF_PY_COMPACT_SUMMARY", "1") != "0"
 COMPACT_PREFIX = "[Compacted earlier conversation — older turns summarized to free context]\n\n"
-CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test"}  # gated when --confirm / SYGNIF_PY_CONFIRM=1
+CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test", "privesc"}  # gated when --confirm / SYGNIF_PY_CONFIRM=1
 CLAUDE_BIN = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "300"))
 
