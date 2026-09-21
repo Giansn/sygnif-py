@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -857,6 +858,59 @@ def do_first_run(spec: dict) -> None:
     _mark_firstrun_done()
 
 
+def _read_version() -> str:
+    try:
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
+                    encoding="utf-8").read().strip()
+    except OSError:
+        return "unknown"
+
+
+def do_version() -> int:
+    print("sygnif-py " + _read_version())
+    return 0
+
+
+def do_update() -> int:
+    """Pull the newest sygnif-py in place from the dist host and re-install over
+    this directory. Your ~/.sygnif overrides (config, secrets) are untouched —
+    only the package files here are refreshed."""
+    home = os.path.dirname(os.path.abspath(__file__))
+    base = os.environ.get(
+        "SYGNIF_PY_BASE_URL",
+        "https://raw.githubusercontent.com/Giansn/sygnif-py/main/dist")
+    before = _read_version()
+    pix.notice(f"  updating sygnif-py in {home}", "cyan")
+    pix.notice(f"  current: {before}   source: {base}")
+    fetch = None
+    for c in ("curl", "wget"):
+        if shutil.which(c):
+            fetch = c
+            break
+    if not fetch:
+        pix.notice("  need curl or wget to update.", "red")
+        return 1
+    dl = (f"curl -fsSL {base}/install.sh" if fetch == "curl"
+          else f"wget -qO- {base}/install.sh")
+    # run the installer against THIS home + base; it re-downloads and unpacks.
+    cmd = f"SYGNIF_PY_HOME={shlex.quote(home)} SYGNIF_PY_BASE_URL={shlex.quote(base)} sh -c '{dl} | sh'"
+    try:
+        rc = subprocess.call(["sh", "-c", cmd])
+    except Exception as e:  # noqa: BLE001
+        pix.notice(f"  update failed: {e}", "red")
+        return 1
+    after = _read_version()
+    if rc != 0:
+        pix.notice(f"  update exited {rc}.", "yellow")
+        return rc
+    if after == before:
+        pix.notice(f"  already up to date ({after}).", "green")
+    else:
+        pix.notice(f"  updated: {before} -> {after}", "green")
+    pix.notice("  restart the seat to load the new version.")
+    return 0
+
+
 def do_doctor() -> int:
     """`sygnif doctor` — one-shot health check of the seat and its backends, so
     the operator can verify everything in a line instead of poking by hand.
@@ -933,6 +987,10 @@ def main() -> int:
         return do_login()
     if len(sys.argv) >= 2 and sys.argv[1] in ("doctor", "health", "check"):
         return do_doctor()
+    if len(sys.argv) >= 2 and sys.argv[1] in ("update", "upgrade", "self-update"):
+        return do_update()
+    if len(sys.argv) >= 2 and sys.argv[1] in ("version", "--version", "-V"):
+        return do_version()
     if len(sys.argv) >= 2 and sys.argv[1] in ("kali-setup", "kali_setup"):
         pentest.toolset_status(pix.notice)
         ok = pentest.install_full_toolset(pix.notice)

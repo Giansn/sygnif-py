@@ -11,6 +11,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
+printf "%s\n" "$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown) $(date -u +%Y-%m-%dT%H:%MZ)" > "$HERE/VERSION"
 DIST="$HERE/dist"
 rm -rf "$DIST"
 mkdir -p "$DIST"
@@ -27,7 +28,7 @@ PKG=(
   sygnif-desk.sh sygnif-desk.ps1
   sygnif-nexus.sh sygnif-nexus.ps1
   nexus.sh nexus.ps1
-  README.md custom_tools.py.example methodology.md
+  README.md custom_tools.py.example methodology.md VERSION
 )
 
 for f in "${PKG[@]}"; do
