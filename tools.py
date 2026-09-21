@@ -642,7 +642,7 @@ def tool_report(args: dict) -> str:
 def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
-    just that part (recon|enum|vuln|exploit|postexploit|privesc|report|webapp|wpsec|dast|
+    just that part (recon|enum|vuln|exploit|postexploit|privesc|report|webapp|wpsec|dast|detect|
     hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
@@ -664,44 +664,34 @@ def tool_playbook(args: dict) -> str:
             blocks.append(line)
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
-                "postexploit, privesc, report, webapp, wpsec, dast, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
+                "postexploit, privesc, report, webapp, wpsec, dast, detect, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
                 "reporter (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
 
 def tool_purple(args: dict) -> str:
-    """Run a DEFENSIVE (blue-team) command in the sygnif-purple container — the
-    Kali Purple counterpart of the 'kali' tool. Detection, IR, forensics,
-    log/traffic analysis: suricata, zeek, wireshark/tshark, yara, volatility3,
-    sleuthkit, clamav, rkhunter, and the rest of the detect/respond/forensics
-    sets. Use this for analysis and hardening, not for attacking."""
+    """Run a raw DEFENSIVE (blue-team) command — the counterpart of the 'kali'
+    tool. Runs in the purple container if present, else the offensive toolbox,
+    else the host. Detection / IR / forensics / log analysis with whatever the
+    container provides (commonly yara, clamav, rkhunter, chkrootkit, chainsaw;
+    more if a full Kali-Purple image is used). For structured compromise
+    assessment prefer the 'detect' tool. Analysis and hardening, not attacking."""
     import shlex
     command = str(args.get("command", "")).strip()
     if not command:
         return "purple: empty command"
-    container = os.environ.get("SYGNIF_PY_PURPLE_CONTAINER", "sygnif-purple")
-    have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
-    if not have_docker:
-        return "purple: docker not available; this tool needs the sygnif-purple container."
-    state, _ = _run_host(
-        "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
-    if state.strip() and state.strip() != "running":
-        _run_host("docker start " + container, 60)
-        state, _ = _run_host(
-            "docker inspect -f '{{.State.Status}}' " + container + " 2>/dev/null", 10)
-    if state.strip() != "running":
-        return ("purple: container '" + container + "' not available — run the "
-                "purple-up provisioning first.")
-    out, rc = _run_host(
-        "docker exec " + container + " bash -lc " + shlex.quote(command), KALI_TIMEOUT)
-    if rc == 124:
-        out2, rc2 = _run_host(
-            "docker exec " + container + " bash -lc " + shlex.quote(command),
-            max(60, KALI_TIMEOUT // 2))
-        if rc2 != 124:
-            return _truncate(out2) + "\nexit=" + str(rc2) + "  (via docker:" + container + "; retried after timeout)"
-        return _truncate(out2) + "\nexit=" + str(rc2) + "  (via docker:" + container + "; timed out twice)"
-    return _truncate(out) + "\nexit=" + str(rc) + "  (via docker:" + container + ")"
+    # portable: purple container if present, else the offensive toolbox, else host
+    box = _def_container()
+    if box:
+        out, rc = _run_host(
+            "docker exec " + shlex.quote(box) + " bash -lc " + shlex.quote(command), KALI_TIMEOUT)
+        where = "docker:" + box
+    elif not _IS_WINDOWS:
+        out, rc = _run_host("bash -lc " + shlex.quote(command), KALI_TIMEOUT)
+        where = "host"
+    else:
+        return "purple: no purple container, toolbox, or POSIX host available for defensive commands."
+    return _truncate(out) + "\nexit=" + str(rc) + "  (via " + where + ")"
 
 
 def tool_kali(args: dict) -> str:
@@ -1580,6 +1570,139 @@ def tool_dast(args: dict) -> str:
     )
     out, rc, where = _off_run(cmd, tmo, need=("zaproxy", "curl", "python3"))
     return _off_report("dast(" + mode + ")", args.get("authorization", ""), "zap " + mode + " " + target, out, rc, where)
+
+
+# 8d. detect — DEFENSIVE compromise assessment (blue team), the mirror of the
+#     offensive suite. Structure/concept modelled on Nextron THOR/THOR Lite: a
+#     multi-module local scan (filesystem YARA+IOC, web-shell, rootkit, malware,
+#     Sigma logs). Engine is LOKI (Neo23x0, the free open-source THOR-Lite sibling
+#     by the same author) + YARA-Forge rules + chainsaw. Runs in the purple
+#     container if present, else the offensive toolbox, else the host. Read-only
+#     analysis of LOCAL paths/logs — no target/authorization needed.
+def _def_container() -> str:
+    """Resolve the container for defensive tools: the purple container if it is
+    running (start it if it merely exists), else the offensive toolbox, else ''."""
+    pc = os.environ.get("SYGNIF_PY_PURPLE_CONTAINER", "sygnif-purple")
+    if not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0:
+        st, _ = _run_host("docker inspect -f '{{.State.Status}}' " + shlex.quote(pc) + " 2>/dev/null", 10)
+        st = st.strip()
+        if st == "running":
+            return pc
+        if st:  # exists but stopped
+            _run_host("docker start " + shlex.quote(pc), 60)
+            st2, _ = _run_host("docker inspect -f '{{.State.Status}}' " + shlex.quote(pc) + " 2>/dev/null", 10)
+            if st2.strip() == "running":
+                return pc
+    return _toolbox_name(auto_create=False)  # offensive toolbox, or '' for host
+
+
+def _def_run(command: str, timeout: int | None = None, need=None) -> tuple[str, int, str]:
+    """Run a defensive command in the resolved container (purple > toolbox > host).
+    need= preflights binaries with a clear 'missing' message (see _off_run)."""
+    timeout = timeout or OFFENSIVE_TIMEOUT
+    box = _def_container()
+
+    def _x(cmd, t):
+        if box:
+            return _run_host("docker exec " + shlex.quote(box) + " bash -lc " + shlex.quote(cmd), t)
+        return _run_host(cmd, t)
+
+    if need:
+        names = [b for b in (need if isinstance(need, (list, tuple)) else [need]) if b]
+        if names:
+            checks = "; ".join("command -v " + shlex.quote(b) + " >/dev/null 2>&1 || echo MISSING:" + b
+                               for b in names)
+            o, _rc = _x(checks, 30)
+            miss = sorted({ln.split("MISSING:", 1)[1].strip() for ln in o.splitlines()
+                           if ln.startswith("MISSING:")})
+            if miss:
+                loc = "the container (" + box + ")" if box else "this host"
+                return ("MISSING TOOL(S): " + ", ".join(miss) + " — not in " + loc
+                        + ". Run `sygnif kali-setup` (it installs the defence tools), or install them.",
+                        127, "preflight")
+    out, rc = _x(command, timeout)
+    return out, rc, ("docker:" + box if box else "host")
+
+
+def _def_report(title: str, cmd: str, out: str, rc: int, where: str) -> str:
+    return _truncate("[" + title + " | via " + where + "]\n$ " + cmd + "\n\n"
+                     + (out or "(no output)") + "\nexit=" + str(rc))
+
+
+def tool_detect(args: dict) -> str:
+    mode = str(args.get("mode", "ioc")).strip().lower()
+    path = str(args.get("path", "") or args.get("target", "")).strip()
+
+    if mode in ("ioc", "scan", "webshell"):
+        if not path:
+            return ("detect " + mode + ": give a 'path' (directory or file). ioc=full local "
+                    "compromise scan; webshell=file-only scan of a web root.")
+        p = shlex.quote(path)
+        extra = "--noprocscan" if mode == "webshell" else ""
+        cmd = ("L=$(find /opt/loki -name loki.py 2>/dev/null | head -1); "
+               "if [ -z \"$L\" ]; then echo LOKI_MISSING; exit 127; fi; "
+               "python3 \"$L\" -p " + p + " --dontwait --noindicator " + extra
+               + " 2>&1 | grep -iE 'ALERT|WARNING|NOTICE|Results:|MATCHES|FINISHED' | tail -140")
+        out, rc, where = _def_run(cmd, 1500)
+        if "LOKI_MISSING" in out:
+            return ("detect: LOKI not installed — run `sygnif kali-setup` (installs LOKI + "
+                    "signature-base + the defence tools).")
+        return _def_report("detect(" + mode + ")", "loki -p " + path, out or "(no alerts)", rc, where)
+
+    if mode == "yara":
+        if not path:
+            return "detect yara: give a 'path' to scan."
+        rules = str(args.get("rules", "")).strip()
+        rsel = shlex.quote(rules) if rules else "$(ls /opt/yara-forge/packages/*/*.yar 2>/dev/null | head -1)"
+        cmd = ("R=" + rsel + "; if [ -z \"$R\" ] || [ ! -s \"$R\" ]; then echo YARA_RULES_MISSING; exit 127; fi; "
+               "yara -r -w -f \"$R\" " + shlex.quote(path) + " 2>&1 | head -160")
+        out, rc, where = _def_run(cmd, 900, need=("yara",))
+        if "YARA_RULES_MISSING" in out:
+            return ("detect yara: no rules — pass 'rules':<path>, or run `sygnif kali-setup` to fetch "
+                    "the YARA-Forge ruleset.")
+        return _def_report("detect(yara)", "yara -r " + path, out or "(no matches)", rc, where)
+
+    if mode == "rootkit":
+        cmd = ("echo '== rkhunter =='; rkhunter --check --sk --nocolors --rwo 2>&1 | tail -60; "
+               "echo '== chkrootkit =='; command -v chkrootkit >/dev/null 2>&1 && "
+               "(chkrootkit 2>/dev/null | grep -ivE 'not infected|not found|nothing found|not tested' | head -40 "
+               "|| echo '(clean)') || echo '(chkrootkit not installed)'")
+        out, rc, where = _def_run(cmd, 900, need=("rkhunter",))
+        return _def_report("detect(rootkit)", "rkhunter + chkrootkit", out, rc, where)
+
+    if mode == "malware":
+        if not path:
+            return "detect malware: give a 'path' (file or dir) to scan (clamav; capa for a single binary)."
+        p = shlex.quote(path)
+        cmd = ("echo '== clamav =='; command -v clamscan >/dev/null 2>&1 && "
+               "clamscan -r --infected --no-summary " + p + " 2>&1 | head -80 || echo '(clamscan not installed)'; "
+               "echo '== capa (if a single binary) =='; "
+               "if command -v capa >/dev/null 2>&1 && [ -f " + p + " ]; then capa " + p
+               + " 2>/dev/null | grep -iE 'CAPABILITY|ATT&CK|MBC|namespace' | head -40; "
+               "else echo '(capa skipped: not a single file or capa absent)'; fi")
+        out, rc, where = _def_run(cmd, 900)
+        return _def_report("detect(malware)", "clamscan + capa " + path, out, rc, where)
+
+    if mode == "sigma":
+        if not path:
+            return ("detect sigma: give a 'path' to a Windows .evtx file/dir. Uses chainsaw + Sigma. "
+                    "For Linux auditd/JSON logs use zircolite via the purple tool.")
+        p = shlex.quote(path)
+        cmd = ("S=$(ls -d /opt/chainsaw*/sigma /opt/chainsaw/sigma 2>/dev/null | head -1); "
+               "M=$(ls /opt/chainsaw*/mappings/sigma-event-logs-all.yml /opt/chainsaw/mappings/*.yml 2>/dev/null | head -1); "
+               "if ! command -v chainsaw >/dev/null 2>&1; then echo CHAINSAW_MISSING; exit 127; fi; "
+               "if [ -n \"$S\" ] && [ -n \"$M\" ]; then chainsaw hunt " + p + " -s \"$S\" --mapping \"$M\" 2>&1 | tail -120; "
+               "else chainsaw hunt " + p + " 2>&1 | tail -120; fi")
+        out, rc, where = _def_run(cmd, 900)
+        if "CHAINSAW_MISSING" in out:
+            return "detect sigma: chainsaw not installed — run `sygnif kali-setup`."
+        return _def_report("detect(sigma)", "chainsaw hunt " + path, out, rc, where)
+
+    return ("detect: mode = ioc | webshell | yara | rootkit | malware | sigma.  "
+            "ioc=LOKI full local compromise scan of a 'path'; webshell=LOKI file scan of a web root; "
+            "yara=YARA-Forge (or custom 'rules') over a 'path'; rootkit=rkhunter+chkrootkit; "
+            "malware=clamav(+capa) on a 'path'; sigma=chainsaw over Windows .evtx. "
+            "Defensive, read-only, local paths — no authorization needed.")
 
 
 # 9. wifi_capture — WPA handshake / PMKID capture on an authorized network.
@@ -2537,10 +2660,10 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "func": tool_metasploit,
     },
     "purple": {
-        "desc": ("Run a DEFENSIVE (blue-team) command in the sygnif-purple container: "
-                 "detection, incident response, forensics, log/traffic analysis (suricata, "
-                 "zeek, wireshark/tshark, yara, volatility3, sleuthkit, clamav, rkhunter). "
-                 "For analysis and hardening, not attacking."),
+        "desc": ("Run a raw DEFENSIVE (blue-team) command in the purple container (or the "
+                 "toolbox/host if absent): detection, IR, forensics, log analysis with the "
+                 "container's tools (yara, clamav, rkhunter, chkrootkit, chainsaw, ...). "
+                 "For structured compromise assessment use 'detect'. Analysis, not attacking."),
         "args": {"command": "defensive command, e.g. 'yara rules.yar sample' or 'zeek -r capture.pcap'"},
         "func": tool_purple,
     },
@@ -2738,6 +2861,18 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "SCOPE.md-confined. For manual work use Burp Repeater/Proxy by hand."),
         "args": {"mode": "quick|baseline|active", "target": "the web app URL (yours/authorized)", "authorization": "attestation"},
         "func": tool_dast,
+    },
+    "detect": {
+        "desc": ("DEFENSIVE compromise assessment (blue team) — the mirror of the offensive suite, "
+                 "modelled on Nextron THOR/THOR Lite. Engine: LOKI (free open-source THOR-Lite sibling) "
+                 "+ YARA-Forge rules + chainsaw. modes: ioc=full local YARA+IOC scan of a 'path'; "
+                 "webshell=file-only scan of a web root (detect dropped shells); yara=YARA-Forge/custom "
+                 "rules over a 'path'; rootkit=rkhunter+chkrootkit; malware=clamav(+capa); sigma=chainsaw "
+                 "over Windows .evtx. Read-only, LOCAL paths — no target/authorization needed. Runs in "
+                 "the purple container if present, else the toolbox, else the host. `sygnif kali-setup` "
+                 "provisions LOKI + rules."),
+        "args": {"mode": "ioc|webshell|yara|rootkit|malware|sigma", "path": "local file/dir/log to scan", "rules": "(yara) optional path to a .yar ruleset"},
+        "func": tool_detect,
     },
     "wifi_capture": {
         "desc": ("Capture a WPA handshake / PMKID on a network YOU are authorized to test "

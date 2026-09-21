@@ -71,6 +71,22 @@ with `report`. Only ever act inside the authorization recorded in SCOPE.md.
   hand (Burp Repeater) before recording with `finding`. ZAP finds reflected/technical
   issues; business-logic flaws (BOLA/IDOR/auth bypass) still need a human.
 
+## detect — defensive compromise assessment (blue team)
+- The mirror of the offensive suite; concept modelled on Nextron THOR/THOR Lite,
+  built on free tooling (LOKI by Florian Roth = the open-source THOR-Lite sibling,
+  + YARA-Forge rules + chainsaw). Read-only, local, no authorization needed.
+- `detect {mode:ioc, path:/}` - full local YARA + IOC scan (LOKI). The THOR-Lite pass.
+- `detect {mode:webshell, path:/var/www}` - file-only scan of a web root for dropped
+  shells/backdoors. First thing to run if a site (WordPress/hosting) may be compromised.
+- `detect {mode:yara, path:..., rules:...}` - YARA-Forge (or your own) rules over a path.
+- `detect {mode:rootkit}` - rkhunter + chkrootkit host check.
+- `detect {mode:malware, path:...}` - clamav, plus capa capability analysis of a binary.
+- `detect {mode:sigma, path:evtx}` - chainsaw + Sigma over Windows event logs.
+- Provisioned by `sygnif kali-setup` (LOKI + signature-base + YARA-Forge + chainsaw).
+  Runs in the purple container if present, else the toolbox, else the host.
+- Offense/defense loop: after an authorized exploit test, `detect webshell`/`ioc`
+  confirms what a real attacker would have left behind, and that you cleaned up.
+
 ## report — the deliverable
 - Run `report` to render findings.jsonl into report.md, grouped by severity.
 - Each finding must carry: target, evidence, impact, and a fix recommendation.
