@@ -331,3 +331,56 @@ and NOT provided here.
 - `cell_info mode=lookup` — geolocate a tower by mcc/mnc/lac/cellid (OpenCellID, free key).
 - `cell_info mode=detect` — IMSI-catcher / rogue-base-station DETECTION guidance (SnoopSnitch,
   Crocodile Hunter): watch for forced 2G downgrade, unknown strong CellID, cipher downgrade.
+
+## shodan — internet-wide passive intelligence (instructions + guidelines)
+Shodan tells you what a host EXPOSES from its own scans — no packets to the target.
+Use the `shodan` tool; `host` works keyless (InternetDB), the rest need SHODAN_API_KEY
+(account.shodan.io -> free tier, or a membership for `vuln:` and larger result sets).
+- Single host:  shodan {op:host, target:"1.2.3.4"}  or a domain (auto-resolved).
+  Keyless InternetDB returns ports, CVEs, hostnames, CPEs, tags — the fastest
+  "what's open + known-vulnerable" snapshot for one IP.
+- Search the internet (key):  shodan {op:search, query:"..."}. Filter syntax:
+    port:443  product:nginx  org:"Example AG"  net:1.2.3.0/24  hostname:example.com
+    country:CH  city:Bern  ssl.cert.subject.cn:example.com  http.title:"admin"
+    http.status:200  os:windows  has_screenshot:true  tag:cloud  vuln:CVE-2024-...
+  Combine with spaces (AND). `vuln:` needs a paid membership.
+- Counts / recon breadth (key):  shodan {op:count, query:"org:\"Example AG\""} —
+  totals + facets (how many by port/product/country) without pulling results.
+- Subdomains (key):  shodan {op:dns, domain:"example.com"}.  myip / info for account.
+Guidelines: it is passive, but only research hosts you are authorized to look at, and
+NEVER auto-scan/exploit an IP just because it appeared in a search — that needs its
+own authorization. Data is as fresh as Shodan's last crawl; confirm before acting.
+Pivot: shodan host -> confirm live with `portscan`/`nuclei` (authorized) -> `finding`.
+
+## containers — image / IaC / dependency security (trivy)
+Use `container_scan`. type=image scans a registry image (no local Docker needed —
+trivy pulls the layers itself); type=fs/repo/config scans a path (your code, a
+checkout, Terraform/K8s manifests). Reports CVEs + leaked secrets + misconfig.
+  container_scan {target:"nginx:1.25", type:"image"}
+  container_scan {target:"~/mysite", type:"repo"}     # deps + secrets + Dockerfile
+For a web dev: scan your image before you ship it, and your repo for a leaked .env
+or a vulnerable dependency. Pair with `secrets_scan` (trufflehog/gitleaks) for depth.
+
+## cloud — cloud security posture (prowler)
+Use `cloud_audit {provider: aws|gcp|azure|kubernetes}` — hundreds of CIS-style checks
+for misconfig (public buckets, over-broad IAM, unencrypted stores, open security
+groups). Credentials come from the ENVIRONMENT, never stored by the seat:
+  AWS  -> ~/.aws/credentials or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ AWS_PROFILE)
+  GCP  -> Application Default Credentials (gcloud auth application-default login)
+  Azure-> az login
+Read-only posture review; run only on accounts you own or are authorized to audit.
+First run auto-installs prowler into the toolbox (or `sygnif kali-setup`).
+
+## crypto — encode / decode / hash / identify (instructions)
+Use `crypto {op:..., data:...}`. Local + deterministic:
+  encode/decode algo=base64|hex|url|rot13      hash algo=md5|sha1|sha256|sha512
+  hmac (key + algo)      jwt (decode header+payload, signature NOT verified)
+  identify (name a hash type — hashid/name-that-hash)
+  magic (auto-decode/decrypt an unknown blob — ciphey)
+For cracking a hash once identified, use `crack` (hashcat -m <mode>). JWT decode is
+inspection only; it does not check or forge signatures.
+
+## website — quick site recon (instructions)
+Use `website {url:...}`. Passive: robots.txt, sitemap.xml, /.well-known/security.txt,
+DNS (A/MX/TXT), whois, tech fingerprint (whatweb), and a Wayback snapshot count.
+A fast first look before the deeper `webapp`/`wpsec`/`hosting` playbook flows.

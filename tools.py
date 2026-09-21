@@ -643,7 +643,7 @@ def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
     just that part (recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|
-    hosting|redteam|network|passwords|cellular|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
+    hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
     try:
@@ -2360,7 +2360,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
                  "checklist and the role modes. section=<phase or role> for one part. Needs no "
                  "network; use it when the van has no signal."),
-        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|scout|analyzer|exploiter|reporter"},
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|scout|analyzer|exploiter|reporter"},
         "func": tool_playbook,
     },
 }
