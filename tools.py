@@ -1600,6 +1600,11 @@ def tool_osint(args: dict) -> str:
     g = _authz(args, domain)
     if g:
         return g
+    uname = str(args.get("username", "")).strip()
+    if uname:
+        cmd = "sherlock " + shlex.quote(uname) + " --timeout 15 --print-found 2>/dev/null | head -60"
+        out, rc, where = _off_run(cmd, 300)
+        return _off_report("osint(username)", args.get("authorization", ""), "sherlock " + uname, out, rc, where)
     d = shlex.quote(_bare_host(domain))
     cmd = (f"echo '== theHarvester =='; theHarvester -d {d} -b duckduckgo,crtsh,bing -l 200 2>/dev/null | grep -iE '@|host|ip' | head -60; "
            f"echo '== dns =='; dnsx -silent -a -resp -d {d} 2>/dev/null | head -20; "
@@ -1709,6 +1714,187 @@ def tool_cell_info(args: dict) -> str:
            "|| echo 'no modem found via ModemManager'")
     out, rc = _run_host(cmd, 30)
     return _off_report("cell_info(serving, own modem)", "own device", "mmcli serving cell", out, rc, "host")
+
+
+# --- Further ethical-hacking tools: containers, visual/AD/cloud recon,
+#     crypto/encoding, website utilities --------------------------------------
+import base64 as _b64
+import hmac as _hmac
+
+
+# 1. container_scan — trivy: images, filesystems, repos, IaC (+ secrets/CVEs)
+def tool_container_scan(args: dict) -> str:
+    tgt = str(args.get("target", "") or args.get("image", "") or ".").strip()
+    kind = str(args.get("type", "")).strip().lower()
+    if not kind:
+        kind = "image" if ("/" in tgt or ":" in tgt) and not os.path.exists(os.path.expanduser(tgt)) else "fs"
+    if kind == "image":
+        cmd = f"trivy image --scanners vuln,secret,misconfig --quiet {shlex.quote(tgt)} 2>&1 | head -200"
+        out, rc, where = _off_run(cmd, 900)
+        if rc != 0 and not _have("trivy"):
+            return "container_scan needs trivy in the toolbox — run `sygnif kali-setup`, or install trivy."
+        return _off_report("container_scan(image)", "own image", cmd, out, rc, where)
+    # fs / repo / config: files on the host
+    sub = {"fs": "fs", "repo": "repo", "config": "config"}.get(kind, "fs")
+    tmpl = "trivy " + sub + " --scanners vuln,secret,misconfig --quiet {p} 2>&1 | head -200"
+    out, rc, where = _local_or_toolbox(tgt, tmpl, "trivy", 900)
+    if where.startswith("missing"):
+        return "container_scan needs trivy on the host or in the toolbox (`sygnif kali-setup`)."
+    return _off_report("container_scan(" + sub + ")", "own code", "trivy " + sub + " " + tgt, out, rc, where)
+
+
+# 2. webshot — bulk screenshots of authorized hosts (gowitness / eyewitness)
+def tool_webshot(args: dict) -> str:
+    target = str(args.get("target", "") or args.get("url", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    outdir = "/tmp/webshot_" + str(abs(hash(target)) % 100000)
+    u = shlex.quote(target if target.startswith("http") else "https://" + target)
+    cmd = (f"mkdir -p {outdir}; (gowitness scan single --url {u} -s {outdir} 2>/dev/null "
+           f"|| gowitness single {u} -P {outdir} 2>/dev/null "
+           f"|| eyewitness --web --single {u} -d {outdir} --no-prompt 2>/dev/null); "
+           f"ls -1 {outdir}/**/*.png {outdir}/*.png 2>/dev/null | head")
+    out, rc, where = _off_run(cmd, 300)
+    return _off_report("webshot", args.get("authorization", ""),
+                       "screenshot " + target + " -> " + outdir, out or "(no output)", rc, where)
+
+
+# 3. ad_enum — BloodHound collection against an authorized Active Directory
+def tool_ad_enum(args: dict) -> str:
+    domain = str(args.get("domain", "")).strip()
+    g = _authz(args, domain)
+    if g:
+        return g
+    dc = str(args.get("dc", "") or args.get("nameserver", "")).strip()
+    user = str(args.get("user", "")).strip()
+    pw = str(args.get("password", "")).strip()
+    if not (dc and user and pw):
+        return ("ad_enum: give domain + 'dc' (DC IP/host) + 'user' + 'password' for an AD you are "
+                "authorized to test. Collects BloodHound data (users, groups, ACLs, sessions).")
+    outdir = "/tmp/bh_" + str(abs(hash(domain)) % 100000)
+    cmd = (f"mkdir -p {outdir}; cd {outdir}; bloodhound-python -d {shlex.quote(domain)} "
+           f"-u {shlex.quote(user)} -p {shlex.quote(pw)} -ns {shlex.quote(dc)} -c All --zip 2>&1 | tail -30; "
+           f"echo '== output =='; ls -1 {outdir}")
+    out, rc, where = _off_run(cmd, 900)
+    return _off_report("ad_enum(bloodhound)", args.get("authorization", ""),
+                       "bloodhound-python " + domain, out, rc, where)
+
+
+# 4. cloud_audit — Prowler cloud posture (AWS/GCP/Azure). Needs cloud creds in env.
+def tool_cloud_audit(args: dict) -> str:
+    provider = str(args.get("provider", "aws")).strip().lower()
+    if provider not in ("aws", "gcp", "azure", "kubernetes"):
+        return "cloud_audit: provider must be aws | gcp | azure | kubernetes."
+    g = _authz(args, provider + "-account")
+    if g:
+        return g
+    extra = str(args.get("extra", "")).strip()
+    ensure = ("command -v prowler >/dev/null 2>&1 || pipx install prowler >/dev/null 2>&1 "
+              "|| pip install --break-system-packages prowler >/dev/null 2>&1; ")
+    cmd = ensure + f"prowler {shlex.quote(provider)} --no-banner {extra} 2>&1 | tail -120"
+    out, rc, where = _off_run(cmd, 1800)
+    if "command not found" in out or ("prowler" not in out and rc != 0):
+        return ("cloud_audit: could not run/install prowler. Provision the toolbox "
+                "(`sygnif kali-setup`) or `pipx install prowler`. Cloud creds come from the "
+                "environment (AWS: ~/.aws or AWS_* env; GCP: ADC; Azure: az login).")
+    return _off_report("cloud_audit(" + provider + ")", args.get("authorization", ""),
+                       "prowler " + provider, out, rc, where)
+
+
+# 5. crypto — encode / decode / hash / hmac / jwt / identify / magic-decrypt.
+#    Local, deterministic; identify + magic use the toolbox (hashid/ciphey).
+def tool_crypto(args: dict) -> str:
+    op = str(args.get("op", "")).strip().lower()
+    data = str(args.get("data", "") or args.get("text", ""))
+    algo = str(args.get("algo", "") or args.get("scheme", "")).strip().lower()
+    key = str(args.get("key", ""))
+    if not op:
+        return ("crypto: op = encode|decode|hash|hmac|jwt|identify|magic. "
+                "encode/decode algo=base64|hex|url|rot13; hash algo=md5|sha1|sha256|sha512; "
+                "hmac needs key+algo; jwt decodes a token; identify names a hash; magic auto-decodes (ciphey).")
+    try:
+        if op == "encode":
+            if algo in ("base64", "b64"):
+                return _b64.b64encode(data.encode()).decode()
+            if algo == "hex":
+                return data.encode().hex()
+            if algo == "url":
+                return urllib.parse.quote(data)
+            if algo == "rot13":
+                import codecs
+                return codecs.encode(data, "rot13")
+            return "crypto encode: algo = base64|hex|url|rot13"
+        if op == "decode":
+            if algo in ("base64", "b64"):
+                return _b64.b64decode(data + "=" * (-len(data) % 4)).decode(errors="replace")
+            if algo == "hex":
+                return bytes.fromhex(data.strip()).decode(errors="replace")
+            if algo == "url":
+                return urllib.parse.unquote(data)
+            if algo == "rot13":
+                import codecs
+                return codecs.encode(data, "rot13")
+            return "crypto decode: algo = base64|hex|url|rot13"
+        if op == "hash":
+            import hashlib
+            algo = algo or "sha256"
+            if algo not in hashlib.algorithms_available:
+                return f"crypto hash: unknown algo '{algo}'"
+            return f"{algo}({len(data)} bytes) = " + hashlib.new(algo, data.encode()).hexdigest()
+        if op == "hmac":
+            import hashlib
+            if not key:
+                return "crypto hmac: give a 'key' and algo (default sha256)."
+            return f"hmac-{algo or 'sha256'} = " + _hmac.new(key.encode(), data.encode(),
+                                                             algo or "sha256").hexdigest()
+        if op == "jwt":
+            parts = data.strip().split(".")
+            if len(parts) < 2:
+                return "crypto jwt: not a JWT (need header.payload.signature)."
+            def d(seg):
+                return _b64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)).decode(errors="replace")
+            return ("JWT (decoded, NOT verified):\n  header:  " + d(parts[0])
+                    + "\n  payload: " + d(parts[1])
+                    + "\n  [signature not checked — decode only]")
+        if op == "identify":
+            out, rc, where = _off_run("echo " + shlex.quote(data) + " | hashid -m 2>/dev/null | head -20 "
+                                      "|| nth -t " + shlex.quote(data) + " 2>/dev/null | head -20", 30)
+            return out or "crypto identify: no match (need hashid/name-that-hash in the toolbox)."
+        if op == "magic":
+            out, rc, where = _off_run("echo " + shlex.quote(data) + " | ciphey -- - 2>/dev/null | head -20", 120)
+            return out or "crypto magic: ciphey found nothing (or not installed in the toolbox)."
+    except Exception as e:  # noqa: BLE001
+        return f"crypto {op}: {type(e).__name__}: {e}"
+    return "crypto: unknown op '" + op + "'"
+
+
+# 6. website — quick site-recon utilities (robots/sitemap/security.txt, DNS,
+#    whois, tech, wayback). Passive; a handful of GETs + DNS.
+def tool_website(args: dict) -> str:
+    url = _norm_url(str(args.get("url", "") or args.get("target", "")))
+    if not url:
+        return "website: give a 'url'."
+    host = _bare_host(url)
+    lines = [f"Website recon: {url}"]
+    for p in ("/robots.txt", "/sitemap.xml", "/.well-known/security.txt"):
+        body, status, _ = _http_get(url + p, headers={"User-Agent": _BROWSER_UA})
+        first = (body or "").strip().splitlines()[:3]
+        lines.append(f"  {p}: HTTP {status}" + (("  " + " | ".join(first)) if status == 200 and first else ""))
+    # wayback snapshot count (keyless CDX)
+    wb, wstat, _ = _http_get(
+        "https://web.archive.org/cdx/search/cdx?url=" + urllib.parse.quote(host)
+        + "*&output=json&fl=original&collapse=urlkey&limit=5000", headers={"User-Agent": _BROWSER_UA})
+    n = max(0, len((wb or "").strip().splitlines()) - 1) if wstat == 200 else 0
+    lines.append(f"  wayback snapshots (unique URLs): ~{n}")
+    # DNS + whois + tech via the toolbox/host
+    dq = shlex.quote(host)
+    out, rc, where = _off_run(
+        f"echo '== dns =='; dig +short A {dq}; dig +short MX {dq}; "
+        f"echo '== whois =='; whois {dq} 2>/dev/null | grep -iE 'registrar|creation|expir|name server' | head; "
+        f"echo '== tech =='; whatweb -q {dq} 2>/dev/null", 120)
+    lines.append(out.strip() if out.strip() else "  (dns/whois/whatweb unavailable)")
+    return _truncate("\n".join(lines))
 
 
 # name -> {desc, args (name->hint), func}
@@ -1926,6 +2112,36 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "(mode=detect). No transmitting / no interception."),
         "args": {"mode": "serving (default) | lookup | detect", "mcc": "for lookup", "mnc": "for lookup", "lac": "for lookup", "cellid": "for lookup"},
         "func": tool_cell_info,
+    },
+    "container_scan": {
+        "desc": "Scan a container image, filesystem, repo, or IaC for CVEs + secrets + misconfig (trivy). type=image|fs|repo|config.",
+        "args": {"target": "image ref or path (default .)", "type": "image|fs|repo|config"},
+        "func": tool_container_scan,
+    },
+    "webshot": {
+        "desc": "Screenshot an authorized web host (gowitness/eyewitness) — visual recon / fleet overview. Requires target+authorization.",
+        "args": {"target": "URL/host you are authorized to test", "authorization": "attestation"},
+        "func": tool_webshot,
+    },
+    "ad_enum": {
+        "desc": "Collect BloodHound data from an authorized Active Directory (bloodhound-python). Requires domain+dc+user+password+authorization.",
+        "args": {"domain": "AD domain", "dc": "DC IP/host", "user": "AD user", "password": "AD password", "authorization": "attestation"},
+        "func": tool_ad_enum,
+    },
+    "cloud_audit": {
+        "desc": "Cloud security-posture audit with Prowler (aws|gcp|azure|kubernetes). Uses cloud creds from the environment. Requires authorization; auto-installs prowler in the toolbox.",
+        "args": {"provider": "aws|gcp|azure|kubernetes", "authorization": "attestation", "extra": "extra prowler flags"},
+        "func": tool_cloud_audit,
+    },
+    "crypto": {
+        "desc": "Encode/decode/hash/hmac/JWT-decode/identify/magic-decrypt. Local + deterministic (identify+magic use the toolbox).",
+        "args": {"op": "encode|decode|hash|hmac|jwt|identify|magic", "data": "the input", "algo": "base64|hex|url|rot13 or md5|sha256|...", "key": "for hmac"},
+        "func": tool_crypto,
+    },
+    "website": {
+        "desc": "Quick website recon: robots/sitemap/security.txt, DNS, whois, tech fingerprint, wayback snapshot count. Passive.",
+        "args": {"url": "the site URL"},
+        "func": tool_website,
     },
     "recon": {
         "desc": ("Recon/OSINT on an authorized target domain: subdomains (subfinder), DNS + "
