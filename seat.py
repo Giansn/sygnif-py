@@ -390,9 +390,17 @@ def _post_chat(spec: dict, messages: list[dict], t0: float) -> tuple[str, dict]:
     return text, _meta(messages, text, data.get("usage"), time.perf_counter() - t0)
 
 
-def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple[str, dict]:
+def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float,
+                 strict: bool = True) -> tuple[str, dict]:
     """Streaming POST parsing SSE lines. Raises on transport/HTTP failure so the
-    caller can fall back to a plain request."""
+    caller can fall back to a plain request.
+
+    When `strict`, the served model (from the SSE chunks' `model` field) is
+    checked against the requested one BEFORE the first content token is shown; a
+    family mismatch (e.g. a subscription backend silently falling back to its
+    default) raises `_ModelDrift` with nothing emitted, so the caller can
+    re-pin and re-issue cleanly instead of the seat quietly running — and
+    billing — a model the operator never selected."""
     url = spec["base_url"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
         "model": spec["id"], "messages": _http_messages(messages),
@@ -405,6 +413,8 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     parts: list[str] = []
     usage = None
+    served = None
+    checked = False
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -417,22 +427,74 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple
                 chunk = json.loads(chunk_s)
             except Exception:  # noqa: BLE001
                 continue
+            served = served or chunk.get("model")
             choices = chunk.get("choices") or []
             if choices:
                 piece = (choices[0].get("delta") or {}).get("content")
                 if piece:
+                    if strict and not checked and served:
+                        if not _model_matches(spec.get("id", ""), served):
+                            raise _ModelDrift(served)  # nothing emitted yet
+                        checked = True
                     parts.append(piece)
                     if on_delta:
                         on_delta(piece)
             if chunk.get("usage"):
                 usage = chunk["usage"]
     text = "".join(parts)
-    return text, _meta(messages, text, usage, time.perf_counter() - t0)
+    meta = _meta(messages, text, usage, time.perf_counter() - t0)
+    meta["served_model"] = served
+    return text, meta
+
+
+# --- model-pin enforcement --------------------------------------------------
+# A subscription backend that doesn't honour a requested model id can silently
+# fall back to the account default (seen 2026-09-22: a `claude-fable-5-1` turn
+# came back served by Opus 4.8). The seat would then quietly run — and bill — a
+# model the operator never selected. PIN enforcement compares the SERVED model
+# against the requested one and, on a family mismatch, back-swaps to the
+# requested model and re-issues ONCE before continuing, rather than accepting
+# the drift. Off with SYGNIF_PY_PIN_MODEL=0.
+PIN_ENFORCE = os.environ.get("SYGNIF_PY_PIN_MODEL", "1") != "0"
+
+
+class _ModelDrift(Exception):
+    """The backend streamed a different model family than we asked for. Raised
+    before any output is shown so the caller can back-swap and re-issue clean."""
+
+    def __init__(self, served: str):
+        super().__init__(served)
+        self.served = served
+
+
+def _model_core(m: str) -> str:
+    """Comparable core of a model id: drop [ctx] tags and a trailing date stamp,
+    so 'claude-fable-5-1[1m]' and 'claude-fable-5-1-20260115' both reduce to
+    'claude-fable-5-1'."""
+    m = (m or "").lower().strip()
+    m = re.sub(r"\[[^\]]*\]", "", m)
+    m = re.sub(r"[-_]?\d{6,8}$", "", m)
+    return m.strip("-_ ")
+
+
+def _model_matches(requested: str, served: str) -> bool:
+    """True when `served` is the model we asked for. Lenient about date suffixes
+    and short aliases ('sonnet' vs 'claude-sonnet-4-5'), so only a real family
+    swap (fable -> opus) counts as a mismatch. Unknown either side -> no fight."""
+    r, s = _model_core(requested), _model_core(served)
+    if not r or not s:
+        return True
+    return r == s or r in s or s in r
 
 
 def call_model_stream(spec: dict, messages: list[dict], on_delta=None) -> tuple[str, dict]:
     """Model call for the REPL turn. Streams (with live on_delta) when possible,
-    returning (text, meta) where meta drives the pix info line."""
+    returning (text, meta) where meta drives the pix info line.
+
+    Enforces the model pin on the streaming path: if the backend serves a
+    different model family, back-swap to the requested model and re-issue once;
+    if it STILL can't serve it, continue on what came back but say so loudly —
+    never a silent swap."""
     t0 = time.perf_counter()
     if spec.get("provider") == "claude-cli":
         text = call_claude_cli(spec, messages)  # no token stream; emit whole
@@ -440,10 +502,20 @@ def call_model_stream(spec: dict, messages: list[dict], on_delta=None) -> tuple[
             on_delta(text)
         return text, _meta(messages, text, None, time.perf_counter() - t0)
     if on_delta is not None:
-        try:
-            return _stream_chat(spec, messages, on_delta, t0)
-        except Exception:  # noqa: BLE001 — endpoint rejected stream; fall back
-            pass
+        for attempt in range(2):
+            try:
+                return _stream_chat(spec, messages, on_delta, t0,
+                                    strict=(PIN_ENFORCE and attempt == 0))
+            except _ModelDrift as d:
+                pix.notice(
+                    f"  ↻ backend served {d.served}, not {spec.get('id')} — "
+                    f"re-pinning to {spec.get('id')} and retrying", "yellow")
+                if attempt == 0:
+                    continue
+                # strict=False on the retry can't raise; unreachable, but be safe.
+                break
+            except Exception:  # noqa: BLE001 — endpoint rejected stream; fall back
+                break
     return _post_chat(spec, messages, t0)
 
 
