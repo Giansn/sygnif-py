@@ -142,10 +142,12 @@ def tool_identity(args: dict) -> str:
     (default) or a specific PROVIDER's (pass provider=<model key from config.json,
     e.g. 'fable'/'claude'/'openrouter-free'>). A provider's role/conduct overrides
     the seat's own when that provider is active; provider instructions are appended
-    after the global ones. Changes persist to the identity file and take effect on the
-    NEXT session. mode=show | set_role | set_conduct | add_instruction |
-    remove_instruction | reset. set_* / add take text=; remove takes index=; reset
-    takes what=(all|role|conduct|instructions). Omit provider= to act on the seat's own."""
+    after the global ones. Safety guidelines are CUMULATIVE — global rules always apply
+    and a provider only adds to them (it can tighten, never weaken). Changes persist to
+    the identity file and take effect on the NEXT session. mode=show | set_role |
+    set_conduct | add_instruction | remove_instruction | add_safety | remove_safety |
+    reset. set_* / add take text=; remove takes index=; reset takes
+    what=(all|role|conduct|instructions|safety). Omit provider= to act on the seat's own."""
     import identity as _id
     mode = str(args.get("mode", "show")).strip().lower()
     provider = str(args.get("provider", "")).strip()
@@ -174,10 +176,13 @@ def tool_identity(args: dict) -> str:
             role_src = "OVERRIDE" if str(ov.get("role") or "").strip() else "default"
             cond_src = "OVERRIDE" if str(ov.get("conduct") or "").strip() else "default"
         instr = _id.effective_instructions(ov, provider or None)
+        safety = _id.effective_safety(ov, provider or None)
         out = [f"== identity · {who} (effective) ==",
                f"[role · {role_src}]", _id.effective_role(ov, provider or None), "",
                f"[conduct · {cond_src}]", _id.effective_conduct(ov, provider or None), "",
-               f"[standing instructions · {len(instr)}]"]
+               f"[safety guidelines · {len(safety)} · cumulative, global+provider]"]
+        out += [f"  {i}. {x}" for i, x in enumerate(safety)] or ["  (none)"]
+        out += ["", f"[standing instructions · {len(instr)}]"]
         out += [f"  {i}. {x}" for i, x in enumerate(instr)] or ["  (none)"]
         if not provider:
             provs = sorted((ov.get("providers") or {}).keys())
@@ -224,6 +229,28 @@ def tool_identity(args: dict) -> str:
         _id.save_identity(ov)
         return f"identity: removed instruction #{idx} for {who}: {removed}"
 
+    if mode == "add_safety":
+        if not text:
+            return "identity add_safety: give text= (one safety guideline). Safety is cumulative — global rules always apply and a provider only adds to them."
+        tgt = _target(create=True)
+        tgt.setdefault("safety", []).append(text)
+        _id.save_identity(ov)
+        return (f"identity: added safety guideline #{len(tgt['safety']) - 1} for {who} "
+                f"(effective next session): {text}")
+
+    if mode == "remove_safety":
+        tgt = _target(create=False)
+        rules = list(tgt.get("safety") or [])
+        try:
+            idx = int(str(args.get("index", "")).strip())
+            removed = rules.pop(idx)
+        except (ValueError, IndexError):
+            return (f"identity remove_safety: give a valid index= (0..{len(rules) - 1}) for {who}. "
+                    f"Note: index is into THIS layer's own safety list, not the merged view.")
+        _target(create=True)["safety"] = rules
+        _id.save_identity(ov)
+        return f"identity: removed safety guideline #{idx} for {who}: {removed}"
+
     if mode == "reset":
         what = str(args.get("what", "all")).strip().lower()
         if provider:
@@ -234,8 +261,10 @@ def tool_identity(args: dict) -> str:
                 (provs.get(provider) or {}).pop(what, None)
             elif what in ("instructions", "instruction"):
                 (provs.get(provider) or {}).pop("instructions", None)
+            elif what == "safety":
+                (provs.get(provider) or {}).pop("safety", None)
             else:
-                return "identity reset: what = all | role | conduct | instructions."
+                return "identity reset: what = all | role | conduct | instructions | safety."
             if provs.get(provider) == {}:
                 provs.pop(provider, None)
             ov["providers"] = provs
@@ -246,16 +275,19 @@ def tool_identity(args: dict) -> str:
                 ov.pop("conduct", None)
             elif what in ("instructions", "instruction"):
                 ov.pop("instructions", None)
+            elif what == "safety":
+                ov.pop("safety", None)
             elif what in ("all", ""):
                 # keep provider overlays; only clear the seat's own top-level identity
                 ov = {"providers": ov.get("providers")} if ov.get("providers") else {}
             else:
-                return "identity reset: what = all | role | conduct | instructions."
+                return "identity reset: what = all | role | conduct | instructions | safety."
         _id.save_identity(ov)
         return f"identity: reset {what or 'all'} for {who} to default (effective next session)."
 
     return ("identity mode = show | set_role | set_conduct | add_instruction | "
-            "remove_instruction | reset  (add provider=<model key> to target a provider).")
+            "remove_instruction | add_safety | remove_safety | reset  "
+            "(add provider=<model key> to target a provider).")
 
 
 def tool_dev_apply_and_test(args: dict) -> str:
@@ -3653,16 +3685,17 @@ BUILTIN_TOOLS: dict[str, dict] = {
             "View or CHANGE identity + standing instructions — SYGNIF py's OWN, or a "
             "PROVIDER's (provider=<model key>, e.g. fable/claude). Provider role/conduct "
             "overrides the seat's own when that provider is active; provider instructions "
-            "append after the global ones. Persists to the identity file; effective NEXT "
+            "append after the global ones. Safety guidelines are cumulative (global always "
+            "applies, a provider only adds). Persists to the identity file; effective NEXT "
             "session. mode=show | set_role | set_conduct | add_instruction | "
-            "remove_instruction | reset."
+            "remove_instruction | add_safety | remove_safety | reset."
         ),
         "args": {
-            "mode": "show | set_role | set_conduct | add_instruction | remove_instruction | reset",
+            "mode": "show | set_role | set_conduct | add_instruction | remove_instruction | add_safety | remove_safety | reset",
             "provider": "OPTIONAL model key from config.json (e.g. fable, claude); omit for the seat's own identity",
-            "text": "new text (set_role, set_conduct, add_instruction)",
-            "index": "instruction index to drop (remove_instruction; see mode=show)",
-            "what": "all | role | conduct | instructions (reset)",
+            "text": "new text (set_role, set_conduct, add_instruction, add_safety)",
+            "index": "index to drop (remove_instruction / remove_safety; into that layer's own list)",
+            "what": "all | role | conduct | instructions | safety (reset)",
         },
         "func": tool_identity,
     },

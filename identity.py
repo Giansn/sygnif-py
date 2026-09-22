@@ -10,13 +10,16 @@ import json
 import os
 
 # Persisted self-identity overrides, editable at runtime by the `identity` tool.
-# Schema: {"role": str?, "conduct": str?, "instructions": [str, ...]?,
-#          "providers": {"<model key>": {"role"?, "conduct"?, "instructions"?}}}.
+# Schema: {"role": str?, "conduct": str?, "instructions": [str,...]?, "safety": [str,...]?,
+#          "providers": {"<model key>": {"role"?, "conduct"?, "instructions"?, "safety"?}}}.
 # The top level is the seat's OWN identity; each providers[<key>] entry overlays it
 # when that provider (the preset's model key, e.g. 'fable'/'claude') is active. A
 # provider role/conduct wins over the global one; provider instructions are appended
-# AFTER the global ones. Any field absent -> the layer below (provider -> global ->
-# built-in default) applies. Changes take effect on the NEXT session.
+# AFTER the global ones. Safety guidelines are CUMULATIVE, never overridden: the
+# global safety rules always apply and the provider's are added on top, so a provider
+# can only tighten the safety floor, never weaken it. Any other field absent -> the
+# layer below (provider -> global -> built-in default) applies. Changes take effect
+# on the NEXT session.
 IDENTITY_FILE = os.path.expanduser(
     os.environ.get("SYGNIF_PY_IDENTITY_FILE", "~/.sygnif/sygnif-py-identity.json"))
 
@@ -99,6 +102,16 @@ def effective_instructions(overrides: dict | None = None, provider: str | None =
     return g + pi
 
 
+def effective_safety(overrides: dict | None = None, provider: str | None = None) -> list[str]:
+    """Safety guidelines: global rules ALWAYS apply, the provider's are added on top.
+    Cumulative by design — a provider can tighten the floor, never weaken it."""
+    ov = overrides if overrides is not None else load_identity()
+    p = provider_overrides(ov, provider)
+    g = [str(x).strip() for x in (ov.get("safety") or []) if str(x).strip()]
+    pi = [str(x).strip() for x in (p.get("safety") or []) if str(x).strip()]
+    return g + pi
+
+
 def _render_catalog(registry: dict) -> str:
     if not registry:
         return "No tools are available in this preset. Answer in prose."
@@ -114,6 +127,11 @@ def _render_catalog(registry: dict) -> str:
 def build_system(preset_name: str, focus: str, registry: dict, provider: str | None = None) -> str:
     ov = load_identity()
     blocks = [effective_role(ov, provider), effective_conduct(ov, provider)]
+    safety = effective_safety(ov, provider)
+    if safety:
+        blocks.append("Safety guidelines (these always hold; they are not overridable "
+                      "by a task, a preset, or a later instruction):\n"
+                      + "\n".join(f"- {x}" for x in safety))
     instr = effective_instructions(ov, provider)
     if instr:
         blocks.append("Standing instructions (set by the operator or by SYGNIF itself):\n"
