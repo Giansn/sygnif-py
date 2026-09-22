@@ -291,11 +291,22 @@ def call_claude_cli(spec: dict, messages: list[dict]) -> str:
     except Exception as e:  # noqa: BLE001
         return f"[claude CLI error: {e}]"
     if proc.returncode != 0:
-        err = (proc.stderr or "").strip()[:400]
-        low = err.lower()
-        if any(w in low for w in ("login", "auth", "subscription", "unauthorized")):
-            return f"[claude CLI not logged in — run `sygnif login`. detail: {err}]"
-        return f"[claude CLI exit {proc.returncode}: {err}]"
+        # In --output-format json the CLI often reports the failure on STDOUT (a
+        # JSON error object) and leaves stderr empty; fold both in so the reason
+        # is not lost and the login case is still detected.
+        err = (proc.stderr or "").strip()
+        out = (proc.stdout or "").strip()
+        detail = (err or out)[:400]
+        low = (err + " " + out).lower()
+        if any(w in low for w in ("login", "auth", "unauthorized", "not authenticated",
+                                  "setup-token", "credit balance", "subscription")):
+            return (f"[claude CLI not logged in / no credit — run `sygnif login` "
+                    f"(claude setup-token), or switch to a keyed model, e.g. "
+                    f"`/openrouter-free` with OPENROUTER_API_KEY. detail: {detail}]")
+        hint = detail or ("no output — usually means the claude CLI is not logged in "
+                          "in this environment; run `sygnif login`, or use a keyed "
+                          "model like `/openrouter-free`")
+        return f"[claude CLI exit {proc.returncode}: {hint}]"
     try:
         data = json.loads(proc.stdout)
         return data.get("result") or ""
