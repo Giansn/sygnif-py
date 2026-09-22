@@ -662,6 +662,71 @@ class SessionState:
             self.tps = meta["tps"]
 
 
+# Tools that touch a live target and REFUSE without an `authorization`
+# attestation (they route through tools._off_report). If a preset can reach any
+# of them, the model must be told the recorded scope AND told to pass the
+# attestation — otherwise it hits the refusal once and silently degrades to
+# running the raw binary through `shell`, losing the kali container's scanners.
+# The full set of tools whose implementation enforces the attestation (each body
+# calls tools._off_report or returns the REFUSED-for-authorization string). Kept
+# exhaustive so no gated tool slips a preset past the briefing — e.g. `purple`
+# carries only `emulate`, which a partial list would miss. If tools.py gains a new
+# gated tool, add it here.
+_GATED_TOOLS = {
+    "ad", "ad_enum", "aitm", "api_scan", "arp", "bloodyad", "bruteforce",
+    "cell_info", "cloud_audit", "cloudx", "coerce", "container_scan", "crack",
+    "dast", "emulate", "exploit_search", "inventory", "kube", "metasploit", "msf",
+    "netenum", "nuclei", "osint", "portscan", "postexploit", "privesc", "recon",
+    "sast", "secrets_scan", "subenum", "takeover", "tls_check", "velociraptor",
+    "vuln_check", "webshot", "wifi_capture", "wifi_crack", "winrm", "wpscan",
+    "wp_vulnscan",
+}
+
+
+def _scope_briefing(reg: dict) -> str:
+    """For a preset that can reach an authorization-gated tool, surface the
+    recorded engagement scope and instruct the model to pass the attestation to
+    target-touching tools rather than falling back to raw `shell`. Empty string
+    when the preset has no gated tools, so non-pentest presets are unaffected."""
+    if not (set(reg) & _GATED_TOOLS):
+        return ""
+    scope_path = os.path.join(PENTEST_DIR, "SCOPE.md")
+    auth = targets = ""
+    try:
+        with open(scope_path, encoding="utf-8") as fh:
+            for ln in fh:
+                low = ln.lower()
+                if "authorization / owner:" in low and not auth:
+                    auth = ln.split(":", 1)[1].strip()
+                elif "in-scope targets" in low and not targets:
+                    targets = ln.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    lines = [
+        "Engagement authorization gate (read before any target-touching tool):",
+        "- Tools such as portscan, netenum, tls_check, recon, nuclei, dast, wpscan, "
+        "takeover, osint, metasploit and bruteforce touch a live target and REFUSE "
+        "unless you pass an `authorization` argument — a short attestation of who "
+        "authorized the test.",
+        "- If such a tool returns `REFUSED: set 'authorization'`, do NOT rerun the raw "
+        "binary through `shell` instead. Add the `authorization` attestation and call "
+        "the tool again. These gated tools run inside the sygnif-kali container and "
+        "carry scanners (testssl, nuclei, sqlmap, ...) the bare host shell may lack.",
+        f"- Scope of record: {scope_path}.",
+    ]
+    if auth:
+        lines.append(f"- Recorded authorization: {auth}")
+        lines.append("  Reuse this exact string as the `authorization` argument for "
+                     "every in-scope tool call this engagement.")
+    if targets:
+        lines.append(f"- Recorded in-scope targets: {targets}")
+    if not auth:
+        lines.append("- No authorization is recorded yet. Before touching any target, "
+                     "fill in SCOPE.md or ask the operator, then use that attestation. "
+                     "Never invent authorization.")
+    return "\n".join(lines)
+
+
 def build_session(cfg: dict, preset_name: str | None):
     name, preset = models.get_preset(cfg, preset_name)
     reg = tools.build_registry(preset.get("tools", models.DEFAULT_TOOLS))
@@ -669,6 +734,9 @@ def build_session(cfg: dict, preset_name: str | None):
     # overlay (if any) is applied on top of the seat's own identity.
     system = identity.build_system(name, preset.get("focus", ""), reg,
                                    provider=preset.get("model"))
+    brief = _scope_briefing(reg)
+    if brief:
+        system = system + "\n\n" + brief
     return name, preset, reg, system
 
 
