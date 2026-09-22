@@ -454,3 +454,48 @@ Test an API you own / are authorized to test. Use the `api_scan` tool + the kit.
   broken function-level auth, mass assignment, excessive data exposure — are MANUAL: replay
   a request in Burp/ZAP with a different id or role and compare. Scanners won't find these.
 Every confirmed issue -> `finding` with the request/response pair as evidence.
+
+## engagement — orchestrated engagement playbooks (tool chains)
+The seat IS the orchestrator: it chains tools, carries state (inventory / findings /
+audit), and picks the next step. Set the phase with `phase set=<recon..report>` so
+every finding is tagged. Five engagement chains below — call each by its own section
+(external | adchain | cloudchain | purpleloop | irchain). Guard rails apply to every
+offensive step: SCOPE.md confinement, the STOP kill-switch, the rate limit, `--confirm`,
+and evidence-required findings (high/critical need a second source).
+- external  — external / perimeter (bug-bounty, external pentest)
+- adchain   — internal Active Directory breach
+- cloudchain— cloud / identity
+- purpleloop— detection validation (attack, then check the blue side saw it)
+- irchain   — incident response / compromise assessment
+
+## external — engagement: external / perimeter
+Order (ATT&CK-shaped; each step is a tool):
+recon -> portscan -> tls_check / headers -> nuclei (+ wpscan / dast for web, api_scan
+for APIs) -> takeover -> exploit_search -> (authorized) msf -> finding -> report.
+Inventory (hosts.jsonl) fills automatically from recon/portscan. Every finding
+evidence-backed; criticals need a second source. This is the bug-bounty spine.
+
+## adchain — engagement: internal Active Directory breach
+From a foothold, walk the path BloodHound reveals:
+ad enum -> ad_enum (BloodHound graph) -> ad kerberoast / ad asrep -> crack ->
+ad spray (rate-limited) -> bloodyad (ACL edge) / coerce (coerce->relay) ->
+ad certipy (ADCS ESC1-17) -> ad secretsdump (DCSync) -> winrm / ad exec (lateral) ->
+velociraptor (post-ex collection) -> finding -> report.
+The chain that was impossible before: ad_enum SEES the path, this WALKS it.
+
+## cloudchain — engagement: cloud / identity
+osint -> cloud_audit (defensive posture) -> cloudx aws|azure|azuread (offensive IAM /
+attack paths) -> finding -> report. Pairs with adchain when Entra ID <-> on-prem AD.
+Uses cloud creds from the environment; enumerates, does not modify by default.
+
+## purpleloop — engagement: detection validation
+emulate list -> emulate run technique=Txxxx (fire an ATT&CK technique on an authorized
+host) -> confirm it landed: triage (endpoint), netmon (network), falco (runtime),
+wazuh (SIEM) -> emulate cleanup -> record whether the detection fired. Closes the loop:
+attack, then prove the blue side saw it. This is the purple team's core cycle.
+
+## irchain — engagement: incident response / compromise assessment
+The defensive mirror of adchain:
+triage collect (Velociraptor artifacts) -> detect ioc (LOKI/YARA) -> memforensics
+(Volatility3 on a dump) -> netmon pcap (Zeek+Suricata on the capture) -> intel (enrich
+the IOCs) -> finding -> report. triage live stands up a Velociraptor GUI for hunting.

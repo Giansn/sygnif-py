@@ -713,7 +713,7 @@ def tool_playbook(args: dict) -> str:
     """Return the offline pentest methodology shipped with the seat — the
     kill-chain checklist and the role modes. Pass section=<phase or role> to get
     just that part (recon|enum|vuln|exploit|postexploit|privesc|report|webapp|wpsec|dast|detect|
-    hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter). No network needed; use this when the van has no signal."""
+    hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter| engagement|external|adchain|cloudchain|purpleloop|irchain). engagement=* are orchestrated tool-chain playbooks per engagement type. No network needed; use this when the van has no signal."""
     section = str(args.get("section", "")).strip().lower()
     path = os.path.join(SEAT_DIR, "methodology.md")
     try:
@@ -735,7 +735,7 @@ def tool_playbook(args: dict) -> str:
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
                 "postexploit, privesc, report, webapp, wpsec, dast, detect, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
-                "reporter (omit for the whole thing).")
+                "reporter, engagement, external, adchain, cloudchain, purpleloop, irchain (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
 
