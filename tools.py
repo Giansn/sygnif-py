@@ -3151,6 +3151,31 @@ def tool_emulate(args: dict) -> str:
     return _off_report("emulate(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
 
 
+def _velo_live_cmd(mode: str, ds: str) -> str:
+    """Shell to start/stop/status a self-contained live Velociraptor GUI server
+    (server + GUI + local client all-in-one, GUI on 127.0.0.1:8889). Datastore in a
+    persistent path so it survives a container recreate. Shared by triage (defensive)
+    and velociraptor (offensive)."""
+    dsq = shlex.quote(ds)
+    V = 'command -v velociraptor >/dev/null 2>&1 || { echo VELO_MISSING; exit 127; }; '
+    # detect the running server by the binary process (pgrep -x, NOT -f: an -f pattern
+    # of "velociraptor gui" self-matches this very shell command) and the GUI port.
+    up = "pgrep -x velociraptor >/dev/null 2>&1"
+    if mode == "start":
+        return (V + "mkdir -p " + dsq + "; "
+                "if " + up + "; then echo 'already running'; else "
+                "setsid bash -c 'exec velociraptor gui --datastore " + dsq + " >> " + dsq + "/gui.log 2>&1' </dev/null & "
+                "sleep 12; fi; "
+                "echo '=== GUI 127.0.0.1:8889 ==='; (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep 8889 || echo 'port not up yet — check the log'; "
+                "echo '=== credentials / log tail ==='; tail -12 " + dsq + "/gui.log 2>/dev/null | grep -aiE 'username|password|gui is now|admin|error|listen' || tail -6 " + dsq + "/gui.log 2>/dev/null")
+    if mode == "status":
+        return (V + "if " + up + "; then pgrep -ax velociraptor | head -2; else echo 'not running'; fi; "
+                "(ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep 8889 || echo 'no :8889'")
+    if mode == "stop":
+        return "pkill -x velociraptor && echo 'stopped live Velociraptor' || echo 'not running'"
+    return ""
+
+
 def tool_velociraptor(args: dict) -> str:
     """OFFENSIVE Velociraptor for an AUTHORIZED engagement: post-exploitation data
     collection and VQL execution against a foothold you hold, plus offline-collector
@@ -3165,6 +3190,14 @@ def tool_velociraptor(args: dict) -> str:
     mode = str(args.get("mode", "collect")).strip().lower()
     VELO = ('V=$(command -v velociraptor || command -v velociraptor-client); '
             '[ -n "$V" ] || { echo VELO_MISSING; exit 127; }; ')
+    if mode in ("live", "start", "stop", "status"):
+        sub = "start" if mode == "live" else mode
+        ds = os.path.expanduser(os.environ.get("SYGNIF_PY_VELO_DIR", "/var/lib/sygnif/velociraptor"))
+        out, rc, where = _off_run(_velo_live_cmd(sub, ds), 120)
+        if "VELO_MISSING" in out:
+            return "velociraptor: not installed — velociraptor.app/downloads or `sygnif kali-setup`."
+        return _off_report("velociraptor(live:" + sub + ")", args.get("authorization", ""),
+                           "velociraptor gui " + sub, out, rc, where, target)
     if mode == "query":
         vql = str(args.get("query", "")).strip()
         if not vql:
@@ -3343,6 +3376,13 @@ def tool_triage(args: dict) -> str:
     mode = str(args.get("mode", "collect")).strip().lower()
     VELO = ('V=$(command -v velociraptor || command -v velociraptor-client); '
             '[ -n "$V" ] || { echo VELO_MISSING; exit 127; }; ')
+    if mode in ("live", "start", "stop", "status"):
+        sub = "start" if mode == "live" else mode
+        ds = os.path.expanduser(os.environ.get("SYGNIF_PY_VELO_DIR", "/var/lib/sygnif/velociraptor"))
+        out, rc, where = _def_run(_velo_live_cmd(sub, ds), 120)
+        if "VELO_MISSING" in out:
+            return ("triage: Velociraptor not installed — velociraptor.app/downloads or `sygnif kali-setup`.")
+        return _def_report("triage(live:" + sub + ")", "velociraptor gui " + sub, out or "(no output)", rc, where)
     if mode == "artifacts":
         cmd = VELO + '"$V" --nobanner artifacts list 2>/dev/null | head -200'
     elif mode == "collect":
@@ -3632,18 +3672,19 @@ BUILTIN_TOOLS: dict[str, dict] = {
     "velociraptor": {
         "desc": ("OFFENSIVE Velociraptor for an authorized engagement: post-exploitation "
                  "collection + VQL execution on a foothold, and offline-collector generation. "
-                 "mode=query|collect|offline|hunt. The offensive sibling of `triage`. Needs "
+                 "mode=live|query|collect|offline|hunt (live = stand up a self-contained Velociraptor "
+                 "GUI server on 127.0.0.1:8889). The offensive sibling of `triage`. Needs "
                  "target + authorization; SCOPE-confined; audited. VQL is powerful — in scope only."),
         "args": {"target": "authorized host / foothold", "authorization": "attestation",
-                 "mode": "query|collect|offline|hunt", "query": "VQL (query/hunt)",
+                 "mode": "live|query|collect|offline|hunt|status|stop", "query": "VQL (query/hunt)",
                  "artifact": "artifact name (collect/offline)", "config": "server API config (hunt)"},
         "func": tool_velociraptor,
     },
     "triage": {
         "desc": ("DEFENSIVE live endpoint IR triage & hunting with Velociraptor on a host "
-                 "you own / are responding to: mode=collect (artifact collection), hunt (VQL "
-                 "query), artifacts (list). The blue mirror of the offensive suite."),
-        "args": {"mode": "collect|hunt|artifacts", "artifact": "artifact name (collect)",
+                 "you own / are responding to: mode=live (stand up a Velociraptor GUI server on "
+                 "127.0.0.1:8889) | collect | hunt | artifacts. The blue mirror of the offensive suite."),
+        "args": {"mode": "live|collect|hunt|artifacts|status|stop", "artifact": "artifact name (collect)",
                  "query": "VQL (hunt)"},
         "func": tool_triage,
     },
