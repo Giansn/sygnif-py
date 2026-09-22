@@ -110,17 +110,28 @@ def list_models(cfg: dict) -> list[str]:
     return sorted(k for k in cfg.get("models", {}) if not _is_meta(k))
 
 
-def resolve_model(cfg: dict, name: str) -> dict:
+def resolve_model(cfg: dict, name: str, strict: bool = True) -> dict:
     """Return a model spec dict {id, base_url, api_key, context, max_tokens}.
 
-    `name` is a key in the models table. An unknown name falls back to the
-    default preset's model, then to the shipped fallback. The named api_key_env
-    is read from the environment here (the file only stores the var name).
+    `name` is a key in the models table. With strict=True (default), a name that
+    is given but not configured raises ValueError — the model the user chose must
+    be the model that answers, so an unknown name is never silently swapped for a
+    different one. A falsy name (no choice made), or an empty models table
+    (unconfigured), yields the shipped fallback. The named api_key_env is read
+    from the environment here (the file only stores the var name).
     """
     models = cfg.get("models", {})
     spec = None
     if name and name in models and not _is_meta(name):
         spec = dict(models[name])
+    elif name and models and strict:
+        # A model was explicitly named but is not configured. NEVER silently
+        # substitute a different model — the model the user chose must be the model
+        # that answers. The caller catches this and refuses the switch (or exits at
+        # startup), keeping whatever model was already active.
+        raise ValueError(
+            "unknown model '" + str(name) + "'. Configured models: "
+            + ", ".join(m for m in models if not _is_meta(m)))
     if spec is None:
         spec = dict(_FALLBACK_MODEL)
     key_env = spec.get("api_key_env")
