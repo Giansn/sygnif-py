@@ -137,6 +137,85 @@ def tool_note(args: dict) -> str:
     return f"noted -> {JOURNAL}"
 
 
+def tool_identity(args: dict) -> str:
+    """View or CHANGE SYGNIF py's OWN identity and standing instructions — the role
+    (who it is), conduct block, and any extra instructions baked into the system
+    prompt. Changes persist to the identity file and take effect on the NEXT session
+    (the running session's prompt is already assembled). mode=show | set_role |
+    set_conduct | add_instruction | remove_instruction | reset. set_role/set_conduct/
+    add_instruction take text=; remove_instruction takes index=; reset takes what=
+    (all|role|conduct|instructions)."""
+    import identity as _id
+    mode = str(args.get("mode", "show")).strip().lower()
+    ov = _id.load_identity()
+    text = str(args.get("text", "")).strip()
+
+    if mode in ("show", ""):
+        role_src = "OVERRIDE" if str(ov.get("role") or "").strip() else "default"
+        cond_src = "OVERRIDE" if str(ov.get("conduct") or "").strip() else "default"
+        instr = ov.get("instructions") or []
+        out = ["== SYGNIF py identity (effective) ==",
+               f"[role · {role_src}]", _id.effective_role(ov), "",
+               f"[conduct · {cond_src}]", _id.effective_conduct(ov), "",
+               f"[standing instructions · {len(instr)}]"]
+        out += [f"  {i}. {x}" for i, x in enumerate(instr)] or ["  (none)"]
+        out.append("\nfile: " + _id.IDENTITY_FILE
+                   + "\n(edits apply on the next session; this one's prompt is already set)")
+        return "\n".join(out)
+
+    if mode == "set_role":
+        if not text:
+            return "identity set_role: give text= (the new role/identity). Use mode=reset what=role to restore the default."
+        ov["role"] = text
+        _id.save_identity(ov)
+        return "identity: role overridden (effective next session). New role:\n\n" + text
+
+    if mode == "set_conduct":
+        if not text:
+            return "identity set_conduct: give text= (the new conduct block). Use mode=reset what=conduct to restore the default."
+        ov["conduct"] = text
+        _id.save_identity(ov)
+        return "identity: conduct overridden (effective next session). New conduct:\n\n" + text
+
+    if mode == "add_instruction":
+        if not text:
+            return "identity add_instruction: give text= (one standing instruction to append to every future session)."
+        ov.setdefault("instructions", []).append(text)
+        _id.save_identity(ov)
+        return (f"identity: added standing instruction #{len(ov['instructions']) - 1} "
+                f"(effective next session): {text}")
+
+    if mode == "remove_instruction":
+        instr = ov.get("instructions") or []
+        try:
+            idx = int(str(args.get("index", "")).strip())
+            removed = instr.pop(idx)
+        except (ValueError, IndexError):
+            return (f"identity remove_instruction: give a valid index= "
+                    f"(0..{len(instr) - 1}). Run mode=show to list them.")
+        ov["instructions"] = instr
+        _id.save_identity(ov)
+        return f"identity: removed standing instruction #{idx}: {removed}"
+
+    if mode == "reset":
+        what = str(args.get("what", "all")).strip().lower()
+        if what == "role":
+            ov.pop("role", None)
+        elif what == "conduct":
+            ov.pop("conduct", None)
+        elif what in ("instructions", "instruction"):
+            ov.pop("instructions", None)
+        elif what in ("all", ""):
+            ov = {}
+        else:
+            return "identity reset: what = all | role | conduct | instructions."
+        _id.save_identity(ov)
+        return f"identity: reset {what or 'all'} to the built-in default (effective next session)."
+
+    return ("identity mode = show | set_role | set_conduct | add_instruction | "
+            "remove_instruction | reset.")
+
+
 def tool_dev_apply_and_test(args: dict) -> str:
     """Write file(s), then run a check/test command, and report both outcomes.
 
@@ -3526,6 +3605,21 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": "Append a timestamped line to the working journal — record decisions, findings, and where evidence lives.",
         "args": {"text": "the note to record"},
         "func": tool_note,
+    },
+    "identity": {
+        "desc": (
+            "View or CHANGE SYGNIF py's own identity + standing instructions (the role, "
+            "conduct, and extra instructions in its system prompt). Persists to the identity "
+            "file; changes take effect on the NEXT session. mode=show | set_role | set_conduct "
+            "| add_instruction | remove_instruction | reset."
+        ),
+        "args": {
+            "mode": "show | set_role | set_conduct | add_instruction | remove_instruction | reset",
+            "text": "new text (set_role, set_conduct, add_instruction)",
+            "index": "instruction index to drop (remove_instruction; see mode=show)",
+            "what": "all | role | conduct | instructions (reset)",
+        },
+        "func": tool_identity,
     },
     "dev_apply_and_test": {
         "desc": (

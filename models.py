@@ -36,7 +36,7 @@ USER_CONFIG = os.path.expanduser(
     os.environ.get("SYGNIF_PY_USER_CONFIG", "~/.sygnif/sygnif-py.json")
 )
 
-DEFAULT_TOOLS = ["shell", "read_file", "write_file", "note"]
+DEFAULT_TOOLS = ["shell", "read_file", "write_file", "note", "identity"]
 
 # Keys starting with "_" in the config are documentation/examples, not real
 # entries — skipped when building the live registry.

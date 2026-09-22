@@ -6,6 +6,16 @@ catalog always matches the tools actually wired in.
 """
 from __future__ import annotations
 
+import json
+import os
+
+# Persisted self-identity overrides, editable at runtime by the `identity` tool.
+# Schema: {"role": str?, "conduct": str?, "instructions": [str, ...]?}. Any field
+# absent -> the built-in default applies. Changes take effect on the NEXT session
+# (the running session's system prompt is already assembled).
+IDENTITY_FILE = os.path.expanduser(
+    os.environ.get("SYGNIF_PY_IDENTITY_FILE", "~/.sygnif/sygnif-py-identity.json"))
+
 ROLE = """You are SYGNIF py — a grounded, capable assistant running on the operator's own machine.
 You have real hands here: you can run commands and read and write files through the tools below.
 You are careful and honest: you state only what a tool actually returned, you never invent facts,
@@ -33,6 +43,35 @@ PROTOCOL = """How to use tools:
 - If you write prose AND a tool block in the same reply, only the tool block runs; keep them separate."""
 
 
+def load_identity() -> dict:
+    """Read persisted identity overrides. Missing file or bad JSON -> {} (defaults)."""
+    try:
+        with open(IDENTITY_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_identity(overrides: dict) -> None:
+    """Persist identity overrides atomically."""
+    os.makedirs(os.path.dirname(IDENTITY_FILE), exist_ok=True)
+    tmp = IDENTITY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(overrides, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, IDENTITY_FILE)
+
+
+def effective_role(overrides: dict | None = None) -> str:
+    ov = overrides if overrides is not None else load_identity()
+    return (str(ov.get("role") or "")).strip() or ROLE
+
+
+def effective_conduct(overrides: dict | None = None) -> str:
+    ov = overrides if overrides is not None else load_identity()
+    return (str(ov.get("conduct") or "")).strip() or CONDUCT
+
+
 def _render_catalog(registry: dict) -> str:
     if not registry:
         return "No tools are available in this preset. Answer in prose."
@@ -46,7 +85,12 @@ def _render_catalog(registry: dict) -> str:
 
 
 def build_system(preset_name: str, focus: str, registry: dict) -> str:
-    blocks = [ROLE, CONDUCT]
+    ov = load_identity()
+    blocks = [effective_role(ov), effective_conduct(ov)]
+    instr = [str(x).strip() for x in (ov.get("instructions") or []) if str(x).strip()]
+    if instr:
+        blocks.append("Standing instructions (set by the operator or by SYGNIF itself):\n"
+                      + "\n".join(f"- {x}" for x in instr))
     if focus:
         blocks.append(f"This session's focus (preset '{preset_name}'):\n{focus}")
     blocks.append(PROTOCOL)
