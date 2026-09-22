@@ -61,7 +61,11 @@ OFFENSIVE_TOOLS = {"recon", "nuclei", "wpscan", "dast", "metasploit", "msf", "br
                    "portscan", "netenum", "takeover", "tls_check", "exploit", "c2", "ad", "aitm", "velociraptor",
                    "coerce", "bloodyad", "winrm", "cloudx", "kube", "emulate", "arp"}
 CLAUDE_BIN = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
-CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "300"))
+# 600s, not 300: a pentest turn that digests a large scan result (a gated tool can
+# block for up to OFFENSIVE_TIMEOUT=1800s) needs a model-generation window wider than
+# the old 5 min, or the turn aborts mid-task and orphans the scan. Raise further with
+# SYGNIF_PY_CLAUDE_TIMEOUT for very heavy work.
+CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "600"))
 
 # First-run onboarding: a marker gates a one-time setup (Claude login + a pentest
 # workspace). SYGNIF_PY_FIRSTRUN=0 skips it; delete the marker to run it again.
@@ -724,6 +728,25 @@ def _scope_briefing(reg: dict) -> str:
         lines.append("- No authorization is recorded yet. Before touching any target, "
                      "fill in SCOPE.md or ask the operator, then use that attestation. "
                      "Never invent authorization.")
+    lines += [
+        "",
+        "Container networking (why a tool may say 'connection refused'):",
+        "- The gated tools run INSIDE the sygnif-kali container. Its `127.0.0.1` / "
+        "`localhost` is the CONTAINER's own loopback, NOT this host. A target on the "
+        "host loopback (e.g. http://127.0.0.1:PORT) is unreachable from those tools and "
+        "returns 'connection refused' — that means wrong address, NOT that the tool is "
+        "broken or 'not callable'.",
+        "- To reach a host-loopback target from a container tool, use its Docker bridge "
+        "IP (for a target that is itself a container, `docker inspect -f "
+        "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <name>`; for a host "
+        "service, the docker0 gateway or `host.docker.internal`), not 127.0.0.1. The "
+        "`shell` tool runs on the host, so it CAN use 127.0.0.1 — but that is a fallback, "
+        "not a reason to abandon the container tool.",
+        "- `web(url=...)` fetches a page and works from this host; `web(query=...)` web "
+        "search may be bot-blocked here. If a search returns a bot-challenge, fetch a "
+        "specific URL with `web(url=...)` instead rather than concluding `web` is "
+        "unavailable.",
+    ]
     return "\n".join(lines)
 
 
