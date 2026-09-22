@@ -1,380 +1,151 @@
 # SYGNIF py
 
-A tiny, dependency-free **SYGNIF seat** in Python — the generic cousin of SYGNIF pi.
-It's an agent loop over **any OpenAI-compatible chat endpoint**: the model calls
-tools by emitting a fenced `` ```tool `` block, the seat runs the tool on your
-machine and feeds the result back, and it loops until the model answers.
+A tiny, dependency-free **agent seat** in Python: a loop over any
+OpenAI-compatible chat endpoint. The model calls tools by emitting a fenced
+`` ```tool `` block, the seat runs the tool on your machine and feeds the result
+back, and it loops until the model answers. Standard library only, Python 3.8+.
 
-No private models are baked in. Out of the box the default model is **Claude
-Fable 5.1** on your own **Claude Pro/Max subscription** (via the official `claude`
-CLI): the first time you run `sygnif`, it walks you through login and sets up a
-pentest workspace. Prefer no login? Switch to a **free public OpenRouter model**
-with `/model openrouter-free`, or add any other OpenAI-compatible endpoint.
+Default model is **Claude Fable 5.1** on your own Claude Pro/Max subscription (via
+the official `claude` CLI). No login? Use a free OpenRouter model, or point it at
+any endpoint that speaks `/v1/chat/completions` — OpenAI, Ollama, LM Studio,
+`llama.cpp --server`.
 
 ## Install
 
-**Linux / macOS**
-
 ```sh
+# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/Giansn/sygnif-py/main/dist/install.sh | sh
-```
-
-**Windows (PowerShell)**
-
-```powershell
+# Windows (PowerShell)
 irm https://raw.githubusercontent.com/Giansn/sygnif-py/main/dist/install.ps1 | iex
 ```
 
-(Or host the four files in `dist/` yourself — any static host works — and set
-`SYGNIF_PY_BASE_URL` before piping the installer.)
-
 ## First run — just type `sygnif`
 
-The default model is **Claude Fable 5.1** on your Claude Pro/Max subscription. The
-first launch is fully guided — you don't need to install anything by hand first:
+The first launch is guided (one-time, gated by `~/.sygnif/.sygnif-py-initialized`):
+it offers to install prerequisites it can't bundle (`claude` CLI, `tmux`), runs
+`claude setup-token` so Fable bills to your plan, creates `~/sygnif-pentest/` with
+a `SCOPE.md` authorization reminder, reports which pentest tools are present and
+offers to install the missing ones, then drops you into the **pentest** preset.
+Turn the pieces off with `SYGNIF_PY_BOOTSTRAP=0`, `SYGNIF_PY_INSTALL_TOOLS=0`,
+`SYGNIF_PY_FIRSTRUN=0`.
 
 ```sh
-sygnif                       # first run: installs prerequisites, logs you in, preps a workspace
+sygnif                       # REPL, default preset
+sygnif --preset chat|dev|ops # chat-only · build→prove · host state via Centre
+sygnif "list my home dir"    # one-shot
+sygnif --confirm             # approve each shell / write / offensive call
+/model openrouter-free       # then: export OPENROUTER_API_KEY=sk-or-...
 ```
 
-That one-time onboarding:
-
-0. **installs the prerequisites the package can't bundle** — the `claude` CLI
-   (via `npm`, or the official installer, offering to add Node.js if needed) and
-   `tmux` (for the `nexus` portal board) — each opt-in and only if missing. Turn
-   this off with `SYGNIF_PY_BOOTSTRAP=0`;
-1. runs `claude setup-token` so Fable 5.1 bills to your Pro/Max plan (not the
-   pay-per-use API) — you can skip and run `sygnif login` later;
-2. creates `~/sygnif-pentest/` with a `SCOPE.md` authorization reminder;
-3. reports which common pentest tools (`nmap`, `curl`, `dig`, …) are on your box,
-   and **offers to install the ones you're missing** (`nikto`, `gobuster`, `sqlmap`,
-   `hydra`, `dnsutils`, …) via your package manager — `apt`/`brew`/`dnf`/`pacman`,
-   skippable, needs `sudo`. Set `SYGNIF_PY_INSTALL_TOOLS=0` to turn this off;
-4. drops you into the **pentest** preset, ready for your first authorized target.
-
-It runs only once (gated by `~/.sygnif/.sygnif-py-initialized`; set
-`SYGNIF_PY_FIRSTRUN=0` to skip it entirely, or delete the marker to run it again).
-
-**Prefer a free model with no login?** In the seat, switch anytime:
-
-```sh
-/model openrouter-free       # then: export OPENROUTER_API_KEY=sk-or-...  (free key)
-```
-
-Free OpenRouter slugs rotate; if it 404s, pick a current one from
-<https://openrouter.ai/models?max_price=0> and set its `id` in your config.
-
-Both need **Python 3.8+** on PATH and nothing else — the seat uses only the
-standard library. The installer unpacks to `~/.sygnif-py` and puts a `sygnif`
-launcher on your PATH.
-
-Run it:
-
-```sh
-sygnif                      # REPL on the default preset
-sygnif --preset chat        # chat-only preset (no shell/file tools)
-sygnif --preset dev         # development mode (build -> prove loop)
-sygnif --preset ops         # ops mode (host state via the Centre)
-sygnif "list my home dir"   # one-shot
-sygnif --confirm            # ask before every shell / write_file / dev step
-```
-
-The install also puts two companion services on your PATH:
-
-```sh
-sygnif-centre               # the knot point — host state, notes, knowledge
-sygnif-commander            # the hands — sandboxed, allowlisted fs/exec
-```
+REPL: `/preset` `/model` `/models` `/tools` `/reset` `/help` `/quit`. Over a TTY
+it renders the **pix UI** (streamed reply, per-turn rule, a status line with model
+/ context / throughput, clean `→ tool(args)` lines). `SYGNIF_PY_PIX=0` for plain.
 
 ## The three pieces
 
-SYGNIF py ships the generic core of the SYGNIF architecture — a **seat**, a
-**Centre**, and a **commander** — each self-contained and usable on its own.
+Each is self-contained and usable alone.
 
-### Seat (`sygnif`)
-The agent loop. Talks to any OpenAI-compatible model, calls tools, loops until it
-answers. This is what you run day to day.
+- **Seat (`sygnif`)** — the agent loop you run day to day.
+- **Centre (`sygnif-centre`, `:9100`)** — one HTTP endpoint fronting **neurons**:
+  `sys.state`, `sys.procs`, `note.*`, `knowledge.*`, and (for pentest)
+  `pentest.hosts`. Extend it with `~/.sygnif/centre-neurons.py` defining
+  `register(NEURONS)`. Loopback unless given `SYGNIF_PY_CENTRE_TOKEN`.
+- **Commander (`sygnif-commander`, `:9110`)** — sandboxed, allowlisted fs/exec
+  over JSON-RPC. Default-deny on both path and command; fails closed without a
+  bearer token (minted on first run into `~/.sygnif/sygnif-py-commander.env`).
 
-Over a terminal it renders the **pix UI**: the model's reply streams token by
-token, each turn opens with a `── turn N · HH:MM:SS ──` rule, and a dim status
-line under the `❯` prompt shows where you stand —
-`Σ <model> · ctx <used>/<window> <pct>% · ~<tps> tps · <n> turns`
-(context occupancy and throughput come from the endpoint's own usage report when
-it sends one, else a char estimate). Tool calls show as clean `→ tool(args)` /
-`← result` lines instead of raw JSON. It's on automatically when stdout is a TTY;
-a pipe gets plain text with no escape codes. Turn it off with `SYGNIF_PY_PIX=0`,
-and colour follows `NO_COLOR`.
+## Models — bring your own, and it stays chosen
 
-REPL commands: `/preset` `/model` `/models` `/tools` `/reset` `/help` `/quit`.
-
-### Centre (`sygnif-centre`) — the knot point
-One local HTTP endpoint (`:9100`) fronting a registry of **neurons** — small
-capabilities behind a single dispatch. Ships generic, read-mostly neurons:
-
-| neuron | what it returns |
-|---|---|
-| `sys.state` | host snapshot: os, uptime, load, memory, disk, listening ports, running user services |
-| `sys.procs` | processes, heaviest by memory first |
-| `note.write` / `note.read` | the working journal |
-| `knowledge.search` / `knowledge.read` | grep/read your local notes dir (`~/.sygnif/knowledge`) |
-
-Grow it: drop a `~/.sygnif/centre-neurons.py` defining `register(NEURONS)` and add
-your own neurons. The seat reaches a running Centre with the **`centre`** tool
-(used by the `ops` preset). Default bind is loopback; binding a non-loopback
-address without `SYGNIF_PY_CENTRE_TOKEN` is refused.
-
-### Commander (`sygnif-commander`) — the hands
-A JSON-RPC HTTP endpoint (`:9110`) for **sandboxed, allowlisted** work on a host:
-`fs_read`/`fs_write`/`fs_list`, `code_search`, and `proc_exec` (named commands
-only — no raw shell). Two gates, both default-deny: every path must sit under an
-allowed root, and exec only runs commands you've named. It **fails closed**: no
-bearer token, no start. The launcher mints and persists a token on first run
-(`~/.sygnif/sygnif-py-commander.env`); `source` it before `sygnif` and the seat's
-**`commander`** tool can drive it.
-
-### Development (`--preset dev`)
-Development is a mode of the seat, not a separate service. The `dev` preset adds
-the **`dev_apply_and_test`** tool: it writes your file(s) and runs a check/build
-command in one step, reporting PASS/FAIL — so a change is never "done" until its
-test actually ran. Work small, prove each step.
-
-### Web & WordPress security (`--preset webdev`)
-For a developer testing their **own** sites, hosting and WordPress (record the
-authorization in `SCOPE.md` first). It's a web-focused slice of the pentest
-toolset — drive `wpscan`, `nuclei`, `nikto`, `sqlmap`, `whatweb`, `wafw00f`,
-`ffuf`/`feroxbuster`, `httpx`, `sslscan`/`testssl.sh`, `subfinder`/`amass` through
-the `shell`/`kali` tools, and read the concrete checklists with the playbook:
-
-```
-/preset webdev
-playbook section=webapp     # own web app: content discovery, headers, cookies, injection
-playbook section=wpsec      # WordPress: wpscan enumerate, xmlrpc, REST user enum, hardening
-playbook section=hosting    # server: exposed ports, TLS, SPF/DKIM/DMARC, subdomain takeover
-```
-
-Install the lighter web toolset (instead of the multi-GB full kill-chain):
-
-```sh
-SYGNIF_PY_KALI_METAPACKAGE=kali-tools-web sygnif kali-setup
-```
-
-`wpscan`'s CVE data needs a free [WPScan API token](https://wpscan.com/api) —
-pass it with `--api-token <TOK>`. Same rule as always: only your own targets,
-and every finding backed by a reproducible request/response.
-
-### Full engagement (`--preset redteam`)
-For an authorized red-team engagement. Structured, **auth-gated** wrappers around the
-standard full-power tools — `recon`, `nuclei`, `wpscan`, `msf` (Metasploit),
-`exploit_search` (searchsploit), `bruteforce` (hydra), `crack` (hashcat/john),
-`postexploit` (linpeas, local enum only), `wifi_capture`/`wifi_crack` (hcxdumptool +
-hashcat), and `c2` (Sliver — authorized adversary emulation, standard
-framework only). **Every offensive tool refuses without a `target` and an `authorization`
-attestation**, and is confined to `~/sygnif-pentest/SCOPE.md` when it lists targets.
-No mass targeting, no persistence, no evasion — authorized scope only. Read
-`playbook section=redteam` for the tool map, and install the tools with
-`sygnif kali-setup` (or run inside the `sygnif-kali` container).
-
-## Desk — chat + workflows in your browser
-
-`sygnif-desk` starts a small web dashboard so you can use the same models from a
-browser instead of the terminal:
-
-```sh
-sygnif-desk                     # serves http://127.0.0.1:8899
-```
-
-Open <http://127.0.0.1:8899>. It's **the same zero-dependency deal** as the rest
-of SYGNIF py — pure Python standard library, no pip install, no venv, no build
-step. It gives you:
-
-* **Chat** over any model in your config (the provider picker lists them). Replies
-  keep generating server-side even if you close the tab, then reattach when you
-  return.
-* **Workflows** — save and re-run multi-step prompts.
-* State is stored as plain JSON files under `~/.sygnif/desk`.
-
-Knobs (all optional):
-
-| env var | default | what it does |
+| model | what | to use |
 |---|---|---|
-| `SYGNIF_DESK_PORT` | `8899` | port to serve on |
-| `SYGNIF_DESK_HOST` | `127.0.0.1` | bind address — keep it loopback unless you know what you're doing |
-| `SYGNIF_DESK_EXEC` | *off* | set to `1` to let the model run shell commands on this machine from the Desk (off by default) |
-| `OPENROUTER_API_KEY` | — | your free OpenRouter key for the default provider |
+| `fable` *(default)* | Claude Fable 5.1 on your Pro/Max plan via the `claude` CLI | first run, or `sygnif login` |
+| `claude` | any other model on your subscription | `sygnif login` |
+| `openrouter-free` | a free public OpenRouter slug | `/model openrouter-free` + key |
+| `inkling` | ThinkingMachines Inkling 256k on a local bridge | run the bridge |
 
-> **Safety:** the Desk binds to loopback (`127.0.0.1`) so only your own machine
-> can reach it, and it will **not** run shell commands unless you explicitly set
-> `SYGNIF_DESK_EXEC=1`. Don't expose it to a public address.
+Each model carries its own `base_url` and `api_key_env`, so **choosing a model
+chooses its provider**. Model selection is strict: the model you pick is the model
+that answers. A misspelled or unconfigured name is **refused**, never silently
+swapped for another; `/model <bad>` keeps your current model, a bad `--model`
+exits. There is **no automatic model or provider switching** at runtime.
 
-## Nexus — labeled portals for your agent sessions
+Add your own in `~/.sygnif/sygnif-py.json` (merged over the shipped config, so
+upgrades don't clobber it). API keys live in env vars named by `api_key_env`,
+never in the file. Switch live with `/model <key>`, list with `/models`.
 
-A **portal** is a persistent, individually-attachable tmux session named
-`<type>-<label>` (e.g. `sygnif-thesis`, `claude-recon`), so you can run many of
-the same agent side by side and tell them apart. Detach and it keeps running;
-SSH back in tomorrow and drop straight into it.
+## Pentest — authorized engagements only
 
-Two front ends, one launch table: the `nexus` command in your terminal, and a web
-board in the browser. Install tmux first (`apt/dnf/pkg/brew install tmux`; on
-Windows run inside WSL) — portals *are* tmux sessions.
+Structured, **auth-gated** wrappers around the standard tools: `recon`, `nuclei`,
+`wpscan`, `msf`, `exploit_search`, `bruteforce`, `crack`, `postexploit`,
+`privesc`, `portscan`, `netenum`, `dast`, `wifi_capture`/`wifi_crack`, `c2`
+(standard framework, adversary emulation). Every offensive tool refuses without a
+`target` and an `authorization` attestation. No mass targeting, no persistence,
+no evasion.
 
-### From the terminal — `nexus`
+**Guard rails (default-on):**
 
-```sh
-nexus                          # picker: table of live portals, choose one
-nexus claude thesis            # attach-or-create the claude-thesis portal
-nexus new                      # interactive: pick a type, give it a label
-nexus ls                       # list live portals
-nexus types                    # what this machine can spawn, and from where
-nexus hub                      # 3-pane command center (list + preview + activity)
-nexus -h                       # full help
-```
+- **Scope** — when `~/sygnif-pentest/SCOPE.md` lists targets, a run must match an
+  exact host, a subdomain of one, or an **IP inside a listed CIDR**.
+- **Blast radius** — a `SCOPE.md`-adjacent `STOP` file is a kill-switch that halts
+  every offensive tool; wildcards and over-broad CIDRs (> 256 hosts) are refused
+  unless you pass `allow_range`; a rate limit caps runaway loops (40 calls / 60s).
+- **`--confirm`** gates the offensive tools too, not just shell and file writes.
+- **Findings** need real evidence; **high/critical** need a second, independent
+  observation (`verify`) or they're refused — no single-source criticals.
+- **Audit** — every offensive command appends to `audit.jsonl` (UTC, target,
+  authorized-by, cmd, exit).
+- **Inventory** — recon/portscan/netenum auto-fill `hosts.jsonl` (host/port/
+  service); query it with the `inventory` tool or the `pentest.hosts` neuron.
+- **Report** — `report` renders `report.md` + `report.html` (severity-graded),
+  plus PDF if weasyprint/pandoc is present.
 
-Fresh spawns ask **where to start** with a visual directory chooser: `Enter` takes
-the current dir, `a`..`z` drill into a subdir, `1`..`9` jump to a recent one, `..`
-goes up, `+name` creates one. Non-TTY callers skip it and take `~`, so scripts
-never hang on a prompt nobody can answer.
+Authenticated web scans: pass `cookie`, `bearer`, or `headers` to `nuclei` /
+`wpscan` to reach behind a login. `webdev` preset is the web-focused slice for
+testing your **own** sites; `redteam` is the full engagement set. Install tools
+with `sygnif kali-setup` (or a lighter `SYGNIF_PY_KALI_METAPACKAGE=kali-tools-web
+sygnif kali-setup`), or run inside the `sygnif-kali` container. Read the concrete
+checklists with `playbook section=<webapp|wpsec|hosting|redteam>`.
 
-Scripting and automation (no TTY required):
+## Desk & Nexus
 
-```sh
-nexus spawn claude recon ~/work      # create WITHOUT attaching
-nexus prime claude recon "read the scope file first"
-                                    # create, then type a first prompt into it
-nexus send claude-recon "status?"    # type text into a live portal
-nexus preview claude-recon 40        # print its screen
-nexus rename claude-recon audit      # relabel (keeps attached clients)
-nexus kill claude-audit              # refuses if attached; -f overrides
-nexus resume                         # reopen a past conversation as a portal
-```
+- **`sygnif-desk`** (`:8899`) — browser chat + saved workflows over your models.
+  Generation continues server-side if you close the tab. Loopback only;
+  `SYGNIF_DESK_EXEC=1` to allow shell from the Desk (off by default).
+- **`nexus`** / **`sygnif-nexus`** (`:8910`) — labelled tmux **portals**
+  (`<type>-<label>`) for running many agent sessions side by side, detachable and
+  resumable. `nexus` (picker), `nexus <type> <label>` (attach-or-create),
+  `nexus spawn|send|preview|rename|kill|resume`. Types are discovered (installed
+  agent CLIs) or declared in config. Both front ends refuse to kill an attached
+  portal without `-f`. Needs `tmux`.
 
-`nexus resume` needs to know how to list and reopen a type's past conversations,
-so it is data rather than code — it ships knowing `claude`, and you can teach it
-any agent:
+Both bind loopback; tunnel with `ssh -N -L <port>:127.0.0.1:<port> <host>` rather
+than exposing them.
 
-```json
-{"nexus": {"resume": {"myagent": {"sessions": "~/.myagent/**/*.jsonl",
-                                  "cmd": "myagent --resume {id}"}}}}
-```
+## Tools & extension
 
-### From the browser — `sygnif-nexus`
-
-```sh
-sygnif-nexus                   # serves http://127.0.0.1:8910
-```
-
-Pick a type, give the portal a label, hit **spawn** — a detached session starts
-with that agent already running. Attaching stays a terminal action: cards hand you
-`nexus <name>` to run. Working on a remote box? Don't expose the port, tunnel to
-it: `ssh -N -L 8910:127.0.0.1:8910 <host>`, then open `http://localhost:8910`.
-
-### From inside the seat — `/nexus`
-
-```
-/nexus                    list live portals
-/nexus claude thesis      open one
-/nexus kill claude-thesis close one
-```
-
-### Portal types are discovered, not hardcoded
-
-`sygnif` (the seat itself), `shell` (your login shell), and any known agent CLI
-actually installed — `claude`, `grok`, `codex`, `opencode`, `aider`, `cline`,
-`gemini`, `qwen`, `devin`, `cursor-agent`, `goose`. Declare your own, which always
-wins, in `config.json` or `~/.sygnif/sygnif-py.json`:
-
-```json
-{"nexus": {"types": {"aider": "aider --model sonnet", "ipython": "ipython3"}}}
-```
-
-...or for one run, via env: `SYGNIF_NEXUS_TYPES="aider=aider,ipython=ipython"`.
-
-Knobs (all optional):
-
-| env var | default | what it does |
-|---|---|---|
-| `SYGNIF_NEXUS_PORT` | `8910` | port the web board serves on |
-| `SYGNIF_NEXUS_BIND` | `127.0.0.1` | bind address — keep it loopback |
-| `SYGNIF_NEXUS_TYPES` | — | extra portal types, `name=command,name2=command2` |
-| `SYGNIF_NEXUS_STATE` | `~/.sygnif` | where recent dirs / hub state are kept |
-| `NEXUS_HUB_ACTIVITY_CMD` | — | what the hub's activity pane tails |
-
-> **Safety:** the web board binds to loopback only, and **both** front ends refuse
-> to kill a portal someone is attached to — that session may be a live console,
-> and killing it cuts the person off mid-sentence. Pass `-f` (or `{"force": true}`)
-> when you really mean it. Both planes call the same functions, so the terminal and
-> the page cannot drift into disagreeing about what a portal is or who may close
-> one. Zero dependencies: pure Python standard library, plus tmux.
-
-## Models — bring your own
-
-Four models ship listed:
-
-| model | what it is | to use |
-|---|---|---|
-| `fable` *(default)* | **Claude Fable 5.1** on your Claude Pro/Max subscription via the official `claude` CLI | first run of `sygnif`, or `sygnif login` (needs the claude CLI) |
-| `claude` | any other model on your subscription (`sonnet`/`opus`/`haiku`/full id) | `sygnif login` (needs the claude CLI) |
-| `openrouter-free` | a free public OpenRouter slug — no login, just a free key | `/model openrouter-free` + `export OPENROUTER_API_KEY=...` |
-| `inkling` | ThinkingMachines Inkling 256k on a local bridge (`:9223`) | run the bridge yourself |
-
-Beyond those the seat is model-agnostic — anything that speaks
-`/v1/chat/completions` works: OpenAI, OpenRouter (paid), a local **Ollama** or
-**LM Studio**, `llama.cpp --server`, etc. The `claude` model is special: it has
-`"provider": "claude-cli"` and shells out to the `claude` CLI (no OAuth secrets in
-config; usage bills to your subscription).
-
-Edit `config.json` (in the install dir) or, better, create `~/.sygnif/sygnif-py.json`
-with the same shape — it's merged over the shipped config, so upgrades won't
-clobber it:
-
-```json
-{
-  "models": {
-    "local": { "id": "llama3.1", "base_url": "http://127.0.0.1:11434/v1", "api_key_env": null, "context": 32768, "max_tokens": 4096 },
-    "gpt":   { "id": "gpt-4o-mini", "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY", "context": 128000, "max_tokens": 4096 }
-  },
-  "default_preset": "assistant",
-  "presets": {
-    "assistant": { "model": "local", "tools": ["shell", "read_file", "write_file", "note"], "focus": "..." }
-  }
-}
-```
-
-**API keys are never stored in the config** — `api_key_env` is the *name* of an
-environment variable the seat reads at runtime (e.g. `export OPENAI_API_KEY=...`).
-
-Switch models live in the REPL with `/model <key>`, list them with `/models`.
-
-## Tools
-
-Built in: `shell` (run a command here), `read_file`, `write_file`, `note` (append
-to a journal), `dev_apply_and_test` (write + prove), `centre` (ask a running
-Centre for a neuron), `commander` (drive a running commander). A preset chooses
-which tools are active.
-
-Add your own tools without touching the core: copy `custom_tools.py.example` to
-`custom_tools.py` (or `~/.sygnif/sygnif-py-tools.py`), define `register(reg)`, and
-drop entries into the registry.
+Built-in: `shell`, `read_file`, `write_file`, `note`, `dev_apply_and_test`,
+`centre`, `commander`, plus the pentest set above. A preset picks which are active.
+Add your own without touching the core: copy `custom_tools.py.example` to
+`custom_tools.py` (or `~/.sygnif/sygnif-py-tools.py`), define `register(reg)`.
 
 ## Layout
 
 ```
-seat.py            agent loop + REPL + OpenAI-compatible transport
-tools.py           built-in tools + plugin loader
-models.py          model/preset registry (config.json + ~/.sygnif/sygnif-py.json)
-identity.py        system prompt + tool protocol + live tool catalog
-config.json        the shipped registry (fable/Fable 5.1 default + claude + openrouter-free + inkling + presets + BYO examples)
-centre.py          the Centre — neuron registry + HTTP endpoint (the knot point)
-commander.py       the commander — sandboxed fs/exec JSON-RPC server (the hands)
-sygnif.sh/.ps1             seat launchers (Linux/macOS · Windows)
-sygnif-centre.sh/.ps1      Centre launchers
-sygnif-commander.sh/.ps1   commander launchers (mint a bearer token)
-install.sh    curl|sh installer          install.ps1  irm|iex installer
+seat.py        agent loop + REPL + OpenAI-compatible transport
+tools.py       built-in + pentest tools, scope/authz/blast guards, plugin loader
+models.py      model/preset registry (strict resolution)
+identity.py    system prompt + tool protocol + live catalog
+centre.py      Centre: neuron registry + HTTP endpoint    centre_neurons.py  drop-in neurons
+commander.py   sandboxed fs/exec JSON-RPC server
+desk.py        browser chat/workflows      nexus.py  portal board
+config.json    shipped models + presets    install.sh / install.ps1  installers
 ```
 
 ## Safety
 
-The seat has real hands on your machine (`shell`, `write_file`, `dev_apply_and_test`).
-Run `--confirm` (or set `SYGNIF_PY_CONFIRM=1`) to approve each such call. The `chat`
-preset has no system access at all. The **commander** is default-deny (path +
-command allowlists) and fails closed without a token; the **Centre** is loopback-only
-unless you give it a token.
+The seat has real hands on your machine (`shell`, `write_file`,
+`dev_apply_and_test`, and the offensive tools). Run `--confirm` (or
+`SYGNIF_PY_CONFIRM=1`) to approve each. The `chat` preset has no system access.
+Commander is default-deny and fails closed; Centre is loopback-only without a
+token. Offensive tooling is for **authorized** testing — certified, written
+authorization, scope confined to `SCOPE.md`, no mass or critical-infra targets.
