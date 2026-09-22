@@ -491,6 +491,28 @@ Test an API you own / are authorized to test. Use the `api_scan` tool + the kit.
   a request in Burp/ZAP with a different id or role and compare. Scanners won't find these.
 Every confirmed issue -> `finding` with the request/response pair as evidence.
 
+## android — role mode: mobile-app testing on your own rooted device
+Set up a rooted Android test device (yours / a lab device) to test mobile apps you own or
+are engaged to test. Two full guides in the docs; this is the map.
+- Emulator first (disposable, resets clean): `~/sygnif/docs/android-avd-root-intercept.md`.
+  Google APIs image (rootable, not a Play image), root with rootAVD (Magisk into the
+  ramdisk), CA into the SYSTEM store, Burp via `10.0.2.2:8080`, tcpdump/androiddump capture.
+- Physical device (when an app rejects the emulator): `~/sygnif/docs/android-physical-root-
+  setup.md`. Bootloader unlock (wipes the device), patch the boot image with Magisk (not
+  /system — systemless, so a stock boot.img reverses it), Zygisk DenyList + Play-Integrity-
+  Fix to hide root. Confirm the model is unlockable BEFORE starting; STRONG hardware
+  attestation is not defeatable on an unlocked device — say so.
+- Tool inventory (all public, none installed by rooting): adb + fastboot (platform-tools),
+  Magisk (systemless root), Frida + objection (runtime hooks — the pinning-bypass tools),
+  apktool + jadx (static review / repackage), scrcpy (screen), tcpdump (capture).
+- Interception, once rooted: CA in the SYSTEM store (Magisk cert module is the clean way);
+  proxy the device Wi-Fi at Burp on the host LAN IP:8080; defeat pinning at runtime with
+  `objection -g <pkg> explore` -> `android sslpinning disable` or a Frida script.
+- No-root alternative for one app: `apktool d`, add a user-CA network-security-config,
+  `apktool b`, re-sign, install. Lower impact when the app has no signature integrity check.
+- Authorization: rooting the operator's OWN hardware is admin work; testing an app is gated
+  by SCOPE.md like any target. Root a device you don't own only with written authorization.
+
 ## engagement — orchestrated engagement playbooks (tool chains)
 The seat IS the orchestrator: it chains tools, carries state (inventory / findings /
 audit), and picks the next step. Set the phase with `phase set=<recon..report>` so

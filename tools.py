@@ -84,7 +84,10 @@ def _run_host(command: str, timeout: int) -> tuple[str, int]:
 def tool_shell(args: dict) -> str:
     command = str(args.get("command", "")).strip()
     if not command:
-        return "shell: empty command"
+        return ("shell: ERROR — no 'command' was given, so NOTHING ran and you have\n"
+                "observed NOTHING about this machine. Reissue the call with a real command\n"
+                "in the 'command' field. Do NOT answer from memory or prior knowledge — you\n"
+                "have not observed this system yet.")
     out, rc = _run_host(command, SHELL_TIMEOUT)
     return _truncate(out) + f"\nexit={rc}"
 
@@ -888,7 +891,7 @@ def tool_playbook(args: dict) -> str:
     if not blocks:
         return ("no section '" + section + "'. Sections: recon, enum, vuln, exploit, "
                 "postexploit, privesc, report, exploitdev, webapp, wpsec, dast, detect, hosting, redteam, network, passwords, cellular, runbook, chaining, nmap, nuclei, wpscan, ffuf, sqlmap, hydra, hashcat, metasploit, handshake, osint, scout, analyzer, exploiter, "
-                "reporter, engagement, external, adchain, cloudchain, purpleloop, irchain, attacks, arp, llmnr, kerberoast, asrep, relay, dcsync, esc1, passhash (omit for the whole thing).")
+                "reporter, android, engagement, external, adchain, cloudchain, purpleloop, irchain, attacks, arp, llmnr, kerberoast, asrep, relay, dcsync, esc1, passhash (omit for the whole thing).")
     return _truncate("\n".join(blocks))
 
 
@@ -902,7 +905,8 @@ def tool_purple(args: dict) -> str:
     import shlex
     command = str(args.get("command", "")).strip()
     if not command:
-        return "purple: empty command"
+        return ("purple: ERROR — no 'command' was given, so NOTHING ran and you have\n"
+                "observed NOTHING. Reissue with a real command; do NOT answer from memory.")
     # portable: purple container if present, else the offensive toolbox, else host
     box = _def_container()
     if box:
@@ -924,7 +928,8 @@ def tool_kali(args: dict) -> str:
     has the tools). Grounds every result in real output."""
     command = str(args.get("command", "")).strip()
     if not command:
-        return "kali: empty command"
+        return ("kali: ERROR — no 'command' was given, so NOTHING ran and you have\n"
+                "observed NOTHING. Reissue with a real command; do NOT answer from memory.")
     container = _toolbox_name(auto_create=True) or TOOLBOX_NAME
     have_docker = not _IS_WINDOWS and _run_host("command -v docker", 10)[1] == 0
     if have_docker:
@@ -4220,7 +4225,7 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": ("Return the offline pentest methodology shipped with the seat — the kill-chain "
                  "checklist and the role modes. section=<phase or role> for one part. Needs no "
                  "network; use it when the van has no signal."),
-        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|scout|analyzer|exploiter|reporter"},
+        "args": {"section": "optional: recon|enum|vuln|exploit|postexploit|report|webapp|wpsec|hosting|redteam|network|passwords|cellular|shodan|containers|cloud|crypto|website|api|android|scout|analyzer|exploiter|reporter"},
         "func": tool_playbook,
     },
 }
