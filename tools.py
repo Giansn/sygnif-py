@@ -3656,6 +3656,130 @@ def tool_triage(args: dict) -> str:
     return _def_report("triage(" + mode + ")", cmd, out or "(no output)", rc, where)
 
 
+def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 30):
+    import urllib.request, urllib.error
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.getcode(), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return 0, f"[error: {e}]"
+
+
+def tool_graphql(args: dict) -> str:
+    """GraphQL authorization probe. op=introspect (default) returns a COMPACT
+    schema summary (type/mutation counts + sensitive-looking field names, never the
+    full dump, so a big schema cannot blow the turn budget); op=query runs a given
+    'query' with an optional bearer 'token'. Built for field/resolver-level authz
+    testing: introspect once, then re-query sensitive fields with a low-priv token
+    and compare. Requires target (the /graphql endpoint URL) + authorization."""
+    target = str(args.get("target") or args.get("endpoint") or args.get("url") or "").strip()
+    gate = _authz(args, target)
+    if gate:
+        return gate
+    token = str(args.get("token") or "").strip()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    auth = args.get("authorization", "")
+    op = str(args.get("op") or ("query" if args.get("query") else "introspect")).strip().lower()
+    if op == "query":
+        q = str(args.get("query") or "").strip()
+        if not q:
+            return "REFUSED: op=query needs a 'query'."
+        code, body = _http_post_json(target, {"query": q, "variables": args.get("variables") or {}}, headers)
+        out = body if len(body) <= 4000 else body[:4000] + f"\n… (+{len(body)-4000} bytes truncated)"
+        return _off_report("graphql(query)", auth, f"POST {target} query={q[:120]}",
+                           f"HTTP {code}\n{out}", 0 if code else 1, "host:urllib", target)
+    q = ("query{__schema{queryType{name} mutationType{name} "
+         "types{name kind fields{name}}}}")
+    code, body = _http_post_json(target, {"query": q}, headers)
+    if not code:
+        return _off_report("graphql(introspect)", auth, f"POST {target}", body, 1, "host:urllib", target)
+    try:
+        sch = (json.loads(body).get("data") or {}).get("__schema") or {}
+        types = sch.get("types") or []
+        mn = (sch.get("mutationType") or {}).get("name")
+        muts, sens = [], []
+        for t in types:
+            fields = t.get("fields") or []
+            if t.get("name") == mn:
+                muts = [f.get("name") for f in fields]
+            for f in fields:
+                fn = (f.get("name") or "").lower()
+                if any(k in fn for k in ("token", "secret", "password", "privatekey", "email",
+                                          "private", "admin", "sshkey", "runner", "variable",
+                                          "credential", "accesstoken")):
+                    sens.append(f"{t.get('name')}.{f.get('name')}")
+        out = "\n".join([
+            f"introspection: {'ENABLED' if types else 'disabled/empty'} (token={'yes' if token else 'no'})",
+            f"queryType={(sch.get('queryType') or {}).get('name')} mutationType={mn} types={len(types)}",
+            f"mutations ({len(muts)}): " + ", ".join(muts[:80]),
+            f"sensitive-looking fields ({len(sens)}): " + ", ".join(sens[:80]),
+        ])
+    except Exception as e:  # noqa: BLE001
+        out = f"[parse error: {e}] first 1200 bytes:\n{body[:1200]}"
+    return _off_report("graphql(introspect)", auth, f"POST {target} introspection",
+                       f"HTTP {code}\n{out}", 0, "host:urllib", target)
+
+
+def tool_ssrf_catcher(args: dict) -> str:
+    """SSRF callback catcher. action=start stands up a loopback+docker-bridge HTTP
+    listener that logs every inbound request (method/path/headers/src) and returns a
+    callback URL to feed into SSRF sinks (containers reach the host at 172.17.0.1).
+    action=check greps the hit log (optional 'nonce' filter); action=stop kills it.
+    Your own listener, so not target-gated — the SSRF injection itself uses the
+    gated web/graphql/shell tools."""
+    import os
+    action = str(args.get("action") or "check").strip().lower()
+    port = int(args.get("port") or 9899)
+    sdir = os.path.expanduser("~/sygnif-pentest/ssrf")
+    os.makedirs(sdir, exist_ok=True)
+    logf, pidf, srv = os.path.join(sdir, "hits.log"), os.path.join(sdir, "catcher.pid"), os.path.join(sdir, "catcher.py")
+    if action == "start":
+        with open(srv, "w") as fh:
+            fh.write(
+                "import http.server,datetime,sys\n"
+                "L=sys.argv[1]\n"
+                "class H(http.server.BaseHTTPRequestHandler):\n"
+                "  def _log(s):\n"
+                "    open(L,'a').write(f'{datetime.datetime.now().isoformat()} {s.command} {s.path} from {s.client_address[0]} UA={s.headers.get(\"User-Agent\",\"\")}\\n')\n"
+                "  def do_GET(s): s._log(); s.send_response(200); s.end_headers(); s.wfile.write(b'ok')\n"
+                "  def do_POST(s): s._log(); s.send_response(200); s.end_headers(); s.wfile.write(b'ok')\n"
+                "  def log_message(s,*a): pass\n"
+                "http.server.HTTPServer(('0.0.0.0',int(sys.argv[2])),H).serve_forever()\n")
+        out, rc = _run_host(f"nohup python3 {shlex.quote(srv)} {shlex.quote(logf)} {port} "
+                            f">/dev/null 2>&1 & echo $!", 10)
+        pid = out.strip().splitlines()[-1] if out.strip() else "?"
+        open(pidf, "w").write(pid)
+        nonce = "sg" + os.urandom(4).hex()
+        return (f"[ssrf-catcher started pid={pid} port={port}]\n"
+                f"callback (from a container target): http://172.17.0.1:{port}/{nonce}\n"
+                f"callback (host loopback): http://127.0.0.1:{port}/{nonce}\n"
+                f"nonce={nonce} — put it in the path so you can tell hits apart. "
+                f"Then: ssrf_catcher(action=check, nonce={nonce}).")
+    if action == "stop":
+        try:
+            pid = open(pidf).read().strip()
+            _run_host(f"kill {int(pid)} 2>/dev/null", 5)
+            return f"[ssrf-catcher stopped pid={pid}]"
+        except Exception as e:  # noqa: BLE001
+            return f"[ssrf-catcher stop: {e}]"
+    nonce = str(args.get("nonce") or "").strip()
+    try:
+        lines = open(logf).read().splitlines()
+    except OSError:
+        return "[no hits yet — catcher not started or nothing called back]"
+    if nonce:
+        lines = [x for x in lines if nonce in x]
+    tail = lines[-40:]
+    return (f"[ssrf-catcher hits: {len(lines)}" + (f" matching {nonce}" if nonce else "") + "]\n"
+            + ("\n".join(tail) if tail else "(none)"))
+
+
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
         "desc": (
@@ -4015,6 +4139,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": "Grade a URL's security headers + cookie flags + CORS (keyless, single GET). Passive.",
         "args": {"url": "URL to check"},
         "func": tool_headers,
+    },
+    "graphql": {
+        "desc": "GraphQL authz probe on an authorized endpoint: op=introspect (compact schema summary + sensitive fields) or op=query (run a query with optional token). For field/resolver-level authorization testing. Requires target+authorization.",
+        "args": {"target": "the /graphql endpoint URL you are authorized to test", "authorization": "attestation", "op": "introspect (default) | query", "query": "GraphQL query string (op=query)", "token": "optional bearer token to test as a given user", "variables": "optional query variables object"},
+        "func": tool_graphql,
+    },
+    "ssrf_catcher": {
+        "desc": "SSRF callback listener: action=start (returns a callback URL for SSRF sinks; containers reach the host at 172.17.0.1), action=check (grep hits, optional nonce), action=stop. Your own listener; pair with the gated web/graphql tools to inject the callback.",
+        "args": {"action": "start | check | stop", "port": "listener port (default 9899)", "nonce": "filter hits by nonce (action=check)"},
+        "func": tool_ssrf_catcher,
     },
     "takeover": {
         "desc": "Subdomain-takeover check on an authorized domain (subfinder -> subjack/nuclei). Requires target+authorization.",

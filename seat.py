@@ -766,7 +766,7 @@ _GATED_TOOLS = {
     "netenum", "nuclei", "osint", "portscan", "postexploit", "privesc", "recon",
     "sast", "secrets_scan", "subenum", "takeover", "tls_check", "velociraptor",
     "vuln_check", "webshot", "wifi_capture", "wifi_crack", "winrm", "wpscan",
-    "wp_vulnscan",
+    "wp_vulnscan", "graphql",
 }
 
 
