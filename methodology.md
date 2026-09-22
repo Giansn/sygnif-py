@@ -38,6 +38,39 @@ with `report`. Only ever act inside the authorization recorded in SCOPE.md.
   authorized credential testing, evil-winrm/impacket for Windows/AD.
 - Capture the exact command and output as evidence for the finding.
 
+## exploitdev — binary exploit development (authoring, not just delivery)
+- When no public exploit or module exists and you must write one. This is the
+  authoring workflow; there is no dedicated seat tool — drive it by hand through
+  the `shell`/`kali` tool in the sygnif-kali container. Standards context: this is
+  the PTES/NIST SP 800-115 exploitation phase, and each primitive maps to a MITRE
+  ATT&CK technique (T1203 exploitation for client execution, T1068 for privesc).
+- Toolchain present in the container: pwntools (scripting); plain `gdb` loads pwndbg by
+  default, and the `gef` command launches the GEF frontend instead; ROPgadget + ropper
+  (gadgets), one_gadget (one-shot execve gadgets in libc), checksec (mitigations),
+  radare2, nasm, msfvenom (shellcode/payloads).
+- Always run pwntools in the seat's non-tty context with `PWNLIB_NOTERM=1` — without
+  a TERM it exits nonzero on import. Example: `PWNLIB_NOTERM=1 python3 exploit.py`.
+- Workflow, least-assumption first:
+  1. Triage the binary: `checksec <bin>` (NX, PIE, canary, RELRO). The mitigations
+     present decide the technique. gef in gdb also prints this with `checksec`.
+  2. Find the offset: `cyclic 200` into the crash input, read the faulting value,
+     `cyclic -l <value>` (or pwntools `cyclic_find`) for the exact offset to control
+     the return address.
+  3. Control the instruction pointer: overwrite the return address; confirm RIP/EIP
+     holds your value under the debugger before building anything further.
+  4. Defeat NX: no ret2shellcode with NX on — chain gadgets. Build ROP with pwntools
+     `ROP(elf)` (auto-resolves gadgets and calling convention) or hunt manually with
+     `ROPgadget --binary <bin>` / `ropper`. ret2libc or a one_gadget when libc is
+     reachable; ret2plt/ret2dlresolve when it is not.
+  5. Beat ASLR/PIE: leak an address first (a format string or a GOT read), rebase
+     the ELF/libc in pwntools with `elf.address = leak - offset`, then send the real
+     chain. No leak, no reliable exploit against PIE + full ASLR.
+  6. Deliver: pwntools `process()` locally, `remote(host, port)` against the
+     authorized target; `gdb.attach()` to debug the live tube.
+- Discipline: develop against a local copy of the exact target binary/libc, prove
+  the primitive in the debugger before firing remote, and keep the final script as
+  the finding's reproducible evidence. Scope and RoE apply exactly as for `exploit`.
+
 ## postexploit — only if the rules of engagement allow it
 - Scope check again: lateral movement, persistence and data access are often
   explicitly out of scope. If unsure, ask the operator before proceeding.
