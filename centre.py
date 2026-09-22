@@ -63,6 +63,21 @@ SEAT_DIR = os.path.dirname(os.path.abspath(__file__))
 KNOWLEDGE_DIR = Path(
     os.path.expanduser(os.environ.get("SYGNIF_PY_KNOWLEDGE", "~/.sygnif/knowledge"))
 )
+# Expertise shipped WITH sygnif-py (repo knowledge/), searched alongside the user's
+# own notes so every install has the bundled know-how (e.g. professional Tailscale
+# setup) out of the box.
+BUNDLED_KNOWLEDGE = Path(SEAT_DIR) / "knowledge"
+
+
+def _knowledge_dirs() -> list:
+    dirs = []
+    for d in (BUNDLED_KNOWLEDGE, KNOWLEDGE_DIR):
+        try:
+            if d.is_dir():
+                dirs.append(d)
+        except OSError:
+            pass
+    return dirs
 JOURNAL = Path(
     os.path.expanduser(os.environ.get("SYGNIF_PY_JOURNAL", "~/.sygnif/sygnif-py-journal.md"))
 )
@@ -224,42 +239,46 @@ def n_knowledge_search(args: dict) -> dict:
     if not query:
         return _err("knowledge.search: empty query")
     limit = int(args.get("limit", 30) or 30)
-    if not KNOWLEDGE_DIR.is_dir():
+    kdirs = _knowledge_dirs()
+    if not kdirs:
         return _ok(dir=str(KNOWLEDGE_DIR), count=0, hits=[],
                    note=f"no knowledge dir yet — create {KNOWLEDGE_DIR} and add notes")
     needle = query.lower()
     hits: list[dict] = []
-    for root, dirs, files in os.walk(KNOWLEDGE_DIR):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        for fn in files:
-            fp = Path(root) / fn
-            try:
-                if fp.stat().st_size > 2 * 2**20:
+    for kd in kdirs:
+        for root, dirs, files in os.walk(kd):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                fp = Path(root) / fn
+                try:
+                    if fp.stat().st_size > 2 * 2**20:
+                        continue
+                    for ln, line in enumerate(fp.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                        if needle in line.lower():
+                            hits.append({"path": str(fp), "line": ln, "text": line.strip()[:300]})
+                            if len(hits) >= limit:
+                                return _ok(dirs=[str(d) for d in kdirs], count=len(hits), hits=hits, truncated=True)
+                except (OSError, UnicodeDecodeError):
                     continue
-                for ln, line in enumerate(fp.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-                    if needle in line.lower():
-                        hits.append({"path": str(fp), "line": ln, "text": line.strip()[:300]})
-                        if len(hits) >= limit:
-                            return _ok(dir=str(KNOWLEDGE_DIR), count=len(hits), hits=hits, truncated=True)
-            except (OSError, UnicodeDecodeError):
-                continue
-    return _ok(dir=str(KNOWLEDGE_DIR), count=len(hits), hits=hits, truncated=False)
+    return _ok(dirs=[str(d) for d in kdirs], count=len(hits), hits=hits, truncated=False)
 
 
 def n_knowledge_read(args: dict) -> dict:
     rel = str(args.get("path", "")).strip()
     if not rel:
         return _err("knowledge.read: empty path")
-    target = (KNOWLEDGE_DIR / rel).expanduser()
-    try:
-        target = target.resolve()
-        base = KNOWLEDGE_DIR.resolve()
-    except Exception as e:  # noqa: BLE001
-        return _err(f"knowledge.read: {e}")
-    if not (str(target) == str(base) or str(target).startswith(str(base) + os.sep)):
-        return _err("knowledge.read: path escapes the knowledge directory")
-    if not target.is_file():
-        return _err(f"knowledge.read: not a file: {target}")
+    target = None
+    for kd in _knowledge_dirs():
+        try:
+            cand = (kd / rel).expanduser().resolve()
+            base = kd.resolve()
+        except Exception:  # noqa: BLE001
+            continue
+        if (str(cand) == str(base) or str(cand).startswith(str(base) + os.sep)) and cand.is_file():
+            target = cand
+            break
+    if target is None:
+        return _err(f"knowledge.read: not found in knowledge dirs: {rel}")
     try:
         content = target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:  # noqa: BLE001

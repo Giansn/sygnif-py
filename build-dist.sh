@@ -28,6 +28,7 @@ PKG=(
   sygnif-desk.sh sygnif-desk.ps1
   sygnif-nexus.sh sygnif-nexus.ps1
   nexus.sh nexus.ps1
+  knowledge/tailscale.md
   README.md custom_tools.py.example methodology.md VERSION
 )
 
