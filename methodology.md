@@ -9,6 +9,9 @@ with `report`. Only ever act inside the authorization recorded in SCOPE.md.
 - Confirm scope against SCOPE.md before touching anything. Out-of-scope = stop.
 - Passive first: whois, DNS (dnsrecon, dnsenum, amass, subfinder), certificate
   transparency, theHarvester for emails/hosts, whatweb for stacks.
+- `subenum {domain}` — passive subdomain union from crt.sh CT logs + HackerTarget
+  passive DNS (EONRaider/ReconLib). Public data only, no packets to the target; still
+  scope-gated. Fast first pass to widen the asset map before any active scan.
 - Active surface: nmap host discovery then service/version scan
   (`nmap -sV -sC -p- <target>`), masscan for wide ranges.
 - Goal: an asset map — live hosts, open ports, service versions. Record notable
@@ -499,6 +502,9 @@ The defensive mirror of adchain:
 triage collect (Velociraptor artifacts) -> detect ioc (LOKI/YARA) -> memforensics
 (Volatility3 on a dump) -> netmon pcap (Zeek+Suricata on the capture) -> intel (enrich
 the IOCs) -> finding -> report. triage live stands up a Velociraptor GUI for hunting.
+For a quick per-frame look before the heavier Zeek/Suricata pass, `sniff pcap file=<cap>`
+(or `sniff live interface=<if>`) decodes L2-L4 and flags checksum mismatches inline
+(spoofed/corrupt traffic) via RootWire — pure-Python, JSON output, no offensive gate.
 
 ## attacks — technique-level attack playbooks (index)
 Concrete, runnable attack runbooks (ARP-level detail): goal, exact commands, the

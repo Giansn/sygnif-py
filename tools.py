@@ -3002,6 +3002,56 @@ def tool_arp(args: dict) -> str:
     return _off_report(tag, args.get("authorization", ""), "arpspoof " + " ".join(opts) + " " + target, out, rc, where, target)
 
 
+def tool_subenum(args: dict) -> str:
+    """Passive subdomain / host enumeration via ReconLib (EONRaider/ReconLib, GPL —
+    invoked as a subprocess, not vendored, so its copyleft stays separate). Unions
+    subdomains from crt.sh Certificate Transparency logs and HackerTarget's passive
+    DNS. Reads only public data (no packets to the target), but still SCOPE-gated the
+    same as the other recon tools. Give domain (+ authorization)."""
+    domain = str(args.get("domain", "") or args.get("target", "")).strip()
+    g = _authz(args, domain)
+    if g:
+        return g
+    d = _bare_host(domain)
+    # resolve the provisioned runner; it imports reconlib in its OWN process (GPL firewall).
+    loc = ('R=/opt/reconlib_run.py; [ -s "$R" ] || { echo RECONLIB_MISSING; exit 127; }; ')
+    cmd = loc + "python3 \"$R\" " + shlex.quote(d) + " 2>&1 | head -300"
+    out, rc, where = _off_run(cmd, 300)
+    if "RECONLIB_MISSING" in out:
+        return ("subenum: EONRaider/ReconLib not provisioned — `sygnif kali-setup` installs it "
+                "and writes /opt/reconlib_run.py, or: pip install --break-system-packages reconlib")
+    return _off_report("subenum", args.get("authorization", ""), "reconlib subenum " + d, out, rc, where, d)
+
+
+def tool_sniff(args: dict) -> str:
+    """DEFENSIVE packet capture + layer-by-layer decode with RootWire (EONRaider/RootWire,
+    GPL — installed, not vendored): a pure-Python raw-socket sniffer that decodes Ethernet/
+    ARP/IPv4/IPv6/ICMP/TCP/UDP and verifies every checksum, flagging mismatches inline (a
+    real signal for spoofed/corrupt traffic). mode=pcap file=<path> (replay a capture, no
+    root) | live interface=<if> (bounded by seconds, needs root). Optional filter= (canned
+    arp|ip6|tcp|udp or a BPF-style expr). JSON output. Your own capture — no offensive gate."""
+    mode = str(args.get("mode", "pcap")).strip().lower()
+    filt = str(args.get("filter", "")).strip()
+    fopt = (" --filter " + shlex.quote(filt)) if filt else ""
+    if mode == "pcap":
+        f = str(args.get("file", "")).strip()
+        if not f:
+            return "sniff pcap: give a 'file' (a .pcap/.pcapng to replay). (filter= is live-only.)"
+        # rootwire: --filter is mutually exclusive with -r, so no fopt on replay.
+        cmd = "rootwire -r " + shlex.quote(f) + " --json 2>&1 | head -300"
+    elif mode == "live":
+        iface = str(args.get("interface", "")).strip()
+        if not iface:
+            return "sniff live: give an 'interface' you own (e.g. eth0). Captures briefly then reports."
+        dur = str(int(str(args.get("seconds", "20")) or 20))
+        cmd = ("timeout " + dur + " rootwire -i " + shlex.quote(iface) + " --json" + fopt
+               + " 2>&1 | head -300; echo '[sniff: capture window ended]'")
+    else:
+        return "sniff mode = pcap (file=, no root) | live (interface=, needs root). RootWire pure-Python decoder, JSON."
+    out, rc, where = _def_run(cmd, 600, need=("rootwire",))
+    return _def_report("sniff(" + mode + ")", "rootwire " + mode, out or "(no output)", rc, where)
+
+
 def tool_coerce(args: dict) -> str:
     """Authentication coercion + NTLM relay for an AUTHORIZED AD engagement (Coercer +
     Impacket ntlmrelayx): the no-creds coerce->relay->ADCS/DCSync chain. mode=coerce
@@ -3644,6 +3694,23 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "interface": "NIC (auto if omitted)", "gateway": "gateway IP (auto if omitted)",
                  "interval": "ARP send interval"},
         "func": tool_arp,
+    },
+    "subenum": {
+        "desc": ("Passive subdomain enumeration (EONRaider/ReconLib, GPL, shelled out): unions "
+                 "crt.sh Certificate Transparency + HackerTarget passive DNS. Public data only, "
+                 "no packets to the target, but SCOPE-gated. Needs domain + authorization."),
+        "args": {"domain": "root domain to enumerate (e.g. example.com)",
+                 "authorization": "attestation that the domain is in scope"},
+        "func": tool_subenum,
+    },
+    "sniff": {
+        "desc": ("DEFENSIVE packet capture + decode (EONRaider/RootWire, GPL): pure-Python raw-socket "
+                 "sniffer, decodes L2-L4 and verifies checksums. mode=pcap (file=, replay, no root) | "
+                 "live (interface=, needs root, bounded by seconds). filter= optional. JSON. No offensive gate."),
+        "args": {"mode": "pcap|live", "file": "pcap/pcapng path (pcap mode)",
+                 "interface": "NIC you own (live mode)", "seconds": "live capture duration (default 20)",
+                 "filter": "canned arp|ip6|tcp|udp or a BPF-style expr (optional)"},
+        "func": tool_sniff,
     },
     "coerce": {
         "desc": ("Auth coercion + NTLM relay for an authorized AD engagement (Coercer + "

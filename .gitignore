@@ -24,3 +24,6 @@ config.json.bak-*
 *.pre-*
 *.bak
 *.bak.*
+
+# session scratch backups (moved out of the working tree)
+backups/

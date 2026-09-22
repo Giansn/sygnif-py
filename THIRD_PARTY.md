@@ -10,6 +10,15 @@ source. `sygnif kali-setup` fetches them into the toolbox at install time.
   dependency, invoked as a subprocess; its code is NOT vendored into this repository, so
   AGPL's copyleft does not extend to SYGNIF py's own source.
 
+## GPL-3.0 — kept separate on purpose
+- **EONRaider/ReconLib** (https://github.com/EONRaider/ReconLib) — the `subenum` tool
+  runs `/opt/reconlib_run.py`, a small runner `sygnif kali-setup` writes that imports
+  reconlib in its OWN process. GPL-3.0. SYGNIF py never imports reconlib itself; it is a
+  runtime subprocess dependency, not vendored, so the copyleft stays separate.
+- **EONRaider/RootWire** (https://github.com/EONRaider/RootWire) — the `sniff` tool shells
+  out to the `rootwire` CLI installed by kali-setup. GPL-3.0. Invoked as a subprocess, not
+  vendored; the copyleft does not extend to SYGNIF py's own source.
+
 ## Other tools (invoked, not bundled)
 NetExec, Impacket, Certipy, bloodyAD, Coercer, evil-winrm, Pacu, ROADtools, AzureHound,
 kube-hunter, Atomic Red Team, Velociraptor, Zeek, Suricata, Volatility3, Falco, LOKI,
