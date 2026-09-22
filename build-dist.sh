@@ -29,7 +29,7 @@ PKG=(
   sygnif-nexus.sh sygnif-nexus.ps1
   nexus.sh nexus.ps1
   knowledge/tailscale.md
-  README.md custom_tools.py.example methodology.md VERSION
+  README.md THIRD_PARTY.md custom_tools.py.example methodology.md VERSION
 )
 
 for f in "${PKG[@]}"; do

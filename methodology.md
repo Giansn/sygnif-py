@@ -517,7 +517,7 @@ Prereq: on the same broadcast domain; note the target IP + gateway (arp -a).
 3. Capture/inspect: Wireshark/tshark on eth0, or bettercap's net.sniff. HTTPS is not
    plaintext — HSTS/cert pinning defeat sslstrip; value is unencrypted protocols, creds
    on legacy services, and traffic analysis.
-Tool: run via `kali` / `shell` (no dedicated wrapper). Detection: gratuitous ARP / a MAC
+Tool: `arp mode=mitm target=<victim> seconds=<n>` (native, zero-dep EONRaider spoofer, auto-detects gateway/MACs, restores on exit) — or bettercap/ettercap via `kali`/`shell`. `arp mode=disassociate` cuts the victim off (disruptive, in-scope single target). Detection: gratuitous ARP / a MAC
 mapping to two IPs — `netmon` (Zeek notice, Suricata ARP-spoof rules), arpwatch.
 Cleanup: stop the tool (ettercap re-ARPs on exit), `sysctl -w net.ipv4.ip_forward=0`.
 

