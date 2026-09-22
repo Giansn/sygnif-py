@@ -54,6 +54,11 @@ COMPACT_KEEP_TURNS = int(os.environ.get("SYGNIF_PY_COMPACT_KEEP_TURNS", "4"))
 COMPACT_SUMMARY = os.environ.get("SYGNIF_PY_COMPACT_SUMMARY", "1") != "0"
 COMPACT_PREFIX = "[Compacted earlier conversation — older turns summarized to free context]\n\n"
 CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test"}  # gated when --confirm / SYGNIF_PY_CONFIRM=1
+# Offensive tools that actively touch a target — also gated under --confirm so a live
+# scan/exploit against an authorized host still gets a human yes (review P2-7).
+OFFENSIVE_TOOLS = {"recon", "nuclei", "wpscan", "dast", "metasploit", "msf", "bruteforce",
+                   "crack", "postexploit", "privesc", "wifi_capture", "wifi_crack",
+                   "portscan", "netenum", "takeover", "tls_check", "exploit", "c2"}
 CLAUDE_BIN = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "300"))
 
@@ -612,7 +617,7 @@ def run_turn(spec: dict, messages: list[dict], reg: dict, confirm: bool, state=N
             if pre:
                 print(f"\nSYGNIF> {pre}")
         pix.tool_start(name, json.dumps(args, ensure_ascii=False)[:200])
-        if confirm and name in CONFIRM_TOOLS:
+        if confirm and (name in CONFIRM_TOOLS or name in OFFENSIVE_TOOLS):
             try:
                 ans = input(pix.dim("    run this? [y/N] ")).strip().lower()
             except EOFError:
@@ -1033,7 +1038,11 @@ def main() -> int:
     cfg = models.load_config()
     name, preset, reg, system = build_session(cfg, a.preset)
     model_key = a.model or preset.get("model")
-    spec = models.resolve_model(cfg, model_key)
+    try:
+        spec = models.resolve_model(cfg, model_key)
+    except ValueError as e:
+        pix.notice(f"[sygnif-py] {e}", "red")
+        sys.exit(2)
 
     # First interactive launch after install: log in + prep the pentest workspace.
     if not a.prompt and _firstrun_pending():
@@ -1129,8 +1138,14 @@ def main() -> int:
                     pix.notice(f"  [preset error: {e}] available: {', '.join(models.list_presets(cfg))}", "red")
                 continue
             if cmd == "model":
+                try:
+                    new_spec = models.resolve_model(cfg, arg)
+                except ValueError as e:
+                    pix.notice(f"  [{e}]", "red")
+                    pix.notice(f"  keeping current model: {model_key}", "yellow")
+                    continue
                 model_key = arg
-                spec = models.resolve_model(cfg, model_key)
+                spec = new_spec
                 state.set_model(model_key, spec)
                 state.used = None
                 pix.notice(f"  model -> {model_key} ({spec['id']}) @ {endpoint_of(spec)}")
