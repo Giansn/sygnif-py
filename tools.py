@@ -20,9 +20,12 @@ registry dict. See custom_tools.py.example.
 from __future__ import annotations
 
 import datetime
+import ipaddress
+import html as _html
 import json
 import os
 import re
+import time
 import subprocess
 import urllib.error
 import urllib.parse
@@ -487,6 +490,8 @@ WORKSPACE = os.path.expanduser(
 FINDINGS = os.path.join(WORKSPACE, "findings.jsonl")
 PHASE_FILE = os.path.join(WORKSPACE, ".phase")
 REPORT_FILE = os.path.join(WORKSPACE, "report.md")
+AUDIT_FILE = os.path.join(WORKSPACE, "audit.jsonl")
+INVENTORY = os.path.join(WORKSPACE, "hosts.jsonl")
 PHASES = ["recon", "enum", "vuln", "exploit", "postexploit", "report"]
 SEVERITIES = ["info", "low", "medium", "high", "critical"]
 # A finding's evidence must be at least this many chars — a defence against the
@@ -528,13 +533,15 @@ def tool_finding(args: dict) -> str:
     """Record a verified finding, with evidence REQUIRED. A finding with no
     evidence, or evidence too short to be real tool output, is refused — proof at
     every step. Fields: title, severity (info|low|medium|high|critical), target,
-    evidence (the command run and a snippet of its real output), and optional
+    evidence (the command run and a snippet of its real output), verify (a second
+    independent observation, REQUIRED for high/critical), and optional
     description and recommendation. Findings are appended to the workspace and
     turned into a report by the 'report' tool."""
     title = str(args.get("title", "")).strip()
     severity = str(args.get("severity", "")).strip().lower()
     target = str(args.get("target", "")).strip()
     evidence = str(args.get("evidence", "")).strip()
+    verify = str(args.get("verify", "")).strip()
     description = str(args.get("description", "")).strip()
     recommendation = str(args.get("recommendation", "")).strip()
 
@@ -547,6 +554,11 @@ def tool_finding(args: dict) -> str:
         return ("finding REFUSED — evidence too thin (" + str(len(evidence)) + " chars). "
                 "Paste the actual command and a snippet of its real output; a finding must be "
                 "backed by something you observed, not asserted.")
+    if severity in ("high", "critical") and len(verify) < MIN_EVIDENCE:
+        return ("finding REFUSED — a '" + severity + "' finding needs a SECOND, independent "
+                "observation. Set 'verify' to a second command + output snippet (a re-run, a "
+                "different tool, or a manual confirmation) that corroborates it. Single-source "
+                "high/critical findings are not accepted in a client deliverable.")
     try:
         os.makedirs(WORKSPACE, exist_ok=True)
         n = 0
@@ -561,6 +573,9 @@ def tool_finding(args: dict) -> str:
             "title": title,
             "target": target,
             "evidence": evidence,
+            "verify": verify,
+            "verified": bool(verify),
+            "single_source": not bool(verify),
             "description": description,
             "recommendation": recommendation,
         }
@@ -568,8 +583,9 @@ def tool_finding(args: dict) -> str:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError as e:
         return "[finding: could not save: " + str(e) + "]"
+    mark = "" if rec["verified"] else "  [SINGLE-SOURCE]"
     return ("recorded finding #" + str(rec["id"]) + " [" + severity + "] '" + title
-            + "' (phase " + rec["phase"] + ") -> " + FINDINGS)
+            + "' (phase " + rec["phase"] + ")" + mark + " -> " + FINDINGS)
 
 
 def _read_findings() -> list:
@@ -586,6 +602,39 @@ def _read_findings() -> list:
     except OSError:
         pass
     return out
+
+
+def _report_html(findings: list, summary: str, scope_text: str) -> str:
+    """Standalone HTML report (stdlib only) built from the structured findings."""
+    e = _html.escape
+    col = {"critical": "#b00020", "high": "#d84315", "medium": "#f9a825",
+           "low": "#2e7d32", "info": "#607d8b"}
+    parts = ["<!doctype html><meta charset=utf-8><title>SYGNIF pentest report</title>",
+             "<style>body{font:15px/1.5 system-ui,sans-serif;max-width:900px;margin:2rem auto;"
+             "padding:0 1rem;color:#111}pre{background:#f4f4f4;padding:.8rem;overflow:auto;"
+             "border-radius:6px}h3{margin-top:2rem}.sev{color:#fff;padding:.1rem .5rem;"
+             "border-radius:4px;font-size:.8em}.m{color:#666;font-size:.9em}</style>",
+             "<h1>SYGNIF pentest report</h1>",
+             "<p class=m>Generated " + e(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")) + "</p>"]
+    if scope_text:
+        parts.append("<h2>Scope</h2><pre>" + e(scope_text.strip()) + "</pre>")
+    parts.append("<h2>Summary</h2><p>" + str(len(findings)) + " finding(s): " + e(summary) + "</p>")
+    parts.append("<h2>Findings</h2>")
+    for f in findings:
+        sv = f.get("severity", "info")
+        badge = "<span class=sev style='background:" + col.get(sv, "#607d8b") + "'>" + e(sv.upper()) + "</span>"
+        parts.append("<h3>#" + str(f.get("id")) + " " + badge + " " + e(f.get("title", "")) + "</h3>")
+        vmark = "" if f.get("verified", True) else " <span class=m>[single-source]</span>"
+        parts.append("<p class=m>Target: " + e(f.get("target", "")) + " &middot; Phase: "
+                     + e(f.get("phase", "")) + " &middot; " + e(f.get("ts", "")) + vmark + "</p>")
+        if f.get("description"):
+            parts.append("<p>" + e(f["description"]) + "</p>")
+        parts.append("<p><b>Evidence</b></p><pre>" + e(f.get("evidence", "").rstrip()) + "</pre>")
+        if f.get("verify"):
+            parts.append("<p><b>Corroboration</b></p><pre>" + e(f.get("verify", "").rstrip()) + "</pre>")
+        if f.get("recommendation"):
+            parts.append("<p><b>Recommendation:</b> " + e(f["recommendation"]) + "</p>")
+    return "\n".join(parts) + "\n"
 
 
 def tool_report(args: dict) -> str:
@@ -630,13 +679,34 @@ def tool_report(args: dict) -> str:
             lines += ["", "**Recommendation:** " + f["recommendation"]]
         lines += ["", "---", ""]
 
+    scope_text = ""
+    if os.path.exists(scope):
+        try:
+            scope_text = open(scope, encoding="utf-8").read()
+        except OSError:
+            pass
+    html_file = os.path.splitext(REPORT_FILE)[0] + ".html"
+    written = []
     try:
         os.makedirs(WORKSPACE, exist_ok=True)
         with open(REPORT_FILE, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
+        written.append(REPORT_FILE)
+        with open(html_file, "w", encoding="utf-8") as fh:
+            fh.write(_report_html(findings, summary, scope_text))
+        written.append(html_file)
     except OSError as e:
         return "[report: could not write: " + str(e) + "]"
-    return "wrote report: " + str(len(findings)) + " finding(s) (" + summary + ") -> " + REPORT_FILE
+    # optional PDF via whatever is present; skipped silently if neither is (zero-dep principle)
+    pdf_file = os.path.splitext(REPORT_FILE)[0] + ".pdf"
+    if _run_host("command -v weasyprint", 10)[1] == 0:
+        if _run_host("weasyprint " + shlex.quote(html_file) + " " + shlex.quote(pdf_file), 120)[1] == 0:
+            written.append(pdf_file)
+    elif _run_host("command -v pandoc", 10)[1] == 0:
+        if _run_host("pandoc " + shlex.quote(REPORT_FILE) + " -o " + shlex.quote(pdf_file), 120)[1] == 0:
+            written.append(pdf_file)
+    return ("wrote report: " + str(len(findings)) + " finding(s) (" + summary + ") -> "
+            + ", ".join(os.path.basename(w) for w in written))
 
 
 def tool_playbook(args: dict) -> str:
@@ -1073,27 +1143,105 @@ def _scope_targets() -> set | None:
     return found or None
 
 
+def _scope_networks() -> list:
+    """CIDR networks parsed from SCOPE.md, for range-based authorization.
+
+    Lets a scope line like `10.1.1.0/24` authorize any host inside it, instead of
+    only the exact network address. IPv4 and IPv6 CIDRs are accepted."""
+    try:
+        txt = open(SCOPE_FILE, encoding="utf-8").read()
+    except OSError:
+        return []
+    nets = []
+    for m in re.findall(r"\b[0-9a-fA-F:.]+/\d{1,3}\b", txt):
+        try:
+            nets.append(ipaddress.ip_network(m, strict=False))
+        except ValueError:
+            pass
+    return nets
+
+
 def _bare_host(target: str) -> str:
     t = str(target).strip()
     t = re.sub(r"^\w+://", "", t)
     return t.split("/")[0].split(":")[0].lower()
 
 
+# --- blast-radius guards (review P2-7): kill-switch, mass-target, rate-limit ----
+STOP_FILE = os.path.expanduser(os.environ.get("SYGNIF_PY_STOP_FILE", "~/sygnif-pentest/STOP"))
+RATE_FILE = os.path.join(WORKSPACE, ".offensive_rate")
+MAX_OFF_CALLS = int(os.environ.get("SYGNIF_PY_MAX_OFF_CALLS", "40"))
+RATE_WINDOW = int(os.environ.get("SYGNIF_PY_RATE_WINDOW", "60"))
+MAX_RANGE_HOSTS = int(os.environ.get("SYGNIF_PY_MAX_RANGE_HOSTS", "256"))
+
+
+def _blast_guard(args: dict, target: str) -> str | None:
+    """Hard guards, in order: (1) a STOP kill-switch file halts every offensive tool;
+    (2) a wildcard or an over-broad CIDR is refused as mass targeting; (3) a rate
+    limit throttles a runaway offensive loop. Returns a refusal string, or None."""
+    if os.path.exists(STOP_FILE):
+        return ("REFUSED: kill-switch active — " + STOP_FILE + " exists. Every offensive tool "
+                "is halted. Delete that file to resume.")
+    raw = str(target).strip()
+    if "*" in raw:
+        return "REFUSED: wildcard target. Name a single host; mass targeting is not permitted."
+    cidr = re.match(r"^\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}$", raw)
+    if cidr:
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+            if net.num_addresses > MAX_RANGE_HOSTS and not str(args.get("allow_range", "")).strip():
+                return ("REFUSED: '" + raw + "' spans " + str(net.num_addresses) + " hosts (cap "
+                        + str(MAX_RANGE_HOSTS) + "). Mass targeting is off by default — narrow the "
+                        "range, or pass allow_range=<reason> if the engagement authorizes the block.")
+        except ValueError:
+            pass
+    now = time.time()
+    try:
+        hits = []
+        if os.path.exists(RATE_FILE):
+            hits = [float(x) for x in open(RATE_FILE).read().split() if x]
+        hits = [h for h in hits if now - h < RATE_WINDOW]
+        if len(hits) >= MAX_OFF_CALLS:
+            return ("REFUSED: rate limit — " + str(len(hits)) + " offensive calls in the last "
+                    + str(RATE_WINDOW) + "s (cap " + str(MAX_OFF_CALLS) + "). This guards against a "
+                    "runaway scan. Wait, or raise SYGNIF_PY_MAX_OFF_CALLS for this engagement.")
+        hits.append(now)
+        os.makedirs(WORKSPACE, exist_ok=True)
+        with open(RATE_FILE, "w") as fh:
+            fh.write(" ".join(str(h) for h in hits[-MAX_OFF_CALLS * 2:]))
+    except OSError:
+        pass
+    return None
+
+
 def _authz(args: dict, target: str) -> str | None:
     """Authorization gate. Returns a refusal string, or None when cleared."""
     if not target:
         return "REFUSED: no 'target' given (a single host / domain / URL / interface)."
+    bg = _blast_guard(args, target)
+    if bg:
+        return bg
     auth = str(args.get("authorization", "") or args.get("auth", "")).strip()
     if len(auth) < 6:
         return ("REFUSED: set 'authorization' — a short attestation that you are authorized to "
                 f"test '{target}' (owner / engagement / ticket). Authorized targets only; this "
                 "tool will not run without it.")
     scoped = _scope_targets()
-    if scoped:
+    nets = _scope_networks()
+    if scoped or nets:
         t = _bare_host(target)
-        if not any(t == s or t.endswith("." + s) for s in scoped):
+        ok = bool(scoped) and any(t == s or t.endswith("." + s) for s in scoped)
+        if not ok and nets:
+            try:
+                ip = ipaddress.ip_address(t)
+                ok = any(ip in n for n in nets)
+            except ValueError:
+                pass  # target is a hostname, not an IP — networks can't match it
+        if not ok:
+            in_scope = ", ".join(sorted(scoped)) if scoped else ""
+            net_s = ("; nets: " + ", ".join(str(n) for n in nets)) if nets else ""
             return (f"REFUSED: '{t}' is not in SCOPE.md. In scope: "
-                    f"{', '.join(sorted(scoped))[:200]}. Add it to your authorized scope first.")
+                    f"{in_scope[:200]}{net_s}. Add it to your authorized scope first.")
     return None
 
 
@@ -1140,7 +1288,107 @@ def _need(bins) -> str:
             + ". Run `sygnif kali-setup` to provision the toolbox, or install them, then retry.")
 
 
-def _off_report(title: str, auth: str, cmd: str, out: str, rc: int, where: str) -> str:
+def _inventory_harvest(title: str, cmd: str, out: str) -> None:
+    """Best-effort asset inventory: pull host + open ports/services from an offensive
+    tool's real output into hosts.jsonl, deduped by (host, port, proto). Turns the
+    recon/enum trail into a queryable target base instead of grep-over-notes (P1-5)."""
+    try:
+        hm = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", cmd) or \
+             re.search(r"\b([a-z0-9][a-z0-9.\-]*\.[a-z]{2,})\b", cmd, re.I)
+        host = hm.group(1) if hm else ""
+        if not host:
+            return
+        rows = []
+        for m in re.finditer(r"(\d{1,5})/(tcp|udp)\s+open\s+(\S+)", out):
+            rows.append((int(m.group(1)), m.group(2), m.group(3)))
+        if not rows:
+            rows = [(None, None, None)]  # host seen, no ports parsed
+        existing = set()
+        recs = []
+        if os.path.exists(INVENTORY):
+            for ln in open(INVENTORY, encoding="utf-8"):
+                try:
+                    r = json.loads(ln); recs.append(r)
+                    existing.add((r.get("host"), r.get("port"), r.get("proto")))
+                except Exception:
+                    pass
+        added = 0
+        os.makedirs(WORKSPACE, exist_ok=True)
+        with open(INVENTORY, "a", encoding="utf-8") as fh:
+            for port, proto, svc in rows:
+                key = (host, port, proto)
+                if key in existing:
+                    continue
+                existing.add(key)
+                fh.write(json.dumps({
+                    "host": host, "port": port, "proto": proto, "service": svc,
+                    "source": title,
+                    "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }, ensure_ascii=False) + "\n")
+                added += 1
+    except OSError:
+        pass
+
+
+def tool_inventory(args: dict) -> str:
+    """Query the asset inventory (hosts.jsonl) built automatically from recon/enum/
+    portscan output: hosts and their open ports/services. Filter by host, service, or
+    port. This is the queryable target base — no grepping notes. action=list (default)."""
+    if not os.path.exists(INVENTORY):
+        return "inventory empty — run recon / portscan / netenum on authorized targets first."
+    recs = []
+    for ln in open(INVENTORY, encoding="utf-8"):
+        try:
+            recs.append(json.loads(ln))
+        except Exception:
+            pass
+    fh = str(args.get("host", "")).strip().lower()
+    fs = str(args.get("service", "")).strip().lower()
+    fp = str(args.get("port", "")).strip()
+    if fh:
+        recs = [r for r in recs if fh in str(r.get("host", "")).lower()]
+    if fs:
+        recs = [r for r in recs if fs in str(r.get("service", "") or "").lower()]
+    if fp:
+        recs = [r for r in recs if str(r.get("port", "")) == fp]
+    if not recs:
+        return "no inventory rows match that filter."
+    by_host = {}
+    for r in recs:
+        by_host.setdefault(r.get("host", "?"), []).append(r)
+    lines = ["asset inventory (" + str(len(recs)) + " rows, " + str(len(by_host)) + " hosts):"]
+    for host in sorted(by_host):
+        ports = sorted([p for p in by_host[host] if p.get("port")], key=lambda r: r.get("port") or 0)
+        if ports:
+            lines.append("  " + host + ": " + ", ".join(
+                str(r["port"]) + "/" + str(r.get("proto") or "tcp") + " " + str(r.get("service") or "?")
+                for r in ports))
+        else:
+            lines.append("  " + host + ": (host seen, no ports recorded)")
+    return "\n".join(lines)
+
+
+def _audit(title: str, auth: str, cmd: str, rc: int, where: str, target: str = "") -> None:
+    """Append-only audit trail of every offensive command: who authorized it, what
+    ran, where, and the exit code. UTC. A best-effort write — a logging failure
+    never blocks the operation, but the trail is what makes a run defensible."""
+    try:
+        os.makedirs(WORKSPACE, exist_ok=True)
+        rec = {
+            "ts_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "title": title, "target": target, "authorized_by": auth,
+            "cmd": cmd, "exit": rc, "via": where,
+        }
+        with open(AUDIT_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _off_report(title: str, auth: str, cmd: str, out: str, rc: int, where: str,
+                target: str = "") -> str:
+    _audit(title, auth, cmd, rc, where, target)
+    _inventory_harvest(title, cmd, out)
     return _truncate(f"[{title} | authorized-by: {auth} | via {where}]\n$ {cmd}\n\n{out}\n"
                      f"exit={rc}")
 
@@ -1151,6 +1399,28 @@ def _have(binname: str) -> bool:
 
 
 # 1. recon / OSINT — subdomains, DNS, tech, live hosts (passive-first)
+def _web_auth_headers(args: dict) -> list:
+    """(name, value) auth headers for authenticated web scans, from cookie /
+    auth_header / bearer / headers args. Lets nuclei & wpscan reach behind a login
+    instead of only seeing the unauthenticated surface (review P2-6)."""
+    out = []
+    cookie = str(args.get("cookie", "")).strip()
+    if cookie:
+        out.append(("Cookie", cookie))
+    auth = str(args.get("auth_header", "") or args.get("bearer", "")).strip()
+    if auth:
+        val = auth if (":" in auth or auth.lower().startswith("bearer ")) else "Bearer " + auth
+        out.append(("Authorization", val))
+    hdrs = args.get("headers") or []
+    if isinstance(hdrs, str):
+        hdrs = [hdrs]
+    for h in hdrs:
+        if ":" in str(h):
+            k, v = str(h).split(":", 1)
+            out.append((k.strip(), v.strip()))
+    return out
+
+
 def tool_recon(args: dict) -> str:
     target = str(args.get("target", "") or args.get("domain", "")).strip()
     g = _authz(args, target)
@@ -1188,6 +1458,8 @@ def tool_nuclei(args: dict) -> str:
         parts.append(f"-severity {shlex.quote(sev)}")
     if xtpl:
         parts.append(f"-t {shlex.quote(xtpl)}")  # e.g. the nuclei-wordfence-cve template dir
+    for _k, _v in _web_auth_headers(args):
+        parts.append("-H " + shlex.quote(_k + ": " + _v))
     if extra:
         parts.append(extra)
     out, rc, where = _off_run(" ".join(parts))
@@ -1211,6 +1483,12 @@ def tool_wpscan(args: dict) -> str:
              f"--enumerate {shlex.quote(enum)}", "--random-user-agent"]
     if tok:
         parts.append(f"--api-token {shlex.quote(tok)}")
+    _cookie = str(args.get("cookie", "")).strip()
+    if _cookie:
+        parts.append("--cookie-string " + shlex.quote(_cookie))
+    _hdrs = [k + ": " + v for k, v in _web_auth_headers(args) if k != "Cookie"]
+    if _hdrs:
+        parts.append("--headers " + shlex.quote("\n".join(_hdrs)))
     if extra:
         parts.append(extra)
     out, rc, where = _off_run(" ".join(parts), need=("wpscan",))
@@ -2690,6 +2968,14 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "SCOPE.md. Run at the end or any time for a running picture."),
         "args": {},
         "func": tool_report,
+    },
+    "inventory": {
+        "desc": ("Query the asset inventory (hosts + open ports/services) built "
+                 "automatically from recon/portscan/netenum output. Filter by host, "
+                 "service, or port. The queryable target base — no grepping notes."),
+        "args": {"host": "optional host filter", "service": "optional service filter",
+                 "port": "optional port filter"},
+        "func": tool_inventory,
     },
     "secrets_scan": {
         "desc": "Scan a repo/dir you own for leaked secrets (API keys, tokens, creds) with trufflehog + gitleaks. Runs on this host.",
