@@ -696,14 +696,21 @@ def _scope_briefing(reg: dict) -> str:
         return ""
     scope_path = os.path.join(PENTEST_DIR, "SCOPE.md")
     auth = targets = ""
+    def _field(ln: str) -> str:
+        # value after the FIRST colon, or "" if the line has none (a prose line
+        # that merely mentions the label must not crash us).
+        parts = ln.split(":", 1)
+        return parts[1].strip() if len(parts) > 1 else ""
     try:
         with open(scope_path, encoding="utf-8") as fh:
             for ln in fh:
-                low = ln.lower()
-                if "authorization / owner:" in low and not auth:
-                    auth = ln.split(":", 1)[1].strip()
-                elif "in-scope targets" in low and not targets:
-                    targets = ln.split(":", 1)[1].strip()
+                # anchor on the field label at the start of a bullet, so a prose
+                # sentence that happens to contain "in-scope targets" is ignored.
+                low = ln.lstrip("-* \t").lower()
+                if not auth and low.startswith("authorization / owner:"):
+                    auth = _field(ln)
+                elif not targets and low.startswith("in-scope targets"):
+                    targets = _field(ln)
     except OSError:
         pass
     lines = [
