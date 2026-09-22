@@ -138,82 +138,124 @@ def tool_note(args: dict) -> str:
 
 
 def tool_identity(args: dict) -> str:
-    """View or CHANGE SYGNIF py's OWN identity and standing instructions — the role
-    (who it is), conduct block, and any extra instructions baked into the system
-    prompt. Changes persist to the identity file and take effect on the NEXT session
-    (the running session's prompt is already assembled). mode=show | set_role |
-    set_conduct | add_instruction | remove_instruction | reset. set_role/set_conduct/
-    add_instruction take text=; remove_instruction takes index=; reset takes what=
-    (all|role|conduct|instructions)."""
+    """View or CHANGE identity + standing instructions — either SYGNIF py's OWN
+    (default) or a specific PROVIDER's (pass provider=<model key from config.json,
+    e.g. 'fable'/'claude'/'openrouter-free'>). A provider's role/conduct overrides
+    the seat's own when that provider is active; provider instructions are appended
+    after the global ones. Changes persist to the identity file and take effect on the
+    NEXT session. mode=show | set_role | set_conduct | add_instruction |
+    remove_instruction | reset. set_* / add take text=; remove takes index=; reset
+    takes what=(all|role|conduct|instructions). Omit provider= to act on the seat's own."""
     import identity as _id
     mode = str(args.get("mode", "show")).strip().lower()
-    ov = _id.load_identity()
+    provider = str(args.get("provider", "")).strip()
     text = str(args.get("text", "")).strip()
+    ov = _id.load_identity()
+    who = f"provider '{provider}'" if provider else "SYGNIF py (own)"
+
+    # resolve the dict we read/write: the provider sub-dict, or the top level.
+    def _target(create: bool) -> dict:
+        if not provider:
+            return ov
+        provs = ov.setdefault("providers", {}) if create else (ov.get("providers") or {})
+        if create:
+            return provs.setdefault(provider, {})
+        p = provs.get(provider)
+        return p if isinstance(p, dict) else {}
 
     if mode in ("show", ""):
-        role_src = "OVERRIDE" if str(ov.get("role") or "").strip() else "default"
-        cond_src = "OVERRIDE" if str(ov.get("conduct") or "").strip() else "default"
-        instr = ov.get("instructions") or []
-        out = ["== SYGNIF py identity (effective) ==",
-               f"[role · {role_src}]", _id.effective_role(ov), "",
-               f"[conduct · {cond_src}]", _id.effective_conduct(ov), "",
+        tgt = _target(create=False)
+        if provider:
+            role_src = "provider" if str(tgt.get("role") or "").strip() else (
+                "global-override" if str(ov.get("role") or "").strip() else "default")
+            cond_src = "provider" if str(tgt.get("conduct") or "").strip() else (
+                "global-override" if str(ov.get("conduct") or "").strip() else "default")
+        else:
+            role_src = "OVERRIDE" if str(ov.get("role") or "").strip() else "default"
+            cond_src = "OVERRIDE" if str(ov.get("conduct") or "").strip() else "default"
+        instr = _id.effective_instructions(ov, provider or None)
+        out = [f"== identity · {who} (effective) ==",
+               f"[role · {role_src}]", _id.effective_role(ov, provider or None), "",
+               f"[conduct · {cond_src}]", _id.effective_conduct(ov, provider or None), "",
                f"[standing instructions · {len(instr)}]"]
         out += [f"  {i}. {x}" for i, x in enumerate(instr)] or ["  (none)"]
+        if not provider:
+            provs = sorted((ov.get("providers") or {}).keys())
+            out.append("\n[providers with an identity overlay]  "
+                       + (", ".join(provs) if provs else "(none)"))
         out.append("\nfile: " + _id.IDENTITY_FILE
                    + "\n(edits apply on the next session; this one's prompt is already set)")
         return "\n".join(out)
 
     if mode == "set_role":
         if not text:
-            return "identity set_role: give text= (the new role/identity). Use mode=reset what=role to restore the default."
-        ov["role"] = text
+            return "identity set_role: give text= (the new role/identity). Use mode=reset what=role to restore."
+        _target(create=True)["role"] = text
         _id.save_identity(ov)
-        return "identity: role overridden (effective next session). New role:\n\n" + text
+        return f"identity: role for {who} set (effective next session). New role:\n\n{text}"
 
     if mode == "set_conduct":
         if not text:
-            return "identity set_conduct: give text= (the new conduct block). Use mode=reset what=conduct to restore the default."
-        ov["conduct"] = text
+            return "identity set_conduct: give text= (the new conduct block). Use mode=reset what=conduct to restore."
+        _target(create=True)["conduct"] = text
         _id.save_identity(ov)
-        return "identity: conduct overridden (effective next session). New conduct:\n\n" + text
+        return f"identity: conduct for {who} set (effective next session). New conduct:\n\n{text}"
 
     if mode == "add_instruction":
         if not text:
-            return "identity add_instruction: give text= (one standing instruction to append to every future session)."
-        ov.setdefault("instructions", []).append(text)
+            return "identity add_instruction: give text= (one standing instruction to append)."
+        tgt = _target(create=True)
+        tgt.setdefault("instructions", []).append(text)
         _id.save_identity(ov)
-        return (f"identity: added standing instruction #{len(ov['instructions']) - 1} "
+        return (f"identity: added instruction #{len(tgt['instructions']) - 1} for {who} "
                 f"(effective next session): {text}")
 
     if mode == "remove_instruction":
-        instr = ov.get("instructions") or []
+        tgt = _target(create=False)
+        instr = list(tgt.get("instructions") or [])
         try:
             idx = int(str(args.get("index", "")).strip())
             removed = instr.pop(idx)
         except (ValueError, IndexError):
-            return (f"identity remove_instruction: give a valid index= "
-                    f"(0..{len(instr) - 1}). Run mode=show to list them.")
-        ov["instructions"] = instr
+            return (f"identity remove_instruction: give a valid index= (0..{len(instr) - 1}) "
+                    f"for {who}. Run mode=show{(' provider=' + provider) if provider else ''} to list them.")
+        # write back into the live dict (which _target(create) would resolve to)
+        _target(create=True)["instructions"] = instr
         _id.save_identity(ov)
-        return f"identity: removed standing instruction #{idx}: {removed}"
+        return f"identity: removed instruction #{idx} for {who}: {removed}"
 
     if mode == "reset":
         what = str(args.get("what", "all")).strip().lower()
-        if what == "role":
-            ov.pop("role", None)
-        elif what == "conduct":
-            ov.pop("conduct", None)
-        elif what in ("instructions", "instruction"):
-            ov.pop("instructions", None)
-        elif what in ("all", ""):
-            ov = {}
+        if provider:
+            provs = ov.get("providers") or {}
+            if what in ("all", ""):
+                provs.pop(provider, None)
+            elif what in ("role", "conduct"):
+                (provs.get(provider) or {}).pop(what, None)
+            elif what in ("instructions", "instruction"):
+                (provs.get(provider) or {}).pop("instructions", None)
+            else:
+                return "identity reset: what = all | role | conduct | instructions."
+            if provs.get(provider) == {}:
+                provs.pop(provider, None)
+            ov["providers"] = provs
         else:
-            return "identity reset: what = all | role | conduct | instructions."
+            if what == "role":
+                ov.pop("role", None)
+            elif what == "conduct":
+                ov.pop("conduct", None)
+            elif what in ("instructions", "instruction"):
+                ov.pop("instructions", None)
+            elif what in ("all", ""):
+                # keep provider overlays; only clear the seat's own top-level identity
+                ov = {"providers": ov.get("providers")} if ov.get("providers") else {}
+            else:
+                return "identity reset: what = all | role | conduct | instructions."
         _id.save_identity(ov)
-        return f"identity: reset {what or 'all'} to the built-in default (effective next session)."
+        return f"identity: reset {what or 'all'} for {who} to default (effective next session)."
 
     return ("identity mode = show | set_role | set_conduct | add_instruction | "
-            "remove_instruction | reset.")
+            "remove_instruction | reset  (add provider=<model key> to target a provider).")
 
 
 def tool_dev_apply_and_test(args: dict) -> str:
@@ -3608,13 +3650,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
     },
     "identity": {
         "desc": (
-            "View or CHANGE SYGNIF py's own identity + standing instructions (the role, "
-            "conduct, and extra instructions in its system prompt). Persists to the identity "
-            "file; changes take effect on the NEXT session. mode=show | set_role | set_conduct "
-            "| add_instruction | remove_instruction | reset."
+            "View or CHANGE identity + standing instructions — SYGNIF py's OWN, or a "
+            "PROVIDER's (provider=<model key>, e.g. fable/claude). Provider role/conduct "
+            "overrides the seat's own when that provider is active; provider instructions "
+            "append after the global ones. Persists to the identity file; effective NEXT "
+            "session. mode=show | set_role | set_conduct | add_instruction | "
+            "remove_instruction | reset."
         ),
         "args": {
             "mode": "show | set_role | set_conduct | add_instruction | remove_instruction | reset",
+            "provider": "OPTIONAL model key from config.json (e.g. fable, claude); omit for the seat's own identity",
             "text": "new text (set_role, set_conduct, add_instruction)",
             "index": "instruction index to drop (remove_instruction; see mode=show)",
             "what": "all | role | conduct | instructions (reset)",

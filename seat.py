@@ -665,7 +665,10 @@ class SessionState:
 def build_session(cfg: dict, preset_name: str | None):
     name, preset = models.get_preset(cfg, preset_name)
     reg = tools.build_registry(preset.get("tools", models.DEFAULT_TOOLS))
-    system = identity.build_system(name, preset.get("focus", ""), reg)
+    # the preset's model key is the active provider; its per-provider identity
+    # overlay (if any) is applied on top of the seat's own identity.
+    system = identity.build_system(name, preset.get("focus", ""), reg,
+                                   provider=preset.get("model"))
     return name, preset, reg, system
 
 

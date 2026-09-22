@@ -10,9 +10,13 @@ import json
 import os
 
 # Persisted self-identity overrides, editable at runtime by the `identity` tool.
-# Schema: {"role": str?, "conduct": str?, "instructions": [str, ...]?}. Any field
-# absent -> the built-in default applies. Changes take effect on the NEXT session
-# (the running session's system prompt is already assembled).
+# Schema: {"role": str?, "conduct": str?, "instructions": [str, ...]?,
+#          "providers": {"<model key>": {"role"?, "conduct"?, "instructions"?}}}.
+# The top level is the seat's OWN identity; each providers[<key>] entry overlays it
+# when that provider (the preset's model key, e.g. 'fable'/'claude') is active. A
+# provider role/conduct wins over the global one; provider instructions are appended
+# AFTER the global ones. Any field absent -> the layer below (provider -> global ->
+# built-in default) applies. Changes take effect on the NEXT session.
 IDENTITY_FILE = os.path.expanduser(
     os.environ.get("SYGNIF_PY_IDENTITY_FILE", "~/.sygnif/sygnif-py-identity.json"))
 
@@ -62,14 +66,37 @@ def save_identity(overrides: dict) -> None:
     os.replace(tmp, IDENTITY_FILE)
 
 
-def effective_role(overrides: dict | None = None) -> str:
-    ov = overrides if overrides is not None else load_identity()
-    return (str(ov.get("role") or "")).strip() or ROLE
+def provider_overrides(overrides: dict, provider: str | None) -> dict:
+    """The per-provider override sub-dict for `provider`, or {} if none."""
+    if not provider:
+        return {}
+    p = (overrides.get("providers") or {}).get(provider)
+    return p if isinstance(p, dict) else {}
 
 
-def effective_conduct(overrides: dict | None = None) -> str:
+def effective_role(overrides: dict | None = None, provider: str | None = None) -> str:
     ov = overrides if overrides is not None else load_identity()
-    return (str(ov.get("conduct") or "")).strip() or CONDUCT
+    p = provider_overrides(ov, provider)
+    return ((str(p.get("role") or "")).strip()
+            or (str(ov.get("role") or "")).strip()
+            or ROLE)
+
+
+def effective_conduct(overrides: dict | None = None, provider: str | None = None) -> str:
+    ov = overrides if overrides is not None else load_identity()
+    p = provider_overrides(ov, provider)
+    return ((str(p.get("conduct") or "")).strip()
+            or (str(ov.get("conduct") or "")).strip()
+            or CONDUCT)
+
+
+def effective_instructions(overrides: dict | None = None, provider: str | None = None) -> list[str]:
+    """Global standing instructions, then the active provider's, in order."""
+    ov = overrides if overrides is not None else load_identity()
+    p = provider_overrides(ov, provider)
+    g = [str(x).strip() for x in (ov.get("instructions") or []) if str(x).strip()]
+    pi = [str(x).strip() for x in (p.get("instructions") or []) if str(x).strip()]
+    return g + pi
 
 
 def _render_catalog(registry: dict) -> str:
@@ -84,10 +111,10 @@ def _render_catalog(registry: dict) -> str:
     return "\n".join(lines)
 
 
-def build_system(preset_name: str, focus: str, registry: dict) -> str:
+def build_system(preset_name: str, focus: str, registry: dict, provider: str | None = None) -> str:
     ov = load_identity()
-    blocks = [effective_role(ov), effective_conduct(ov)]
-    instr = [str(x).strip() for x in (ov.get("instructions") or []) if str(x).strip()]
+    blocks = [effective_role(ov, provider), effective_conduct(ov, provider)]
+    instr = effective_instructions(ov, provider)
     if instr:
         blocks.append("Standing instructions (set by the operator or by SYGNIF itself):\n"
                       + "\n".join(f"- {x}" for x in instr))
