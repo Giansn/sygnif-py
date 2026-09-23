@@ -61,7 +61,7 @@
       }
     },
     "glm": {
-      "id": "glm-5.3",
+      "id": "glm-5.3-flash",
       "base_url": "https://api.z.ai/api/paas/v4",
       "api_key_env": "GLM_API_KEY",
       "context": 200000,
