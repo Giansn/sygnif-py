@@ -2723,6 +2723,58 @@ def tool_portscan(args: dict) -> str:
     return _off_report("portscan", args.get("authorization", ""), cmd, out, rc, where)
 
 
+# 7b. cidr_scan — sweep a whole CIDR range for live hosts + open ports
+def tool_cidr_scan(args: dict) -> str:
+    """Sweep an authorized CIDR range. modes: discover (nmap ping-sweep → live hosts) |
+    ports (naabu connect-scan across the range, or masscan for speed) | full (host+port
+    sweep, then nmap -sV on what's found). Requires 'target' (the CIDR) + 'authorization';
+    SCOPE.md-confined when present. A CIDR is loud and wide — scope it tightly."""
+    target = str(args.get("target", "") or args.get("cidr", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    q = shlex.quote
+    mode = str(args.get("mode", "discover")).strip().lower()
+    ports = str(args.get("ports", "")).strip()
+    rate = str(args.get("rate", "1000")).strip()
+    engine = str(args.get("engine", "")).strip().lower()  # ports mode: naabu (default) | masscan
+    extra = str(args.get("extra", "")).strip()
+    if mode == "discover":
+        cmd = "nmap -sn -n " + q(target) + " -oG - 2>/dev/null | awk '/Up/{print $2}'"
+        need = "nmap"
+        timeout = 600
+    elif mode == "ports":
+        p = ports or "1-1000"
+        if engine == "masscan":
+            cmd = "masscan " + q(target) + " -p" + q(p) + " --rate " + q(rate) + " 2>/dev/null"
+            need = "masscan"
+        else:  # naabu connect scan — reliable, needs no raw socket
+            cmd = "naabu -host " + q(target) + " -p " + q(p) + " -s c -silent 2>/dev/null"
+            need = "naabu"
+        timeout = min(OFFENSIVE_TIMEOUT, 1800)
+    elif mode == "full":
+        p = ports or "1-1000"
+        # 1) naabu finds live host:port pairs across the CIDR; 2) nmap -sV fingerprints exactly those
+        cmd = (
+            "TMP=$(mktemp); echo '== host:port sweep (naabu) =='; "
+            "naabu -host " + q(target) + " -p " + q(p) + " -s c -silent 2>/dev/null | tee \"$TMP\"; "
+            "echo; echo '== service/version on discovered host:ports (nmap -sV) =='; "
+            "if [ -s \"$TMP\" ]; then "
+            "H=$(cut -d: -f1 \"$TMP\" | sort -u | paste -sd, -); "
+            "P=$(cut -d: -f2 \"$TMP\" | sort -un | paste -sd, -); "
+            "nmap -sV -Pn -n -p \"$P\" $H 2>/dev/null | grep -E 'Nmap scan report|/tcp|/udp'; "
+            "else echo '(no open ports found in range)'; fi; rm -f \"$TMP\""
+        )
+        need = ["naabu", "nmap"]
+        timeout = min(OFFENSIVE_TIMEOUT, 1800)
+    else:
+        return "cidr_scan: 'mode' must be discover | ports | full."
+    if extra:
+        cmd += " " + extra
+    out, rc, where = _off_run(cmd, timeout, need=need)
+    return _off_report("cidr_scan(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target=target)
+
+
 # 8. netenum — SMB / SNMP / service enumeration on an authorized host
 def tool_netenum(args: dict) -> str:
     target = str(args.get("target", "")).strip()
@@ -4948,6 +5000,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": "Structured nmap service scan of an authorized target. Requires target+authorization.",
         "args": {"target": "host/range you are authorized to test", "authorization": "attestation", "ports": "e.g. 1-1000 (default top-1000)", "extra": "extra nmap flags"},
         "func": tool_portscan,
+    },
+    "cidr_scan": {
+        "desc": ("Sweep a whole CIDR range (e.g. 172.17.0.0/24). modes: discover (nmap ping-sweep → "
+                 "list of live hosts) | ports (naabu connect-scan across the range, or engine=masscan "
+                 "for a fast wide sweep) | full (host:port sweep, then nmap -sV on exactly what's found). "
+                 "Requires 'target' (the CIDR) + 'authorization'; SCOPE.md-confined. Loud and wide — "
+                 "scope tightly. From the toolbox, use container-net CIDRs (e.g. 172.17.0.0/24), not the "
+                 "host loopback."),
+        "args": {"target": "CIDR you are authorized to test, e.g. 172.17.0.0/24", "authorization": "attestation", "mode": "discover|ports|full (default discover)", "ports": "port spec, e.g. 1-1000 or 22,80,443 (default 1-1000)", "engine": "ports mode: naabu (default) | masscan", "rate": "masscan packets/sec (default 1000)", "extra": "extra flags"},
+        "func": tool_cidr_scan,
     },
     "netenum": {
         "desc": "Network service enumeration (SMB via enum4linux-ng/smbmap/nxc, or SNMP) on an authorized host. Requires target+authorization.",
