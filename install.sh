@@ -44,13 +44,13 @@ mkdir -p "$HOME_DIR"
 tar -xzf "$TMP/$TARBALL" -C "$HOME_DIR" || die "unpack failed."
 # tarball is packed flat (files at its root), so files land directly in HOME_DIR.
 [ -f "$HOME_DIR/seat.py" ] || die "package looks incomplete (no seat.py in $HOME_DIR)."
-chmod +x "$HOME_DIR/sygnif.sh" "$HOME_DIR/nexus.sh" "$HOME_DIR/sygnif-centre.sh" "$HOME_DIR/sygnif-commander.sh" "$HOME_DIR/sygnif-desk.sh" "$HOME_DIR/sygnif-nexus.sh" 2>/dev/null || true
+chmod +x "$HOME_DIR/sygnif.sh" "$HOME_DIR/sygnif-py.sh" "$HOME_DIR/nexus.sh" "$HOME_DIR/sygnif-centre.sh" "$HOME_DIR/sygnif-commander.sh" "$HOME_DIR/sygnif-desk.sh" "$HOME_DIR/sygnif-nexus.sh" 2>/dev/null || true
 
 # --- launchers on PATH ------------------------------------------------------
 mkdir -p "$BIN_DIR"
 # The seat, the Centre (knot point), the commander (hands), and the Desk (the
 # browser dashboard) each get a launcher.
-for name in sygnif:sygnif.sh nexus:nexus.sh sygnif-centre:sygnif-centre.sh sygnif-commander:sygnif-commander.sh sygnif-desk:sygnif-desk.sh sygnif-nexus:sygnif-nexus.sh; do
+for name in sygnif:sygnif.sh sygnif-py:sygnif-py.sh nexus:nexus.sh sygnif-centre:sygnif-centre.sh sygnif-commander:sygnif-commander.sh sygnif-desk:sygnif-desk.sh sygnif-nexus:sygnif-nexus.sh; do
   cmd="${name%%:*}"; script="${name##*:}"
   cat > "$BIN_DIR/$cmd" <<EOF
 #!/usr/bin/env sh
@@ -66,6 +66,7 @@ case ":$PATH:" in
      printf '        echo '\''export PATH="%s:$PATH"'\'' >> ~/.profile\n' "$BIN_DIR" ;;
 esac
 say "run the seat:      sygnif           (or: $HOME_DIR/sygnif.sh)"
+say "seat in tmux:      sygnif-py [model] (persistent session; sources ~/.sygnif/<model>.env, default model glm)"
 say "the dashboard:     sygnif-desk      (chat + workflows in your browser, http://127.0.0.1:8899)"
 say "the nexus:         nexus            (labeled agent portals: picker, hub, spawn, resume)"
 say "the nexus board:   sygnif-nexus     (same portals in the browser, http://127.0.0.1:8910)"

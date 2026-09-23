@@ -22,7 +22,7 @@ PKG=(
   centre.py commander.py desk.py nexus.py
   static/index.html static/app.js static/style.css static/theme-dark.css
   static/nexus.html
-  sygnif.sh sygnif.ps1
+  sygnif.sh sygnif.ps1 sygnif-py.sh
   sygnif-centre.sh sygnif-centre.ps1
   sygnif-commander.sh sygnif-commander.ps1
   sygnif-desk.sh sygnif-desk.ps1
