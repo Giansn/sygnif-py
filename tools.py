@@ -2676,6 +2676,57 @@ def tool_headers(args: dict) -> str:
 
 
 # 5. takeover — subdomain takeover check (subfinder -> subjack / nuclei)
+def tool_akamai(args: dict) -> str:
+    """Akamai-aware recon for an authorized target behind Akamai's CDN/WAF. modes:
+    detect (is it Akamai + which product) | debug (send Akamai Pragma debug directives and
+    read the akamai-x-* edge headers: cache key, request id, edge server) | origin (find the
+    real backend to test directly: DNS/A records, subdomains that skip the CDN, cert SANs).
+    Requires 'target'+'authorization'; SCOPE.md-confined. Read-only recon — it does NOT forge
+    Bot Manager sensor data / _abck cookies (anti-bot bypass is out of scope)."""
+    url = _norm_url(str(args.get("target", "") or args.get("url", "")).strip())
+    g = _authz(args, url)
+    if g:
+        return g
+    q = shlex.quote
+    host = urllib.parse.urlparse(url).hostname or url
+    mode = str(args.get("mode", "detect")).strip().lower()
+    if mode == "detect":
+        cmd = (
+            "echo '== wafw00f =='; wafw00f " + q(url) + " 2>/dev/null | grep -iE 'is behind|akamai|detected|no WAF' | head; "
+            "echo '== edge signature headers =='; curl -sI -m 12 -A " + q(_BROWSER_UA) + " " + q(url) +
+            " 2>/dev/null | grep -iE 'server|akamaighost|x-akamai|x-cache|x-check-cacheable|x-true-cache-key|^via|x-served-by'"
+        )
+        need = None
+    elif mode == "debug":
+        # Akamai's documented Pragma debug directives — the edge echoes akamai-x-* headers back.
+        pragma = ("akamai-x-cache-on, akamai-x-cache-remote-on, akamai-x-check-cacheable, "
+                  "akamai-x-get-cache-key, akamai-x-get-extracted-values, akamai-x-get-request-id, "
+                  "akamai-x-get-true-cache-key, akamai-x-serial-no, akamai-x-get-nonces, "
+                  "akamai-x-feo-trace")
+        cmd = ("curl -sI -m 12 -A " + q(_BROWSER_UA) + " -H " + q("Pragma: " + pragma) + " " + q(url) +
+               " 2>/dev/null | grep -iE 'x-akamai|x-cache|x-check-cacheable|x-true-cache-key|x-serial|x-request-id|akamai' || "
+               "echo '(no akamai-x-* headers returned — not Akamai, or debug directives stripped)'")
+        need = None
+    elif mode == "origin":
+        cmd = (
+            "echo '== A/AAAA + CNAME (dnsx) =='; echo " + q(host) + " | dnsx -a -aaaa -cname -resp -silent 2>/dev/null; "
+            "echo '== subdomains that may skip the CDN (subfinder -> httpx, non-Akamai IPs are candidates) =='; "
+            "subfinder -d " + q(host) + " -silent 2>/dev/null | httpx -silent -ip -title -status-code -cdn 2>/dev/null | head -40; "
+            "echo '== cert SANs (origin hostnames sometimes leak here) =='; "
+            "echo | openssl s_client -connect " + q(host) + ":443 -servername " + q(host) +
+            " 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null | tail -1; "
+            "echo '== pivot: favicon/cert hash in shodan/censys via the shodan tool to find the origin IP =='"
+        )
+        need = ("subfinder", "httpx", "dnsx")
+    else:
+        return "akamai: 'mode' must be detect | debug | origin."
+    extra = str(args.get("extra", "")).strip()
+    if extra:
+        cmd += " " + extra
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 900), need=need)
+    return _off_report("akamai(" + mode + ")", args.get("authorization", ""), cmd, out, rc, where, target=host)
+
+
 def tool_takeover(args: dict) -> str:
     domain = str(args.get("domain", "") or args.get("target", "")).strip()
     g = _authz(args, domain)
@@ -4990,6 +5041,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "desc": "Subdomain-takeover check on an authorized domain (subfinder -> subjack/nuclei). Requires target+authorization.",
         "args": {"domain": "domain you are authorized to test", "authorization": "attestation"},
         "func": tool_takeover,
+    },
+    "akamai": {
+        "desc": ("Akamai-aware recon for an authorized target behind Akamai's CDN/WAF. modes: detect "
+                 "(confirm Akamai + product via wafw00f + edge headers) | debug (send Akamai Pragma "
+                 "debug directives, read the akamai-x-* edge headers: cache key, request id, edge "
+                 "server) | origin (find the real backend to test directly: DNS/A records, subdomains "
+                 "that skip the CDN, cert SANs). Requires 'target'+'authorization'; SCOPE.md-confined. "
+                 "Read-only recon; does NOT forge Bot Manager sensor data (anti-bot bypass is excluded)."),
+        "args": {"target": "URL you are authorized to test", "authorization": "attestation", "mode": "detect|debug|origin (default detect)", "extra": "extra shell to append"},
+        "func": tool_akamai,
     },
     "osint": {
         "desc": "Passive OSINT on an authorized domain (theHarvester, dnsx, SPF/DMARC). Requires target+authorization.",

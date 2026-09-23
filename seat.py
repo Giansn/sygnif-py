@@ -69,7 +69,7 @@ COMPACT_PREFIX = "[Compacted earlier conversation — older turns summarized to 
 CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test"}  # gated when --confirm / SYGNIF_PY_CONFIRM=1
 # Offensive tools that actively touch a target — also gated under --confirm so a live
 # scan/exploit against an authorized host still gets a human yes (review P2-7).
-OFFENSIVE_TOOLS = {"recon", "nuclei", "jwt", "graphw00f", "clairvoyance", "wpscan", "dast", "metasploit", "msf", "bruteforce",
+OFFENSIVE_TOOLS = {"recon", "nuclei", "jwt", "graphw00f", "clairvoyance", "akamai", "wpscan", "dast", "metasploit", "msf", "bruteforce",
                    "crack", "postexploit", "privesc", "wifi_capture", "wifi_crack",
                    "portscan", "cidr_scan", "netenum", "takeover", "tls_check", "exploit", "c2", "ad", "aitm", "velociraptor",
                    "coerce", "bloodyad", "winrm", "cloudx", "kube", "emulate", "arp"}
