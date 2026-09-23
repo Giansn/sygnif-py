@@ -42,7 +42,7 @@ import pix
 import tools
 
 HTTP_TIMEOUT = int(os.environ.get("SYGNIF_PY_HTTP_TIMEOUT", "600"))
-MAX_TOOL_ITERS = int(os.environ.get("SYGNIF_PY_MAX_ITERS", "12"))
+MAX_TOOL_ITERS = int(os.environ.get("SYGNIF_PY_MAX_ITERS", "50"))
 # Context compaction (see compact_messages): char budget for the whole history, how
 # much recent tool output stays verbatim, how many recent user turns are never
 # summarized, and whether the model is asked for a summary (else extractive digest).
