@@ -61,11 +61,7 @@ OFFENSIVE_TOOLS = {"recon", "nuclei", "wpscan", "dast", "metasploit", "msf", "br
                    "portscan", "netenum", "takeover", "tls_check", "exploit", "c2", "ad", "aitm", "velociraptor",
                    "coerce", "bloodyad", "winrm", "cloudx", "kube", "emulate", "arp"}
 CLAUDE_BIN = os.environ.get("SYGNIF_PY_CLAUDE_BIN", "claude")
-# 600s, not 300: a pentest turn that digests a large scan result (a gated tool can
-# block for up to OFFENSIVE_TIMEOUT=1800s) needs a model-generation window wider than
-# the old 5 min, or the turn aborts mid-task and orphans the scan. Raise further with
-# SYGNIF_PY_CLAUDE_TIMEOUT for very heavy work.
-CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "600"))
+CLAUDE_TIMEOUT = int(os.environ.get("SYGNIF_PY_CLAUDE_TIMEOUT", "300"))
 
 # First-run onboarding: a marker gates a one-time setup (Claude login + a pentest
 # workspace). SYGNIF_PY_FIRSTRUN=0 skips it; delete the marker to run it again.
@@ -291,22 +287,11 @@ def call_claude_cli(spec: dict, messages: list[dict]) -> str:
     except Exception as e:  # noqa: BLE001
         return f"[claude CLI error: {e}]"
     if proc.returncode != 0:
-        # In --output-format json the CLI often reports the failure on STDOUT (a
-        # JSON error object) and leaves stderr empty; fold both in so the reason
-        # is not lost and the login case is still detected.
-        err = (proc.stderr or "").strip()
-        out = (proc.stdout or "").strip()
-        detail = (err or out)[:400]
-        low = (err + " " + out).lower()
-        if any(w in low for w in ("login", "auth", "unauthorized", "not authenticated",
-                                  "setup-token", "credit balance", "subscription")):
-            return (f"[claude CLI not logged in / no credit — run `sygnif login` "
-                    f"(claude setup-token), or switch to a keyed model, e.g. "
-                    f"`/openrouter-free` with OPENROUTER_API_KEY. detail: {detail}]")
-        hint = detail or ("no output — usually means the claude CLI is not logged in "
-                          "in this environment; run `sygnif login`, or use a keyed "
-                          "model like `/openrouter-free`")
-        return f"[claude CLI exit {proc.returncode}: {hint}]"
+        err = (proc.stderr or "").strip()[:400]
+        low = err.lower()
+        if any(w in low for w in ("login", "auth", "subscription", "unauthorized")):
+            return f"[claude CLI not logged in — run `sygnif login`. detail: {err}]"
+        return f"[claude CLI exit {proc.returncode}: {err}]"
     try:
         data = json.loads(proc.stdout)
         return data.get("result") or ""
@@ -390,17 +375,9 @@ def _post_chat(spec: dict, messages: list[dict], t0: float) -> tuple[str, dict]:
     return text, _meta(messages, text, data.get("usage"), time.perf_counter() - t0)
 
 
-def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float,
-                 strict: bool = True) -> tuple[str, dict]:
+def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple[str, dict]:
     """Streaming POST parsing SSE lines. Raises on transport/HTTP failure so the
-    caller can fall back to a plain request.
-
-    When `strict`, the served model (from the SSE chunks' `model` field) is
-    checked against the requested one BEFORE the first content token is shown; a
-    family mismatch (e.g. a subscription backend silently falling back to its
-    default) raises `_ModelDrift` with nothing emitted, so the caller can
-    re-pin and re-issue cleanly instead of the seat quietly running — and
-    billing — a model the operator never selected."""
+    caller can fall back to a plain request."""
     url = spec["base_url"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
         "model": spec["id"], "messages": _http_messages(messages),
@@ -413,8 +390,6 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float,
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     parts: list[str] = []
     usage = None
-    served = None
-    checked = False
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -427,74 +402,22 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float,
                 chunk = json.loads(chunk_s)
             except Exception:  # noqa: BLE001
                 continue
-            served = served or chunk.get("model")
             choices = chunk.get("choices") or []
             if choices:
                 piece = (choices[0].get("delta") or {}).get("content")
                 if piece:
-                    if strict and not checked and served:
-                        if not _model_matches(spec.get("id", ""), served):
-                            raise _ModelDrift(served)  # nothing emitted yet
-                        checked = True
                     parts.append(piece)
                     if on_delta:
                         on_delta(piece)
             if chunk.get("usage"):
                 usage = chunk["usage"]
     text = "".join(parts)
-    meta = _meta(messages, text, usage, time.perf_counter() - t0)
-    meta["served_model"] = served
-    return text, meta
-
-
-# --- model-pin enforcement --------------------------------------------------
-# A subscription backend that doesn't honour a requested model id can silently
-# fall back to the account default (seen 2026-09-22: a `claude-fable-5-1` turn
-# came back served by Opus 4.8). The seat would then quietly run — and bill — a
-# model the operator never selected. PIN enforcement compares the SERVED model
-# against the requested one and, on a family mismatch, back-swaps to the
-# requested model and re-issues ONCE before continuing, rather than accepting
-# the drift. Off with SYGNIF_PY_PIN_MODEL=0.
-PIN_ENFORCE = os.environ.get("SYGNIF_PY_PIN_MODEL", "1") != "0"
-
-
-class _ModelDrift(Exception):
-    """The backend streamed a different model family than we asked for. Raised
-    before any output is shown so the caller can back-swap and re-issue clean."""
-
-    def __init__(self, served: str):
-        super().__init__(served)
-        self.served = served
-
-
-def _model_core(m: str) -> str:
-    """Comparable core of a model id: drop [ctx] tags and a trailing date stamp,
-    so 'claude-fable-5-1[1m]' and 'claude-fable-5-1-20260115' both reduce to
-    'claude-fable-5-1'."""
-    m = (m or "").lower().strip()
-    m = re.sub(r"\[[^\]]*\]", "", m)
-    m = re.sub(r"[-_]?\d{6,8}$", "", m)
-    return m.strip("-_ ")
-
-
-def _model_matches(requested: str, served: str) -> bool:
-    """True when `served` is the model we asked for. Lenient about date suffixes
-    and short aliases ('sonnet' vs 'claude-sonnet-4-5'), so only a real family
-    swap (fable -> opus) counts as a mismatch. Unknown either side -> no fight."""
-    r, s = _model_core(requested), _model_core(served)
-    if not r or not s:
-        return True
-    return r == s or r in s or s in r
+    return text, _meta(messages, text, usage, time.perf_counter() - t0)
 
 
 def call_model_stream(spec: dict, messages: list[dict], on_delta=None) -> tuple[str, dict]:
     """Model call for the REPL turn. Streams (with live on_delta) when possible,
-    returning (text, meta) where meta drives the pix info line.
-
-    Enforces the model pin on the streaming path: if the backend serves a
-    different model family, back-swap to the requested model and re-issue once;
-    if it STILL can't serve it, continue on what came back but say so loudly —
-    never a silent swap."""
+    returning (text, meta) where meta drives the pix info line."""
     t0 = time.perf_counter()
     if spec.get("provider") == "claude-cli":
         text = call_claude_cli(spec, messages)  # no token stream; emit whole
@@ -502,20 +425,10 @@ def call_model_stream(spec: dict, messages: list[dict], on_delta=None) -> tuple[
             on_delta(text)
         return text, _meta(messages, text, None, time.perf_counter() - t0)
     if on_delta is not None:
-        for attempt in range(2):
-            try:
-                return _stream_chat(spec, messages, on_delta, t0,
-                                    strict=(PIN_ENFORCE and attempt == 0))
-            except _ModelDrift as d:
-                pix.notice(
-                    f"  ↻ backend served {d.served}, not {spec.get('id')} — "
-                    f"re-pinning to {spec.get('id')} and retrying", "yellow")
-                if attempt == 0:
-                    continue
-                # strict=False on the retry can't raise; unreachable, but be safe.
-                break
-            except Exception:  # noqa: BLE001 — endpoint rejected stream; fall back
-                break
+        try:
+            return _stream_chat(spec, messages, on_delta, t0)
+        except Exception:  # noqa: BLE001 — endpoint rejected stream; fall back
+            pass
     return _post_chat(spec, messages, t0)
 
 
@@ -749,97 +662,6 @@ class SessionState:
             self.tps = meta["tps"]
 
 
-# Tools that touch a live target and REFUSE without an `authorization`
-# attestation (they route through tools._off_report). If a preset can reach any
-# of them, the model must be told the recorded scope AND told to pass the
-# attestation — otherwise it hits the refusal once and silently degrades to
-# running the raw binary through `shell`, losing the kali container's scanners.
-# The full set of tools whose implementation enforces the attestation (each body
-# calls tools._off_report or returns the REFUSED-for-authorization string). Kept
-# exhaustive so no gated tool slips a preset past the briefing — e.g. `purple`
-# carries only `emulate`, which a partial list would miss. If tools.py gains a new
-# gated tool, add it here.
-_GATED_TOOLS = {
-    "ad", "ad_enum", "aitm", "api_scan", "arp", "bloodyad", "bruteforce",
-    "cell_info", "cloud_audit", "cloudx", "coerce", "container_scan", "crack",
-    "dast", "emulate", "exploit_search", "inventory", "kube", "metasploit", "msf",
-    "netenum", "nuclei", "osint", "portscan", "postexploit", "privesc", "recon",
-    "sast", "secrets_scan", "subenum", "takeover", "tls_check", "velociraptor",
-    "vuln_check", "webshot", "wifi_capture", "wifi_crack", "winrm", "wpscan",
-    "wp_vulnscan", "graphql",
-}
-
-
-def _scope_briefing(reg: dict) -> str:
-    """For a preset that can reach an authorization-gated tool, surface the
-    recorded engagement scope and instruct the model to pass the attestation to
-    target-touching tools rather than falling back to raw `shell`. Empty string
-    when the preset has no gated tools, so non-pentest presets are unaffected."""
-    if not (set(reg) & _GATED_TOOLS):
-        return ""
-    scope_path = os.path.join(PENTEST_DIR, "SCOPE.md")
-    auth = targets = ""
-    def _field(ln: str) -> str:
-        # value after the FIRST colon, or "" if the line has none (a prose line
-        # that merely mentions the label must not crash us).
-        parts = ln.split(":", 1)
-        return parts[1].strip() if len(parts) > 1 else ""
-    try:
-        with open(scope_path, encoding="utf-8") as fh:
-            for ln in fh:
-                # anchor on the field label at the start of a bullet, so a prose
-                # sentence that happens to contain "in-scope targets" is ignored.
-                low = ln.lstrip("-* \t").lower()
-                if not auth and low.startswith("authorization / owner:"):
-                    auth = _field(ln)
-                elif not targets and low.startswith("in-scope targets"):
-                    targets = _field(ln)
-    except OSError:
-        pass
-    lines = [
-        "Engagement authorization gate (read before any target-touching tool):",
-        "- Tools such as portscan, netenum, tls_check, recon, nuclei, dast, wpscan, "
-        "takeover, osint, metasploit and bruteforce touch a live target and REFUSE "
-        "unless you pass an `authorization` argument — a short attestation of who "
-        "authorized the test.",
-        "- If such a tool returns `REFUSED: set 'authorization'`, do NOT rerun the raw "
-        "binary through `shell` instead. Add the `authorization` attestation and call "
-        "the tool again. These gated tools run inside the sygnif-kali container and "
-        "carry scanners (testssl, nuclei, sqlmap, ...) the bare host shell may lack.",
-        f"- Scope of record: {scope_path}.",
-    ]
-    if auth:
-        lines.append(f"- Recorded authorization: {auth}")
-        lines.append("  Reuse this exact string as the `authorization` argument for "
-                     "every in-scope tool call this engagement.")
-    if targets:
-        lines.append(f"- Recorded in-scope targets: {targets}")
-    if not auth:
-        lines.append("- No authorization is recorded yet. Before touching any target, "
-                     "fill in SCOPE.md or ask the operator, then use that attestation. "
-                     "Never invent authorization.")
-    lines += [
-        "",
-        "Container networking (why a tool may say 'connection refused'):",
-        "- The gated tools run INSIDE the sygnif-kali container. Its `127.0.0.1` / "
-        "`localhost` is the CONTAINER's own loopback, NOT this host. A target on the "
-        "host loopback (e.g. http://127.0.0.1:PORT) is unreachable from those tools and "
-        "returns 'connection refused' — that means wrong address, NOT that the tool is "
-        "broken or 'not callable'.",
-        "- To reach a host-loopback target from a container tool, use its Docker bridge "
-        "IP (for a target that is itself a container, `docker inspect -f "
-        "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <name>`; for a host "
-        "service, the docker0 gateway or `host.docker.internal`), not 127.0.0.1. The "
-        "`shell` tool runs on the host, so it CAN use 127.0.0.1 — but that is a fallback, "
-        "not a reason to abandon the container tool.",
-        "- `web(url=...)` fetches a page and works from this host; `web(query=...)` web "
-        "search may be bot-blocked here. If a search returns a bot-challenge, fetch a "
-        "specific URL with `web(url=...)` instead rather than concluding `web` is "
-        "unavailable.",
-    ]
-    return "\n".join(lines)
-
-
 def build_session(cfg: dict, preset_name: str | None):
     name, preset = models.get_preset(cfg, preset_name)
     reg = tools.build_registry(preset.get("tools", models.DEFAULT_TOOLS))
@@ -847,9 +669,6 @@ def build_session(cfg: dict, preset_name: str | None):
     # overlay (if any) is applied on top of the seat's own identity.
     system = identity.build_system(name, preset.get("focus", ""), reg,
                                    provider=preset.get("model"))
-    brief = _scope_briefing(reg)
-    if brief:
-        system = system + "\n\n" + brief
     return name, preset, reg, system
 
 
