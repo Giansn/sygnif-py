@@ -139,7 +139,7 @@ def _install_pentest_tools(missing: list[str]) -> None:
     if still_missing:
         pix.notice(f"  still missing (rc={rc}): " + ", ".join(still_missing) + " — install these manually", "yellow")
 
-_FENCE = re.compile(r"```(?:tool|json)?\s*(\{.*?\})\s*```", re.S)
+_FENCE = re.compile(r"```[a-zA-Z0-9_+.-]*[ \t]*\r?\n?(\{.*?\})\s*```", re.S)
 
 
 # --- tool-call parsing ------------------------------------------------------
@@ -171,37 +171,133 @@ def _balanced_obj(text: str, start: int) -> str | None:
     return None
 
 
+# Tool-call dialects vary by model: the canonical SYGNIF shape is
+# {"tool": <name>, "args": {...}}, but OpenAI-compatible models (GLM, GPT, …)
+# emit {"name","arguments"} or a {"function":{...}} object, sometimes with args
+# as a JSON *string*, and weaker models produce almost-JSON (trailing commas,
+# single quotes). The parser below accepts all of these. Non-canonical shapes are
+# only honoured when the resolved name is a real tool in the registry, so ordinary
+# JSON in a reply is never mistaken for a call.
+_NAME_KEYS = ("tool", "tool_name", "name")
+_ARG_KEYS = ("args", "arguments", "parameters", "params", "input")
+_CALLISH = ('"tool"', '"tool_name"', '"name"', '"function"')
+
+
+def _lenient_loads(s: str):
+    """json.loads, then two safe repairs for weaker models: strip trailing commas,
+    and promote single quotes ONLY when there are no double quotes to mangle.
+    Returns the parsed value, or None."""
+    try:
+        return json.loads(s)
+    except Exception:  # noqa: BLE001
+        pass
+    t = re.sub(r",\s*([}\]])", r"\1", s)                 # trailing commas
+    try:
+        return json.loads(t)
+    except Exception:  # noqa: BLE001
+        pass
+    if '"' not in t and "'" in t:                        # single-quoted JSON
+        try:
+            return json.loads(t.replace("'", '"'))
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+def _coerce_args(v):
+    """Normalise an args value to a dict: a dict passes through; a JSON string
+    (OpenAI-native stringifies arguments) is parsed; anything else becomes {}."""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str) and v.strip():
+        d = _lenient_loads(v.strip())
+        if isinstance(d, dict):
+            return d
+    return {}
+
+
+def _extract_call(obj):
+    """(name, args, explicit) from a parsed object across the common shapes, or
+    None. explicit=True only for the canonical "tool" key (trusted even when the
+    name is unknown); other shapes are validated against the registry by the caller."""
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function")                              # OpenAI tool-call object
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"].strip():
+        return fn["name"].strip(), _coerce_args(fn.get("arguments") if "arguments" in fn else fn.get("args")), False
+    name, explicit = "", False
+    for k in _NAME_KEYS:
+        v = obj.get(k)
+        if isinstance(v, str) and v.strip():
+            name, explicit = v.strip(), (k == "tool")
+            break
+    if not name:
+        return None
+    args = {}
+    for k in _ARG_KEYS:
+        if k in obj:
+            args = _coerce_args(obj[k])
+            break
+    return name, args, explicit
+
+
 def _candidates(text: str):
     seen_spans = []
     for m in _FENCE.finditer(text):
-        body_start = text.index("{", m.start())
+        try:
+            body_start = text.index("{", m.start())
+        except ValueError:
+            continue
         obj = _balanced_obj(text, body_start) or m.group(1)
         seen_spans.append((body_start, body_start + len(obj)))
         yield obj
-    for m in re.finditer(r'\{[^{}]*"tool"', text):
-        s = m.start()
+    # bare objects (no fence): walk each brace-delimited object that looks call-ish.
+    # Balancing (not a flat regex) means key order doesn't matter — args-before-tool
+    # and nested args are both found. Bounded so a huge reply can't blow up.
+    i, tried = 0, 0
+    while tried < 60:
+        s = text.find("{", i)
+        if s == -1:
+            break
+        i = s + 1
         if any(a <= s < b for a, b in seen_spans):
             continue
         obj = _balanced_obj(text, s)
-        if obj:
+        if not obj:
+            continue
+        tried += 1
+        if any(k in obj for k in _CALLISH):
             yield obj
 
 
-def parse_tool_call(text: str):
-    """Return (name, args) for the first well-formed tool call, else None."""
+def parse_tool_call(text: str, reg=None):
+    """Return (name, args) for the first tool call in the text, else None.
+    Adaptive across model dialects (see the note above). Non-canonical shapes are
+    accepted only when `reg` is None (test/back-compat) or the name is in `reg`."""
     for cand in _candidates(text):
-        try:
-            obj = json.loads(cand)
-        except Exception:
+        obj = _lenient_loads(cand)
+        if obj is None:
             continue
-        if isinstance(obj, dict) and "tool" in obj:
-            name = str(obj.get("tool", "")).strip()
-            args = obj.get("args") or {}
-            if not isinstance(args, dict):
-                args = {}
-            if name:
-                return name, args
+        ex = _extract_call(obj)
+        if not ex:
+            continue
+        name, args, explicit = ex
+        if explicit or reg is None or name in reg:
+            return name, args
     return None
+
+
+def _synth_tool_text(tool_calls) -> str:
+    """Render a native OpenAI `tool_calls` array as the seat's fenced ```tool block
+    so the normal text loop parses it. Uses the first call."""
+    try:
+        fn = (tool_calls[0].get("function") or {})
+        name = (fn.get("name") or "").strip()
+        if name:
+            return "```tool\n" + json.dumps({"tool": name, "args": _coerce_args(fn.get("arguments"))}) + "\n```"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 # --- transport: Claude subscription via the official claude CLI -------------
@@ -368,7 +464,12 @@ def _post_chat(spec: dict, messages: list[dict], t0: float) -> tuple[str, dict]:
         return (f"[endpoint error: {e} — is {spec['base_url']} reachable?]",
                 _meta(messages, "", None, time.perf_counter() - t0))
     try:
-        text = data["choices"][0]["message"]["content"] or ""
+        msg = data["choices"][0]["message"]
+        text = msg.get("content") or ""
+        # a function-calling model may answer via native tool_calls with empty
+        # content — fold that back into the fenced protocol the loop understands.
+        if not text.strip() and msg.get("tool_calls"):
+            text = _synth_tool_text(msg["tool_calls"]) or text
     except Exception:
         return (f"[endpoint: unexpected response shape: {json.dumps(data)[:500]}]",
                 _meta(messages, "", None, time.perf_counter() - t0))
@@ -389,6 +490,7 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple
         headers["Authorization"] = f"Bearer {spec['api_key']}"
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     parts: list[str] = []
+    tool_frag: dict = {}   # index -> {"name","args"} accumulated native tool_calls
     usage = None
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         for raw in resp:
@@ -404,14 +506,27 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple
                 continue
             choices = chunk.get("choices") or []
             if choices:
-                piece = (choices[0].get("delta") or {}).get("content")
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
                 if piece:
                     parts.append(piece)
                     if on_delta:
                         on_delta(piece)
+                for tc in (delta.get("tool_calls") or []):
+                    slot = tool_frag.setdefault(tc.get("index", 0), {"name": "", "args": ""})
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
             if chunk.get("usage"):
                 usage = chunk["usage"]
     text = "".join(parts)
+    # native tool_calls with no prose content -> render as a fenced block
+    if not text.strip() and tool_frag:
+        first = tool_frag[min(tool_frag)]
+        if first["name"]:
+            text = _synth_tool_text([{"function": {"name": first["name"], "arguments": first["args"]}}])
     return text, _meta(messages, text, usage, time.perf_counter() - t0)
 
 
@@ -596,6 +711,7 @@ def compact_messages(spec: dict, messages: list[dict], notify=print) -> bool:
 
 
 def run_turn(spec: dict, messages: list[dict], reg: dict, confirm: bool, state=None) -> None:
+    nudged = False
     for _ in range(MAX_TOOL_ITERS):
         compact_messages(spec, messages, notify=pix.notice)  # turn start AND between rounds
         if pix.PIX:
@@ -606,8 +722,21 @@ def run_turn(spec: dict, messages: list[dict], reg: dict, confirm: bool, state=N
             text, meta = call_model_stream(spec, messages)
         if state is not None:
             state.update(spec, meta)
-        call = parse_tool_call(text)
+        call = parse_tool_call(text, reg)
         if not call:
+            # A code fence that didn't parse as a call is almost always a malformed
+            # tool call, not a final answer. Nudge once to re-emit clean JSON before
+            # treating the reply as prose — one retry, so a real prose answer with a
+            # stray fence still gets through.
+            if not nudged and _FENCE.search(text):
+                nudged = True
+                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "user", "content": (
+                    "That looked like a tool call but I could not parse it. Re-emit EXACTLY ONE "
+                    'fenced ```tool block containing valid JSON {"tool":"<name>","args":{...}} '
+                    "and nothing after it. If you meant to answer, reply in plain prose with no code fence.")})
+                pix.notice("  [unparseable tool block — asked the model to re-emit]", "yellow")
+                continue
             if not pix.PIX:
                 print(f"\nSYGNIF> {text}\n")
             messages.append({"role": "assistant", "content": text})
