@@ -27,6 +27,7 @@ import os
 import re
 import time
 import subprocess
+import shlex
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,8 +62,65 @@ def _truncate(text: str, limit: int = MAX_OUTPUT) -> str:
     return text[:limit] + f"\n[... output truncated at {limit} chars ...]"
 
 
+_DOCKER_ROUTE = None  # cache: "" = local docker; "<ssh prefix> " = remote; False = none anywhere
+
+
+def _docker_route():
+    """Where Docker lives, computed once. Returns "" (local docker present — never
+    reroute), an ssh command prefix (route Docker to a remote host), or False (no
+    Docker anywhere — leave the command alone so it fails honestly).
+
+    A Docker-less seat (e.g. the tablet) thus drives the sygnif-kali container and
+    the AVD on e14 instead of silently falling back to host execution. Retarget or
+    disable via SYGNIF_PY_DOCKER_SSH_HOST (default 'e14'; '' disables remote routing).
+    Uses subprocess directly — never _run_host — so it cannot recurse."""
+    global _DOCKER_ROUTE
+    if _DOCKER_ROUTE is not None:
+        return _DOCKER_ROUTE
+    if _IS_WINDOWS:
+        _DOCKER_ROUTE = ""
+        return _DOCKER_ROUTE
+
+    def _rc(cmd, t):
+        try:
+            return subprocess.run(["bash", "-lc", cmd], capture_output=True, timeout=t).returncode
+        except Exception:  # noqa: BLE001
+            return 1
+
+    if _rc("command -v docker >/dev/null 2>&1", 10) == 0:
+        _DOCKER_ROUTE = ""  # local docker: run as-is
+        return _DOCKER_ROUTE
+    host = os.environ.get("SYGNIF_PY_DOCKER_SSH_HOST", "e14")
+    if host:
+        q = shlex.quote(host)
+        if _rc(f"ssh -o BatchMode=yes -o ConnectTimeout=8 {q} 'command -v docker >/dev/null 2>&1'", 25) == 0:
+            _DOCKER_ROUTE = f"ssh -o BatchMode=yes {q} "
+            return _DOCKER_ROUTE
+    _DOCKER_ROUTE = False  # no docker locally or on the remote
+    return _DOCKER_ROUTE
+
+
+def _route_docker(command: str) -> str:
+    """Rewrite a Docker-control command to run on the remote when local Docker is
+    absent. Only touches 'docker ...' and the 'command -v docker' probe; the actual
+    pentest payload rides inside 'docker exec ... bash -lc <payload>', so quoting the
+    whole string once and handing it to ssh as a single argument survives both shells."""
+    if _IS_WINDOWS:
+        return command
+    s = command.lstrip()
+    if not (s.startswith("docker ") or s.startswith("command -v docker")):
+        return command
+    route = _docker_route()
+    if isinstance(route, str) and route:  # remote
+        return route + shlex.quote(command)
+    return command  # "" local docker, or False = none anywhere
+
+
 def _run_host(command: str, timeout: int) -> tuple[str, int]:
-    """Run a command string on the host. Never raises."""
+    """Run a command string on the host. Never raises. Docker-control commands are
+    transparently routed to a remote host (see _docker_route) when this box has no
+    local Docker, so a Docker-less seat still reaches the container stack on e14."""
+    command = _route_docker(command)
     try:
         if _IS_WINDOWS:
             args, shell = command, True
@@ -1599,6 +1657,145 @@ def tool_recon(args: dict) -> str:
     return _off_report("recon", args.get("authorization", ""), "recon " + dom, out, rc, where)
 
 
+# 1b. jwt — JSON Web Token testing/forging with jwt_tool (in the toolbox)
+def tool_jwt(args: dict) -> str:
+    """JWT testing/forging via jwt_tool. Operates on a supplied token STRING — it does
+    not hit a live endpoint. modes: decode (default), crack, sign, tamper, exploit."""
+    token = str(args.get("token", "")).strip()
+    if not token:
+        return ("jwt: ERROR — no 'token' given, so NOTHING ran. Pass the JWT string. modes: "
+                "decode (default; parse header/payload + checks) | crack ('wordlist', dictionary "
+                "attack on the HMAC secret) | sign ('secret' [+'algorithm'], re-sign) | tamper "
+                "('claim'+'value' [+'secret'], set a payload claim and optionally re-sign) | "
+                "exploit ('exploit': none|null|blank|psychic|key_confusion(+'pubkey')|"
+                "jwks_spoof(+'jwks_url')). Do NOT answer from memory.")
+    q = shlex.quote
+    mode = str(args.get("mode", "decode")).strip().lower()
+    parts = ["jwt_tool", q(token)]
+    if mode == "decode":
+        pass
+    elif mode == "crack":
+        wl = str(args.get("wordlist", "")).strip() or "/usr/share/wordlists/rockyou.txt"
+        parts += ["-C", "-d", q(wl)]
+    elif mode == "sign":
+        sec = str(args.get("secret", "")).strip()
+        if not sec:
+            return "jwt sign: needs 'secret' (the HMAC key to sign with)."
+        alg = str(args.get("algorithm", "hs256")).strip().lower()
+        parts += ["-S", q(alg), "-p", q(sec)]
+    elif mode == "tamper":
+        claim = str(args.get("claim", "")).strip()
+        value = str(args.get("value", "")).strip()
+        if not claim:
+            return "jwt tamper: needs 'claim' and 'value' (the payload claim to set, e.g. admin=true)."
+        parts += ["-I", "-pc", q(claim), "-pv", q(value)]
+        sec = str(args.get("secret", "")).strip()
+        if sec:
+            alg = str(args.get("algorithm", "hs256")).strip().lower()
+            parts += ["-S", q(alg), "-p", q(sec)]
+    elif mode == "exploit":
+        ex = str(args.get("exploit", "")).strip().lower()
+        xmap = {"none": "a", "null": "n", "blank": "b", "psychic": "p",
+                "jwks_spoof": "s", "inline_jwks": "i", "key_confusion": "k"}
+        code = xmap.get(ex)
+        if not code:
+            return "jwt exploit: 'exploit' must be one of " + ", ".join(xmap) + "."
+        parts += ["-X", code]
+        if ex == "key_confusion":
+            pk = str(args.get("pubkey", "")).strip()
+            if not pk:
+                return ("jwt exploit key_confusion: needs 'pubkey' — path (inside the toolbox) to the "
+                        "server's RSA public key. Fetch it first, e.g. from /.well-known/jwks or the TLS cert.")
+            parts += ["-pk", q(pk)]
+        elif ex == "jwks_spoof":
+            ju = str(args.get("jwks_url", "")).strip()
+            if ju:
+                parts += ["-ju", q(ju)]
+    else:
+        return "jwt: unknown 'mode' " + q(mode) + " (decode|crack|sign|tamper|exploit)."
+    extra = str(args.get("extra", "")).strip()
+    if extra:
+        parts.append(extra)
+    out, rc, where = _off_run(" ".join(parts), min(OFFENSIVE_TIMEOUT, 1800), need="jwt_tool")
+    return _off_report("jwt", args.get("authorization", "token-manipulation (no live target)"),
+                       " ".join(parts), out, rc, where)
+
+
+# 1c. glab — GitLab CLI against an authorized instance (API, repos, CI, tokens)
+def tool_glab(args: dict) -> str:
+    """Drive the GitLab CLI (glab) against an instance you are authorized on. Pass the
+    subcommand in 'args' (e.g. 'api /version', 'repo list', 'ci list', 'auth status').
+    Provide 'host' (e.g. 127.0.0.1:8929) and 'token' — for the lab, source
+    ~/sygnif-pentest/lab-creds.env and pass $GL19_URL host + $GL19_TOKEN."""
+    sub = str(args.get("args", "")).strip()
+    if not sub:
+        return ("glab: no 'args'. Give a glab subcommand, e.g. \"api /projects\", \"repo list\", "
+                "\"ci status\", \"auth status\". Add 'host' (GITLAB_HOST) + 'token' (GITLAB_TOKEN).")
+    q = shlex.quote
+    host = str(args.get("host", "")).strip().replace("http://", "").replace("https://", "")
+    token = str(args.get("token", "")).strip()
+    proto = str(args.get("protocol", "")).strip().lower()  # http|https; http lab instances need this
+    env = []
+    if host:
+        env.append("GITLAB_HOST=" + q(host))
+    if token:
+        env.append("GITLAB_TOKEN=" + q(token))
+    # glab defaults to https and errors on a plain-http instance ("HTTP response to HTTPS client");
+    # set the per-host api_protocol first when the caller says http.
+    pre = ""
+    if host and proto == "http":
+        pre = "glab config set -h " + q(host) + " api_protocol http >/dev/null 2>&1; "
+    cmd = pre + (" ".join(env) + " " if env else "") + "glab " + sub
+    out, rc, where = _off_run(cmd, min(OFFENSIVE_TIMEOUT, 600), need="glab")
+    return _off_report("glab", args.get("authorization", "gitlab (own/authorized instance)"),
+                       "glab " + sub, out, rc, where)
+
+
+# 1d. graphw00f — GraphQL engine detection + fingerprinting
+def tool_graphw00f(args: dict) -> str:
+    """Fingerprint a GraphQL endpoint's server engine (Apollo, Hasura, graphql-yoga, …)
+    with graphw00f — the precursor to engine-specific attacks. Requires 'target'+'authorization'."""
+    target = str(args.get("target", "") or args.get("url", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    q = shlex.quote
+    parts = ["graphw00f", "-d", "-f", "-t", q(target)]
+    extra = str(args.get("extra", "")).strip()
+    if extra:
+        parts.append(extra)
+    out, rc, where = _off_run(" ".join(parts), min(OFFENSIVE_TIMEOUT, 600), need="graphw00f")
+    return _off_report("graphw00f", args.get("authorization", ""), " ".join(parts), out, rc, where, target=target)
+
+
+# 1e. clairvoyance — recover a GraphQL schema when introspection is disabled
+def tool_clairvoyance(args: dict) -> str:
+    """Recover a GraphQL schema via field-suggestion brute force (clairvoyance) when
+    introspection is turned off. Requires 'target'+'authorization'. 'wordlist' optional
+    (a field-name list); 'output' writes JSON schema to a path in the workspace mount."""
+    target = str(args.get("target", "") or args.get("url", "")).strip()
+    g = _authz(args, target)
+    if g:
+        return g
+    q = shlex.quote
+    parts = ["clairvoyance", q(target)]
+    wl = str(args.get("wordlist", "")).strip()
+    if wl:
+        parts += ["-w", q(wl)]
+    out_path = str(args.get("output", "")).strip()
+    if out_path:
+        parts += ["-o", q(out_path)]
+    for _k, _v in _web_auth_headers(args):
+        parts += ["-H", q(_k + ": " + _v)]
+    if str(args.get("insecure", "")).strip().lower() in ("1", "true", "yes"):
+        parts.append("-k")
+    extra = str(args.get("extra", "")).strip()
+    if extra:
+        parts.append(extra)
+    out, rc, where = _off_run(" ".join(parts), min(OFFENSIVE_TIMEOUT, 1800), need="clairvoyance")
+    return _off_report("clairvoyance", args.get("authorization", ""), " ".join(parts), out, rc, where, target=target)
+
+
 # 2. nuclei — templated vulnerability scan (community + optional Wordfence WP CVEs)
 def tool_nuclei(args: dict) -> str:
     target = str(args.get("target", "") or args.get("url", "")).strip()
@@ -2351,6 +2548,64 @@ def tool_secrets_scan(args: dict) -> str:
         return ("secrets_scan needs trufflehog/gitleaks. Either install them on this host, or "
                 "provision the toolbox with `sygnif kali-setup` (Docker) and they'll run there.")
     return _off_report("secrets_scan", "own code", f"scan {path}", out, rc, where)
+
+
+# 1b. trufflehog — deep secret hunting across filesystem/git/github/gitlab, with live verification
+def tool_trufflehog(args: dict) -> str:
+    """Hunt secrets with trufflehog across a filesystem, git repo, GitHub org/repo, or GitLab
+    instance, verifying hits against the live provider. Complements secrets_scan (which only
+    runs trufflehog+gitleaks over a local path) by reaching REMOTE sources and validating."""
+    q = shlex.quote
+    source = str(args.get("source", "filesystem")).strip().lower()
+    target = str(args.get("target", "") or args.get("path", "") or args.get("repo", "")).strip()
+    results = str(args.get("results", "verified")).strip().lower()  # verified|unknown|unverified|all
+    parts = ["trufflehog", source, "--no-update"]
+    if results and results != "all":
+        parts.append("--results=" + q(results))
+    if str(args.get("json", "")).strip().lower() in ("1", "true", "yes"):
+        parts.append("--json")
+    if source == "filesystem":
+        parts.append(q(target or "."))  # path must be inside the container/workspace mount
+    elif source == "git":
+        if not target:
+            return "trufflehog git: needs 'target' (repo URL, or a local repo path in the toolbox/workspace mount)."
+        br = str(args.get("branch", "")).strip()
+        since = str(args.get("since", "")).strip()
+        if br:
+            parts += ["--branch", q(br)]
+        if since:
+            parts += ["--since-commit", q(since)]
+        parts.append(q(target))
+    elif source == "github":
+        org = str(args.get("org", "")).strip()
+        if not target and not org:
+            return "trufflehog github: needs 'target' (a --repo URL) or 'org' (a --org name)."
+        if target:
+            parts += ["--repo", q(target)]
+        if org:
+            parts += ["--org", q(org)]
+        tok = str(args.get("token", "")).strip()
+        if tok:
+            parts += ["--token", q(tok)]
+    elif source == "gitlab":
+        tok = str(args.get("token", "")).strip()
+        if not tok:
+            return ("trufflehog gitlab: needs 'token' (a GitLab PAT — it scans every repo that token can see; "
+                    "for the lab, source ~/sygnif-pentest/lab-creds.env and pass $GL19_TOKEN).")
+        parts += ["--token", q(tok)]
+        ep = str(args.get("endpoint", "")).strip()
+        if ep:
+            parts += ["--endpoint", q(ep)]
+        if target:
+            parts += ["--repo", q(target)]
+    else:
+        return "trufflehog: 'source' must be filesystem|git|github|gitlab."
+    extra = str(args.get("extra", "")).strip()
+    if extra:
+        parts.append(extra)
+    out, rc, where = _off_run(" ".join(parts), min(OFFENSIVE_TIMEOUT, 1800), need="trufflehog")
+    return _off_report("trufflehog", args.get("authorization", "secret-scan (own/authorized sources)"),
+                       " ".join(parts), out, rc, where)
 
 
 # 2. sast — semgrep static analysis of your own source (runs on host)
@@ -4447,6 +4702,16 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "args": {"path": "repo/dir to scan (default .)"},
         "func": tool_secrets_scan,
     },
+    "trufflehog": {
+        "desc": ("Deep secret hunting with trufflehog, with LIVE verification of hits, across a "
+                 "'source': filesystem (default; 'target' path in the workspace mount) | git ('target' "
+                 "repo URL or local path, optional 'branch'/'since') | github ('target' repo URL or "
+                 "'org' name, optional 'token') | gitlab ('token' required, optional 'endpoint'/'repo'). "
+                 "'results'=verified (default, only API-confirmed) |unknown|unverified|all. Complements "
+                 "secrets_scan by reaching remote repos/orgs/instances and validating."),
+        "args": {"source": "filesystem|git|github|gitlab", "target": "path/repo-URL/repo depending on source", "org": "GitHub org (github)", "endpoint": "GitLab base URL (gitlab)", "token": "PAT for github/gitlab", "results": "verified|unknown|unverified|all (default verified)", "branch": "git branch", "since": "git since-commit", "json": "true for JSON output", "extra": "raw trufflehog flags"},
+        "func": tool_trufflehog,
+    },
     "sast": {
         "desc": "Static analysis of YOUR source for vulns (injection/XSS/secrets/misconfig) via semgrep. Runs on this host (needs semgrep).",
         "args": {"path": "source dir (default .)", "config": "semgrep config (default auto)"},
@@ -4568,6 +4833,39 @@ BUILTIN_TOOLS: dict[str, dict] = {
                  "template set. Requires 'target'+'authorization'."),
         "args": {"target": "URL you are authorized to test", "authorization": "attestation", "tags": "optional nuclei tags e.g. wordpress,cve", "severity": "optional e.g. critical,high", "extra": "optional extra flags"},
         "func": tool_nuclei,
+    },
+    "jwt": {
+        "desc": ("JSON Web Token testing/forging with jwt_tool (toolbox). Operates on the supplied "
+                 "'token' STRING, not a live endpoint. modes: decode (default — parse header/payload "
+                 "+ security checks) | crack (dictionary attack on the HMAC secret; 'wordlist', "
+                 "default rockyou) | sign (re-sign with a known 'secret' [+'algorithm']) | tamper "
+                 "(set a payload 'claim'+'value', optionally re-sign with 'secret') | exploit "
+                 "('exploit': none=alg:none, null=null-sig, blank=blank-password, psychic=ECDSA, "
+                 "key_confusion(+'pubkey'), jwks_spoof(+'jwks_url'))."),
+        "args": {"token": "the JWT string (required)", "mode": "decode|crack|sign|tamper|exploit", "secret": "HMAC key for sign/tamper", "wordlist": "dict path for crack", "claim": "payload claim to set (tamper)", "value": "claim value (tamper)", "algorithm": "sign alg, default hs256", "exploit": "none|null|blank|psychic|key_confusion|jwks_spoof", "pubkey": "RSA public-key path (key_confusion)", "jwks_url": "URL (jwks_spoof)", "extra": "raw jwt_tool flags to append"},
+        "func": tool_jwt,
+    },
+    "glab": {
+        "desc": ("GitLab CLI (glab) against an instance you are authorized on. Put the subcommand in "
+                 "'args' (e.g. 'api /version', 'api /users', 'repo list', 'ci list'). Provide 'host' "
+                 "(e.g. 127.0.0.1:8929) and 'token'. For the lab, use $GL19_URL host + $GL19_TOKEN "
+                 "from ~/sygnif-pentest/lab-creds.env."),
+        "args": {"args": "glab subcommand + flags (required)", "host": "GITLAB_HOST, e.g. 172.17.0.4:8929 (container-net IP, not 127.0.0.1, when run from the toolbox)", "token": "GITLAB_TOKEN (PAT)", "protocol": "http|https (default https; http lab instances need http)"},
+        "func": tool_glab,
+    },
+    "graphw00f": {
+        "desc": ("Fingerprint a GraphQL endpoint's server engine (Apollo, Hasura, graphql-yoga, …) with "
+                 "graphw00f — detect + fingerprint mode. Names the engine so you can pick engine-specific "
+                 "attacks. Requires 'target' (the GraphQL URL) + 'authorization'."),
+        "args": {"target": "GraphQL endpoint URL you are authorized to test", "authorization": "attestation", "extra": "raw graphw00f flags"},
+        "func": tool_graphw00f,
+    },
+    "clairvoyance": {
+        "desc": ("Recover a GraphQL schema when introspection is DISABLED, via field-suggestion brute "
+                 "force (clairvoyance). Requires 'target'+'authorization'. 'wordlist' = field-name list; "
+                 "'output' writes the JSON schema to a workspace path; 'insecure'=true skips TLS verify."),
+        "args": {"target": "GraphQL endpoint URL you are authorized to test", "authorization": "attestation", "wordlist": "optional field-name wordlist path", "output": "optional JSON schema output path (workspace mount)", "insecure": "true to skip TLS verify", "extra": "raw clairvoyance flags"},
+        "func": tool_clairvoyance,
     },
     "wpscan": {
         "desc": ("Full WordPress enumeration (wpscan): vulnerable plugins/themes, users, config "

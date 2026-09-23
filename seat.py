@@ -47,16 +47,29 @@ MAX_TOOL_ITERS = int(os.environ.get("SYGNIF_PY_MAX_ITERS", "50"))
 # much recent tool output stays verbatim, how many recent user turns are never
 # summarized, and whether the model is asked for a summary (else extractive digest).
 HISTORY_BUDGET_CHARS = int(os.environ.get("SYGNIF_PY_HISTORY_BUDGET", "80000"))
+_HISTORY_BUDGET_ENV_SET = bool(os.environ.get("SYGNIF_PY_HISTORY_BUDGET"))
 HISTORY_TOOL_PROTECT_CHARS = int(os.environ.get("SYGNIF_PY_TOOL_PROTECT", "24000"))
 HISTORY_TOOL_HEAD_CHARS = int(os.environ.get("SYGNIF_PY_TOOL_HEAD", "600"))
 HISTORY_MSG_HEAD_CHARS = int(os.environ.get("SYGNIF_PY_MSG_HEAD", "1200"))
 COMPACT_KEEP_TURNS = int(os.environ.get("SYGNIF_PY_COMPACT_KEEP_TURNS", "4"))
+# Tool-call display: how many chars of the args JSON and of the result to show in the
+# pane. 0 = show it ALL (default — fully visible tool calls). The result is already
+# bounded by the tool layer's MAX_OUTPUT (SYGNIF_PY_MAXOUT, default 8000), so full
+# display cannot run away. Set these to a positive number to shorten the pane again.
+DISPLAY_ARGS_CHARS = int(os.environ.get("SYGNIF_PY_DISPLAY_ARGS", "0"))
+DISPLAY_RESULT_CHARS = int(os.environ.get("SYGNIF_PY_DISPLAY_RESULT", "0"))
+# When the user-turn count is too low for the KEEP_TURNS gate (autonomous / tool-heavy
+# runs fire dozens of tool rounds off 1-2 prompts), summarize by position instead: keep
+# this many chars of the newest tail verbatim and summarize everything older.
+RECENT_TAIL_CHARS = int(os.environ.get("SYGNIF_PY_RECENT_TAIL", "40000"))
+# ~chars per token; used only to derive a budget from a model's advertised context window.
+_CHARS_PER_TOKEN = 3.6
 COMPACT_SUMMARY = os.environ.get("SYGNIF_PY_COMPACT_SUMMARY", "1") != "0"
 COMPACT_PREFIX = "[Compacted earlier conversation — older turns summarized to free context]\n\n"
 CONFIRM_TOOLS = {"shell", "write_file", "dev_apply_and_test"}  # gated when --confirm / SYGNIF_PY_CONFIRM=1
 # Offensive tools that actively touch a target — also gated under --confirm so a live
 # scan/exploit against an authorized host still gets a human yes (review P2-7).
-OFFENSIVE_TOOLS = {"recon", "nuclei", "wpscan", "dast", "metasploit", "msf", "bruteforce",
+OFFENSIVE_TOOLS = {"recon", "nuclei", "jwt", "graphw00f", "clairvoyance", "wpscan", "dast", "metasploit", "msf", "bruteforce",
                    "crack", "postexploit", "privesc", "wifi_capture", "wifi_crack",
                    "portscan", "netenum", "takeover", "tls_check", "exploit", "c2", "ad", "aitm", "velociraptor",
                    "coerce", "bloodyad", "winrm", "cloudx", "kube", "emulate", "arp"}
@@ -660,35 +673,69 @@ def _summarize_older(spec: dict, older: list[dict], previous: str | None) -> str
     return text
 
 
+def _effective_budget(spec: dict) -> int:
+    """Char budget for the whole history. An explicit SYGNIF_PY_HISTORY_BUDGET always
+    wins; otherwise derive from the model's advertised context window (spec['context'],
+    in tokens) so a 200k-token model isn't compacted at the 80k-char small-model default.
+    Never returns below the 80k floor."""
+    if _HISTORY_BUDGET_ENV_SET:
+        return HISTORY_BUDGET_CHARS
+    ctx = spec.get("context") if isinstance(spec, dict) else None
+    if isinstance(ctx, int) and ctx > 0:
+        # keep ~55% of the window for history; the rest is response + headroom
+        return max(HISTORY_BUDGET_CHARS, int(ctx * _CHARS_PER_TOKEN * 0.55))
+    return HISTORY_BUDGET_CHARS
+
+
+def _tail_cut(body: list[dict], user_idx: list[int], tail_budget: int) -> int | None:
+    """Index at which to split older|recent for the summary tier. Prefer the last
+    COMPACT_KEEP_TURNS user turns; if too few user turns exist (autonomous run), fall
+    back to keeping the newest `tail_budget` chars verbatim. None when there's nothing
+    worth summarizing (too little older content)."""
+    if len(user_idx) > COMPACT_KEEP_TURNS:
+        return user_idx[-COMPACT_KEEP_TURNS]
+    running, cut = 0, 0
+    for i in range(len(body) - 1, -1, -1):
+        running += len(body[i].get("content") or "")
+        if running > tail_budget:
+            cut = i + 1  # keep i+1..end verbatim, summarize 0..i
+            break
+    # need a real older chunk to be worth a summary round
+    return cut if cut >= 2 else None
+
+
 def compact_messages(spec: dict, messages: list[dict], notify=print) -> bool:
-    """Compact `messages` IN PLACE when over HISTORY_BUDGET_CHARS. Returns True if changed.
-    Never raises — a compaction failure must not kill the turn."""
+    """Compact `messages` IN PLACE when over the effective budget. Returns True if it
+    actually reduced the history. Never raises — a failure must not kill the turn."""
     try:
-        if _history_chars(messages) <= HISTORY_BUDGET_CHARS:
+        budget_total = _effective_budget(spec)
+        before = _history_chars(messages)
+        if before <= budget_total:
             return False
         system = messages[0] if messages and messages[0].get("role") == "system" else None
         sys_chars = len(system["content"]) if system else 0
         body = messages[1:] if system else list(messages)
-        budget = HISTORY_BUDGET_CHARS - sys_chars
+        budget = budget_total - sys_chars
         body, collapsed, freed = _collapse_tool_outputs(body)
         how = [f"collapsed {collapsed} tool outputs"] if collapsed else []
         if _history_chars(body) > budget:
             user_idx = [i for i, m in enumerate(body)
                         if m.get("role") == "user" and not (m.get("content") or "").startswith(COMPACT_PREFIX)]
-            if len(user_idx) > COMPACT_KEEP_TURNS:
-                cut = user_idx[-COMPACT_KEEP_TURNS]
+            cut = _tail_cut(body, user_idx, min(RECENT_TAIL_CHARS, max(budget // 2, HISTORY_MSG_HEAD_CHARS)))
+            if cut is not None:
                 older, recent = body[:cut], body[cut:]
                 previous = None
                 if older and older[0].get("role") == "user" and (older[0].get("content") or "").startswith(COMPACT_PREFIX):
                     previous = older[0]["content"][len(COMPACT_PREFIX):]
                     older = older[1:]
-                summary = _summarize_older(spec, older, previous) if COMPACT_SUMMARY else None
-                mode = "model summary"
-                if summary is None:
-                    summary = ((previous + "\n\n---\n\n") if previous else "") + _extractive_digest(older)
-                    mode = "extractive digest (model summary unavailable)"
-                body = [{"role": "user", "content": COMPACT_PREFIX + summary}] + recent
-                how.append(f"{len(older)} older msgs → {mode}" + (" (updated previous)" if previous else ""))
+                if older:
+                    summary = _summarize_older(spec, older, previous) if COMPACT_SUMMARY else None
+                    mode = "model summary"
+                    if summary is None:
+                        summary = ((previous + "\n\n---\n\n") if previous else "") + _extractive_digest(older)
+                        mode = "extractive digest (model summary unavailable)"
+                    body = [{"role": "user", "content": COMPACT_PREFIX + summary}] + recent
+                    how.append(f"{len(older)} older msgs → {mode}" + (" (updated previous)" if previous else ""))
         if _history_chars(body) > budget:  # backstop, ported from the Desk
             running, cut_n = 0, 0
             for i in range(len(body) - 1, -1, -1):
@@ -702,10 +749,15 @@ def compact_messages(spec: dict, messages: list[dict], notify=print) -> bool:
                 cut_n += 1
             if cut_n:
                 how.append(f"truncated {cut_n} older turns")
-        before = _history_chars(messages)
         messages[:] = ([system] if system else []) + body
-        notify(f"  [context compacted: {before} → {_history_chars(messages)} chars — {'; '.join(how)}]")
-        return True
+        after = _history_chars(messages)
+        if after < before:
+            notify(f"  [context compacted: {before} → {after} chars — {'; '.join(how)}]")
+            return True
+        # over budget but nothing further to give up (all recent/protected) — say so once,
+        # honestly, instead of printing a misleading no-op "compacted N → N" every turn.
+        notify(f"  [context at {after} chars, over the {budget_total} budget, but only recent/protected content remains — not compacting]")
+        return False
     except Exception as e:  # noqa: BLE001
         notify(f"  [compaction skipped: {e}]")
         return False
@@ -750,7 +802,10 @@ def run_turn(spec: dict, messages: list[dict], reg: dict, confirm: bool, state=N
             pre = _FENCE.sub("", text).strip()
             if pre:
                 print(f"\nSYGNIF> {pre}")
-        pix.tool_start(name, json.dumps(args, ensure_ascii=False)[:200])
+        _args_json = json.dumps(args, ensure_ascii=False)
+        if DISPLAY_ARGS_CHARS and len(_args_json) > DISPLAY_ARGS_CHARS:
+            _args_json = _args_json[:DISPLAY_ARGS_CHARS] + " …"
+        pix.tool_start(name, _args_json)
         if confirm and (name in CONFIRM_TOOLS or name in OFFENSIVE_TOOLS):
             try:
                 ans = input(pix.dim("    run this? [y/N] ")).strip().lower()
@@ -759,7 +814,10 @@ def run_turn(spec: dict, messages: list[dict], reg: dict, confirm: bool, state=N
             out = tools.run_tool(reg, name, args) if ans in ("y", "yes") else "[operator declined this tool call]"
         else:
             out = tools.run_tool(reg, name, args)
-        preview = out[:800] + (" …" if len(out) > 800 else "")
+        if DISPLAY_RESULT_CHARS and len(out) > DISPLAY_RESULT_CHARS:
+            preview = out[:DISPLAY_RESULT_CHARS] + " …"
+        else:
+            preview = out  # fully visible; out is already bounded by MAX_OUTPUT
         pix.tool_end(preview, is_error=out.lstrip().startswith("[operator declined"))
         messages.append({"role": "assistant", "content": text})
         messages.append({"role": "tool", "name": name, "content": out})
