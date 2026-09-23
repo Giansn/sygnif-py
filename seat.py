@@ -465,10 +465,13 @@ def _post_chat(spec: dict, messages: list[dict], t0: float) -> tuple[str, dict]:
                 _meta(messages, "", None, time.perf_counter() - t0))
     try:
         msg = data["choices"][0]["message"]
-        text = msg.get("content") or ""
-        # a function-calling model may answer via native tool_calls with empty
-        # content — fold that back into the fenced protocol the loop understands.
-        if not text.strip() and msg.get("tool_calls"):
+        # content may be a string, null, or an array of parts (some OpenAI-compat
+        # providers) — flatten defensively so parsing never sees a non-string.
+        text = _flatten_content(msg.get("content"))
+        # Prefer native tool_calls when present and the prose doesn't already carry
+        # a fenced call: a function-calling model (GLM/GPT) may put the call in
+        # tool_calls with content empty OR alongside a short narration preamble.
+        if msg.get("tool_calls") and not _FENCE.search(text or ""):
             text = _synth_tool_text(msg["tool_calls"]) or text
     except Exception:
         return (f"[endpoint: unexpected response shape: {json.dumps(data)[:500]}]",
@@ -522,8 +525,9 @@ def _stream_chat(spec: dict, messages: list[dict], on_delta, t0: float) -> tuple
             if chunk.get("usage"):
                 usage = chunk["usage"]
     text = "".join(parts)
-    # native tool_calls with no prose content -> render as a fenced block
-    if not text.strip() and tool_frag:
+    # native tool_calls -> render as a fenced block, unless the prose already
+    # carries one. Prefer the call over a bare narration preamble (GLM/GPT).
+    if tool_frag and not _FENCE.search(text):
         first = tool_frag[min(tool_frag)]
         if first["name"]:
             text = _synth_tool_text([{"function": {"name": first["name"], "arguments": first["args"]}}])
