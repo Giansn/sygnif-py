@@ -528,10 +528,15 @@ and evidence-required findings (high/critical need a second source).
 
 ## external — engagement: external / perimeter
 Order (ATT&CK-shaped; each step is a tool):
+`bounty` (pick a paying, in-scope program) -> record authorized assets in SCOPE.md ->
 recon -> portscan -> tls_check / headers -> nuclei (+ wpscan / dast for web, api_scan
 for APIs) -> takeover -> exploit_search -> (authorized) msf -> finding -> report.
 Inventory (hosts.jsonl) fills automatically from recon/portscan. Every finding
 evidence-backed; criticals need a second source. This is the bug-bounty spine.
+Target selection: `bounty` ranks public programs (Bugcrowd/HackerOne/Intigriti/
+YesWeHack) by MAX REWARD and matches your target keyword against in-scope assets, so
+you chase money where the scope is real. `bounty program=<name>` dumps the full
+in-scope list; paste ONLY assets you are authorized to test into SCOPE.md first.
 
 ## adchain — engagement: internal Active Directory breach
 From a foothold, walk the path BloodHound reveals:

@@ -4357,7 +4357,199 @@ def tool_ssrf(args: dict) -> str:
                        0 if st else 1, "host:urllib", target)
 
 
+
+# --- bug-bounty discovery ---------------------------------------------------
+# Reward money + target scope are the two things that decide whether a program
+# is worth our time, so this pulls the public, keyless, ~daily-updated program
+# directories (arkadiyt/bounty-targets-data: Bugcrowd, HackerOne, Intigriti,
+# YesWeHack) and normalises every program to {reward, scope}. It finds programs;
+# it does NOT test them — the operator still records authorized targets in
+# SCOPE.md before any tool touches them. (Immunefi/crypto has no keyless feed;
+# FireBounty is HTML-only — both are future scraper add-ons.)
+_BOUNTY_SRC = "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data"
+_BOUNTY_CACHE = os.path.join(os.path.expanduser("~"), ".sygnif", "bounty_cache")
+_BOUNTY_TTL = 6 * 3600
+_BOUNTY_FILES = ("bugcrowd_data", "hackerone_data", "intigriti_data", "yeswehack_data")
+
+
+def _bounty_fetch(name: str) -> list:
+    """One platform file, cached ~6h; falls back to a stale cache on network error."""
+    try:
+        os.makedirs(_BOUNTY_CACHE, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    fp = os.path.join(_BOUNTY_CACHE, name + ".json")
+    if os.path.exists(fp) and (time.time() - os.path.getmtime(fp)) < _BOUNTY_TTL:
+        try:
+            with open(fp, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        req = urllib.request.Request(_BOUNTY_SRC + "/" + name + ".json",
+                                     headers={"User-Agent": "sygnif-bounty"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        try:
+            with open(fp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+        except Exception:  # noqa: BLE001
+            pass
+        return data
+    except Exception:  # noqa: BLE001 — network down; use stale cache if any
+        if os.path.exists(fp):
+            try:
+                with open(fp, encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception:  # noqa: BLE001
+                pass
+        return []
+
+
+def _bounty_scope(t: dict) -> str:
+    for k in ("target", "uri", "asset_identifier", "endpoint", "host", "name"):
+        v = t.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _bounty_num(v) -> int:
+    """Extract a whole-number reward from int/float, {'value'|'amount': n}, or a $ string."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, dict):
+        for k in ("value", "amount", "max", "usd"):
+            if isinstance(v.get(k), (int, float)):
+                return int(v[k])
+    if isinstance(v, str):
+        m = re.search(r"\d[\d,]*", v)
+        if m:
+            return int(m.group().replace(",", ""))
+    return 0
+
+
+def _bounty_programs() -> list:
+    """All platforms normalised to a common shape (reward + scope)."""
+    progs = []
+    for f in _BOUNTY_FILES:
+        plat = f.split("_", 1)[0]
+        for p in _bounty_fetch(f):
+            if not isinstance(p, dict):
+                continue
+            ins = [_bounty_scope(t) for t in ((p.get("targets") or {}).get("in_scope") or [])
+                   if isinstance(t, dict)]
+            ins = [x for x in ins if x]
+            cur = "$"
+            if plat == "bugcrowd":
+                mx, mn = _bounty_num(p.get("max_payout")), 0
+                bounties = bool(mx)
+            elif plat in ("intigriti", "yeswehack"):
+                mb = p.get("max_bounty")
+                if isinstance(mb, dict) and mb.get("currency") == "EUR":
+                    cur = "\u20ac"
+                mx, mn = _bounty_num(mb), _bounty_num(p.get("min_bounty"))
+                bounties = bool(mx)
+            else:  # hackerone — bounties flag only, no $ amount in the feed
+                mx, mn = 0, 0
+                bounties = bool(p.get("offers_bounties"))
+            progs.append({
+                "platform": plat, "name": (p.get("name") or p.get("handle") or "").strip(),
+                "url": p.get("url") or "", "max": mx, "min": mn, "cur": cur,
+                "bounties": bounties, "safe_harbor": p.get("safe_harbor"),
+                "ttb": p.get("average_time_to_bounty_awarded"), "in_scope": ins,
+            })
+    return progs
+
+
+def _money(p: dict) -> str:
+    if p["max"]:
+        return "%s%s" % (p.get("cur", "$"), format(p["max"], ","))
+    return "bounty" if p["bounties"] else "VDP/no$"
+
+
+def tool_bounty(args: dict) -> str:
+    q = str(args.get("target") or args.get("query") or "").strip().lower()
+    plat = str(args.get("platform") or "").strip().lower()
+    program = str(args.get("program") or "").strip().lower()
+    try:
+        min_reward = int(args.get("min_reward") or 0)
+    except Exception:  # noqa: BLE001
+        min_reward = 0
+    try:
+        limit = max(1, min(int(args.get("limit") or 20), 100))
+    except Exception:  # noqa: BLE001
+        limit = 20
+    progs = _bounty_programs()
+    if not progs:
+        return ("bounty: could not fetch program directories (network?). Source: "
+                "arkadiyt/bounty-targets-data (bugcrowd/hackerone/intigriti/yeswehack).")
+    if program:
+        hit = [p for p in progs if program in p["name"].lower() or program in p["url"].lower()]
+        if not hit:
+            return "bounty: no program matching '" + program + "'. Try `bounty target=" + program + "`."
+        hit.sort(key=lambda p: -(p["max"] or 0))
+        p = hit[0]
+        head = ("%s [%s]  max=%s  safe_harbor=%s\n%s\nIN SCOPE (%d assets):"
+                % (p["name"], p["platform"], _money(p), p.get("safe_harbor"), p["url"], len(p["in_scope"])))
+        body = "\n".join("  " + t for t in p["in_scope"][:250]) or "  (no assets listed in feed — read the program page)"
+        return head + "\n" + body + ("\n\nPaste ONLY the assets you're authorized to test into ~/sygnif-pentest/SCOPE.md "
+                                     "before running any tool against them.")
+
+    def keep(p):
+        if plat and p["platform"] != plat:
+            return False
+        if min_reward and (p["max"] or 0) < min_reward:
+            return False
+        if q:
+            if q in p["name"].lower():
+                return True
+            return any(q in t.lower() for t in p["in_scope"])
+        return True
+
+    sel = [p for p in progs if keep(p)]
+    sel.sort(key=lambda p: (-(p["max"] or 0), -int(p["bounties"]), -len(p["in_scope"])))
+    hdr = ("Bug-bounty programs by MAX REWARD"
+           + (" matching '" + q + "'" if q else "")
+           + (" >= $" + format(min_reward, ",") if min_reward else "")
+           + (" on " + plat if plat else "")
+           + "  —  %d match, top %d:" % (len(sel), min(limit, len(sel))))
+    lines = [hdr]
+    for p in sel[:limit]:
+        sh = " [safe-harbor]" if p.get("safe_harbor") == "full" else ""
+        mt = ""
+        if q:
+            hits = [t for t in p["in_scope"] if q in t.lower()][:3]
+            if hits:
+                mt = "  ->" + ", ".join(hits)
+        lines.append("%12s  %-10s %-46s scope:%-4d%s%s"
+                     % (_money(p), p["platform"], p["name"][:46], len(p["in_scope"]), sh, mt))
+        lines.append(" " * 14 + p["url"])
+    lines.append("\nNext: `bounty program=<name>` for full scope -> record authorized targets in SCOPE.md. "
+                 "(HackerOne feed has no $ amount, only a bounties flag; Immunefi/crypto not covered.)")
+    return "\n".join(lines)
+
+
 BUILTIN_TOOLS: dict[str, dict] = {
+    "bounty": {
+        "desc": ("Find VALUABLE bug-bounty programs from the public multi-platform "
+                 "directory (Bugcrowd, HackerOne, Intigriti, YesWeHack; keyless, ~daily). "
+                 "Ranked by MAX REWARD $ then scope size — reward and target are the "
+                 "priorities. No args = top-paying programs. target=<keyword> matches a "
+                 "program name OR an in-scope asset (domain/tech/app). program=<name> dumps "
+                 "one program's full in-scope list to record in SCOPE.md. Finds programs "
+                 "only; never tests them."),
+        "args": {
+            "target": "optional keyword to match program name OR an in-scope asset (e.g. 'coinbase', 'tesla', 'api', 'android')",
+            "min_reward": "optional: only programs whose max payout is at least this many $",
+            "platform": "optional: bugcrowd | hackerone | intigriti | yeswehack",
+            "program": "optional: dump ONE program's full in-scope list by name",
+            "limit": "optional: how many programs to list (default 20, max 100)",
+        },
+        "func": tool_bounty,
+    },
     "shell": {
         "desc": (
             "Run a command on THIS machine (as the seat user) and return its "
